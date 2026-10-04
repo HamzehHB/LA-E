@@ -86,7 +86,8 @@ class ControlledExecutor:
             return _reject(request.proposal_hash, action, destination,
                            "staging root invalid", "destination", provenance)
         checked = Revalidator().revalidate(
-            request, outcome, proposal, confidence, schema_version or "")
+            request, outcome, proposal, confidence, schema_version or "",
+            note)
         if not checked.valid:
             return _reject(request.proposal_hash, action, destination,
                            checked.reason or "revalidation failed",

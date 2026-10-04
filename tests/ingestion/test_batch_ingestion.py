@@ -268,7 +268,7 @@ def test_batch_invalid_encoding_is_isolated_and_leaves_no_partial_state(tmp_path
 
 
 def test_outside_boundary_path_rejected_without_read(tmp_path):
-    outside = tmp_path.parent / "forbidden_cp20_probe.md"
+    outside = tmp_path.parent / "forbidden_outside_probe.md"
     try:
         outside.write_text(SAMPLE_NOTE, encoding="utf-8")
         outcomes = BatchIngestor(

@@ -155,6 +155,8 @@ Current configuration files include:
 * [`paths.example.yaml`](Config/paths.example.yaml)
 * `paths.local.yaml` (not committed)
 * [`models.yaml`](Config/models.yaml)
+* [`llm.example.yaml`](Config/llm.example.yaml)
+* `llm.local.yaml` (not committed; set `provider: "ollama"` locally)
 
 ### `paths.example.yaml`
 
@@ -172,6 +174,25 @@ It is ignored by git and must never be committed or pushed.
 Committed, machine-independent model settings (for example the
 active embedding model and its dimension).
 
+### `llm.example.yaml` / `llm.local.yaml`
+
+Copy `Config/llm.example.yaml` to gitignored `Config/llm.local.yaml`
+and set `provider: "ollama"` plus your local model name. The tracked
+example defaults to `provider: "disabled"`, which stops safely
+instead of proceeding. Activate the venv first
+(`Venv\Scripts\activate`, or `Venv\Scripts\python -m ...`).
+
+Run either input mode:
+
+```bash
+python -m src.living_authenticity.cli --input-file "note.md"
+python -m src.living_authenticity.cli --text "my text..."
+```
+
+A different cloud API shape is added as one new small module under
+`src/living_authenticity/llm/` implementing `LLMProvider`, plus one
+registry branch — never by editing the shared interface.
+
 ### Configuration workflow
 
 1. Copy the template:
@@ -182,9 +203,16 @@ active embedding model and its dimension).
 
 2. Edit `Config/paths.local.yaml` and set the real locations for
    your machine (persistent data root, model path, vector database,
-   Obsidian vault, Zotero library, exports, and cache).
+   Obsidian vault, Zotero library, exports, cache, and staging).
 
-3. Run the test suite (see [Testing](#testing)) to verify your configuration
+3. Set `staging.root` to the single directory that may receive
+   controlled-execution artifacts. This is an explicit, config-declared
+   exception: `data.root` stays guarded, and staging is still refused
+   anywhere else — including arbitrary children of `data.root` and any
+   subdirectory of the declared staging root. Leaving it unset
+   authorizes no staging location inside guarded persistent data.
+
+4. Run the test suite (see [Testing](#testing)) to verify your configuration
    loads correctly.
 
 Repository-internal locations — the repository root itself and the
@@ -246,6 +274,72 @@ everything else. No production data is read by the test suite.
 
 ---
 
+## Bounded Local Integration (optional)
+
+The bounded local-integration runner composes the existing pipeline and
+governance contracts over **explicitly supplied** paths. It performs no
+discovery of its own: there are no defaults for source, staging, corpus,
+Core, or vector-store roots.
+
+Token-overlap retrieval (no local infrastructure required):
+
+```bash
+python -m src.living_authenticity.cli \
+  --source-root <existing directory of .md/.txt inputs> \
+  --staging-root <existing isolated directory> \
+  --max-files 1
+```
+
+Real local embedding and vector retrieval:
+
+```bash
+python -m src.living_authenticity.cli \
+  --source-root <existing directory of .md/.txt inputs> \
+  --staging-root <existing isolated directory> \
+  --max-files 2 \
+  --corpus-root <existing directory of known notes> \
+  --core-root <existing directory of approved Core references> \
+  --embed \
+  --vector-db <existing empty directory for the isolated database>
+```
+
+Notes:
+
+* `--max-files` defaults to `1` and bounds source, corpus, and Core files
+  alike; each additional file is an explicit operator decision.
+* Every extracted knowledge unit is governed independently: the proposal
+  is displayed, then human review, explicit approval (default No), fresh
+  revalidation, controlled execution, audit record.
+* `--embed` uses the configured local embedding model
+  (`Config/models.yaml` + `Config/paths.local.yaml`) and an isolated
+  LanceDB vector database. `--vector-db` is required with `--embed`, must
+  resolve outside the repository, and is refused when it resolves to the
+  configured production vector database.
+* The corpus is indexed into that isolated database as retrieval context.
+  A vector store is a retrieval index, never an authoritative knowledge
+  store, and a vector result is evidence only — never identity,
+  confidence, or authorization.
+* Indexing is refused when the isolated database is not empty. Storing
+  the same corpus twice would accumulate duplicate rows and change the
+  retrieval evidence while the inputs stayed identical, so the operator
+  either reuses the existing index (omit `--corpus-root`) or supplies a
+  fresh empty `--vector-db` directory.
+* The staging root is validated before anything is read: explicit,
+  existing, real directory, not a symlink, outside the repository. Inside
+  persistent-data roots it is accepted only when it resolves identically
+  to the single config-declared `staging.root`; every other
+  persistent-data location, and every other child of `data.root`, remains
+  rejected.
+* With no `--core-root`, Core relevance stays unresolved and proposals
+  resolve conservatively to `NEEDS_REVIEW`. That is correct behaviour.
+* This is not a vault migration and not an authoritative write. `CREATE`
+  means creation into the isolated staging area only.
+
+A synthetic walkthrough lives in
+[examples/bounded_local_integration/](examples/bounded_local_integration/README.md).
+
+---
+
 ## Private Project Documents
 
 Some project documents are intentionally kept local and are not committed to the public repository.
@@ -258,8 +352,8 @@ They are stored under:
 
 This directory may contain:
 
-* `Project-Vision.md`
-* `Current-Summer-Scope.md`
+* `.project/Project-Vision.md`
+* `.project/Current-Summer-Scope.md`
 
 The `.project/` directory is excluded through `.gitignore`.
 

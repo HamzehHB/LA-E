@@ -45,6 +45,8 @@ CONFIG_DIR = ROOT / "Config"
 PATHS_EXAMPLE_FILE = "paths.example.yaml"
 PATHS_LOCAL_FILE = "paths.local.yaml"
 MODELS_FILE = "models.yaml"
+LLM_EXAMPLE_FILE = "llm.example.yaml"
+LLM_LOCAL_FILE = "llm.local.yaml"
 
 _PATHS_REQUIRED_KEYS = (
     "data.root",
@@ -55,6 +57,14 @@ _PATHS_REQUIRED_KEYS = (
     "zotero.library",
     "exports.root",
     "cache.root",
+)
+
+# Optional keys: validated only when present, because a deployment that
+# never stages anything does not need them. ``staging.root`` is the single
+# explicitly authorized controlled-execution staging destination; leaving
+# it unset authorizes no staging location inside guarded persistent data.
+_PATHS_OPTIONAL_STRING_KEYS = (
+    "staging.root",
 )
 
 
@@ -123,6 +133,19 @@ def _require_non_empty_strings(data: dict, dotted_keys, source: Path) -> None:
             )
 
 
+def _require_optional_strings(data: dict, dotted_keys, source: Path) -> None:
+
+    for key in dotted_keys:
+        value = _resolve(data, key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"Invalid configuration in {source}: "
+                f"'{key}' must be either absent or a non-empty string."
+            )
+
+
 def _derived_repository_paths() -> dict:
 
     return {
@@ -152,6 +175,7 @@ def load_paths(config_dir: Path | str = CONFIG_DIR) -> dict:
     data.update(_derived_repository_paths())
 
     _require_non_empty_strings(data, _PATHS_REQUIRED_KEYS, config_dir)
+    _require_optional_strings(data, _PATHS_OPTIONAL_STRING_KEYS, config_dir)
 
     return data
 
@@ -197,6 +221,64 @@ def load_models(config_dir: Path | str = CONFIG_DIR) -> dict:
             f"Invalid configuration in {source}: "
             f"'{active}.batch_size' must be a positive integer."
         )
+
+    return data
+
+
+def load_llm(config_dir: Path | str = CONFIG_DIR) -> dict:
+    """Load and validate ``llm.example.yaml`` with local overrides.
+
+    Follows the same contract as :func:`load_paths`: the committed
+    example provides portable defaults and an optional gitignored
+    ``llm.local.yaml`` overrides it value by value. The provider layer
+    is a formal workflow component; ``provider`` selects only the
+    implementation behind it.
+    """
+
+    config_dir = Path(config_dir)
+    source = config_dir / LLM_EXAMPLE_FILE
+    data = _load_yaml(source)
+
+    local = config_dir / LLM_LOCAL_FILE
+    if local.is_file():
+        data = _deep_merge(data, _load_yaml(local))
+
+    section = data.get("llm")
+    if not isinstance(section, dict):
+        raise ConfigError(
+            f"Invalid configuration in {source}: 'llm' must be a mapping."
+        )
+
+    provider = section.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ConfigError(
+            f"Invalid configuration in {source}: "
+            f"'llm.provider' must be a non-empty string "
+            f"(use \"disabled\" for the safe default: the formal stage "
+            f"then stops safely instead of proceeding)."
+        )
+
+    for key in ("model", "endpoint", "credential_env"):
+        value = section.get(key, "")
+        if value is None:
+            section[key] = ""
+            continue
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"Invalid configuration in {source}: "
+                f"'llm.{key}' must be a string."
+            )
+
+    for key in ("timeout_seconds", "max_tokens", "max_candidates",
+                "max_body_characters"):
+        value = section.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigError(
+                f"Invalid configuration in {source}: "
+                f"'llm.{key}' must be a positive integer."
+            )
 
     return data
 

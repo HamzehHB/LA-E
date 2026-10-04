@@ -30,14 +30,15 @@ class ExplicitApprovalGate(ApprovalGate):
     def name(self) -> str:
         return self._strategy
 
-    def build_request(self, query, proposal=None, confidence=None) -> ApprovalRequest:
+    def build_request(self, query, proposal=None, confidence=None,
+                      note=None) -> ApprovalRequest:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError("query must be a KnowledgeUnit")
         if not isinstance(proposal, Proposal):
             raise TypeError("proposal must be a Proposal")
         if proposal.query_unit_id != query.id:
             raise ValueError("proposal query_unit_id mismatch")
-        payload = proposal_payload(proposal, confidence)
+        payload = proposal_payload(proposal, confidence, note)
         digest = canonical_proposal_hash(payload)
         return ApprovalRequest(
             query_unit_id=query.id,
@@ -50,6 +51,7 @@ class ExplicitApprovalGate(ApprovalGate):
             confidence_level=payload.get("confidence_level", ""),
             proposal_hash=digest,
             strategy=self._strategy,
+            note_bound=note is not None,
             note=(
                 "Non-authoritative approval request for human review only; "
                 "not authorization or execution. Destination is inert data."
@@ -93,15 +95,17 @@ class ExplicitApprovalGate(ApprovalGate):
             requires_human_review=True,
         )
 
-    def request_approval(self, query, proposal=None, confidence=None, reader=None) -> tuple:
+    def request_approval(self, query, proposal=None, confidence=None,
+                         reader=None, note=None) -> tuple:
         """Display one request, read one input, record one outcome.
 
         ``reader`` is an injected zero-argument callable returning the
         human's raw string (default ``input``). It is invoked at most
         once. Any exception (EOF, timeout, interruption) is rejection,
-        never approval.
+        never approval. ``note`` binds the displayed generated-note
+        markdown into the canonical approval hash.
         """
-        request = self.build_request(query, proposal, confidence)
+        request = self.build_request(query, proposal, confidence, note)
         text = self.display(request)
         read = reader if reader is not None else input
         if not callable(read):

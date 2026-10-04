@@ -17,6 +17,9 @@ Venv/
 # ---------- Local machine configuration ----------
 Config/paths.local.yaml
 
+# ---------- Local LLM provider configuration (may hold credentials) ----------
+Config/llm.local.yaml
+
 # ---------- IDE ----------
 .vscode/
 .clinerules/

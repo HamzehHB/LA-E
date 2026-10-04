@@ -100,9 +100,27 @@ class IngestionPipeline:
         self.classifier = classifier
 
     def ingest(self, file_path: str) -> IngestionResult:
-
         reader = self.reader_registry.get(file_path)
         raw_text = reader.read(file_path)
+        return self._process(raw_text, source=file_path, kind=file_path)
+
+    def ingest_text(self, text: str, source: str = "<text-input>",
+                    kind: str = ".md") -> IngestionResult:
+        """Process already-available text through the same stages as a file.
+
+        This keeps terminal text input on the single existing ingestion
+        path (cleaning, normalization, chunking, parsing, extraction,
+        metadata) without creating a temporary file and without a second
+        parsing/extraction implementation. ``source`` is the inert
+        provenance label; ``kind`` selects the registered chunker and
+        extractor exactly as a file extension would.
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        return self._process(text, source=source, kind=kind)
+
+    def _process(self, raw_text: str, source: str, kind: str) -> IngestionResult:
+        """Shared ingestion body over raw text (analysis-only, no writes)."""
         cleaned_text = self.cleaner.clean(raw_text)
 
         normalized_text = None
@@ -111,7 +129,7 @@ class IngestionPipeline:
 
         text_for_analysis = normalized_text if normalized_text is not None else cleaned_text
 
-        chunker = self.chunker_registry.get(file_path)
+        chunker = self.chunker_registry.get(kind)
         chunks = chunker.split(text_for_analysis)
 
         parsed = None
@@ -120,9 +138,9 @@ class IngestionPipeline:
 
         knowledge_units: list[KnowledgeUnit] = []
         try:
-            extractor = self.extractor_registry.get(file_path)
+            extractor = self.extractor_registry.get(kind)
             knowledge_units = extractor.extract(
-                source=file_path,
+                source=source,
                 original_text=raw_text,
                 cleaned_text=cleaned_text,
                 normalized_text=normalized_text or cleaned_text,
@@ -138,10 +156,10 @@ class IngestionPipeline:
                 self.classifier.classify(unit) for unit in knowledge_units
             ]
 
-        metadata = self.metadata_extractor.extract(file_path)
+        metadata = self.metadata_extractor.extract(source)
 
         return IngestionResult(
-            file_path=file_path,
+            file_path=source,
             raw_text=raw_text,
             cleaned_text=cleaned_text,
             normalized_text=normalized_text,

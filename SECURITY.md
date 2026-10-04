@@ -20,9 +20,12 @@ Facts verified against the repository at this checkpoint:
 * Git history **does** contain historical machine-specific filesystem paths
   (former `Config/paths.yaml` versions and an older workspace file). This is a
   documented residual risk (§5). No history rewriting is performed by agents.
-* Application code performs no network calls, no dynamic code execution
-  (`eval`/`exec`), no shell-out (`subprocess`/`os.system`), and no
-  deserialization of untrusted data.
+* Application code performs network calls only inside
+  `src/living_authenticity/llm/` via stdlib `urllib`/`http` (local or
+  configured endpoint, privacy gate on resolved host, no streaming,
+  credentials from environment only, audit stores prompt hash only).
+  No dynamic code execution (`eval`/`exec`), no shell-out
+  (`subprocess`/`os.system`), and no deserialization of untrusted data.
 * The analytical pipeline is analysis-only: it performs no authoritative writes
   to knowledge. The single controlled-execution boundary
   (`knowledge/governance/execution/`) writes exactly one approved + revalidated
@@ -31,15 +34,49 @@ Facts verified against the repository at this checkpoint:
   authoritative-vault placement. Current executable action scope is
   `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` — everything else is future work.
 * Private configuration and private documents are physically outside the
-  tracked tree: `Config/paths.local.yaml`, `.project/`, `.clinerules/`,
+  tracked tree: `Config/paths.local.yaml`, `Config/llm.local.yaml`,
+  `.project/`, `.clinerules/`,
   `Venv/`, `.env`, and `Logs/*` are all covered by `.gitignore` and verified
-  with `git check-ignore`. `Config/paths.local.yaml` must **never be committed
+  with `git check-ignore`. `Config/paths.local.yaml` and
+  `Config/llm.local.yaml` must **never be committed
   or pushed**.
 * The production persistent-data tree is **denied to coding agents by
   default**. Runtime data-processing components follow
   `.project/Local-Paths-Reference.md`; that access never extends to
   development agents, and knowing a path is not permission.
 * Reusable runtime security utilities live in `src/living_authenticity/security/`: a default-deny path boundary (`PathBoundary`) and value-safe sensitive-data detection (`find_secrets` / `contains_secret`). `PathBoundary` is wired into the controlled-execution boundary (`knowledge/governance/execution/`) as its staging confinement; it remains unwired into the ingestion/analysis pipeline, which performs no writes.
+* The bounded local-integration runner (`knowledge/integration/`) adds no
+  new write path: it composes the existing approval, revalidation,
+  controlled-execution, and audit contracts, and routes every write
+  through `ControlledExecutor`. Its staging eligibility guard is
+  computed from the deployment's own configuration
+  (`Config/paths.local.yaml` via `Config/settings.py`) — staging must be
+  explicitly supplied, already exist, be a real directory, not be a
+  symlink, and resolve outside the repository tree, using the same
+  `PathBoundary` resolution and normalization as the executor. Inside a
+  configured persistent-data root, staging is accepted only when it
+  resolves identically to the single, config-declared `staging.root`
+  key: `data.root` and every other guarded root stay guarded by default,
+  and arbitrary children of `data.root`, subdirectories of the declared
+  staging root, symlinks, and case/separator/trailing-slash/relative
+  spellings of other locations are all rejected. The guard is checked
+  before anything is read and re-checked before each unit; the exact
+  validated value is pinned for the whole run. No default, discovered,
+  or hardcoded staging location exists.
+* Vector-index writes (`--embed --vector-db`) are confined to an
+  explicitly supplied, isolated LanceDB directory that must resolve
+  outside the repository and is refused when it resolves to the
+  configured production vector database. A vector store is a retrieval
+  index, never authoritative knowledge, and it authorizes nothing:
+  embeddings and vector results are evidence only, and knowledge
+  artifacts still reach the world only through `ControlledExecutor`.
+  The isolation guard is checked before any indexing occurs.
+* The formal LLM stage is mandatory architecture: a disabled,
+  unreachable, or invalid provider stops the affected unit safely
+  (`llm_safe_stop`, no candidate, no approval, no execution) instead
+  of bypassing synthesis. The vault stays read-only and bounded.
+* Example inputs under `examples/` are synthetic and fictitious; they
+  contain no real knowledge, no real machine path, and no credentials.
 
 ---
 
@@ -53,8 +90,8 @@ Steps 1–5 are automated in `tests/test_repository_security.py` — keep it gre
    is defined only in `Config/paths.local.yaml`; synthetic test fixtures use
    invented values).
 3. **Ignore rules** — `.gitignore` covers `Config/paths.local.yaml`,
-   `.project/`, `.clinerules/`, `Venv/`, `.env`, `Logs/`, and
-   `git check-ignore` confirms every one of them.
+   `Config/llm.local.yaml`, `.project/`, `.clinerules/`, `Venv/`, `.env`,
+   `Logs/`, and `tests/local/`; `git check-ignore` confirms every one.
 4. **Policy alignment** — this file exists and stays consistent with
    `AI-Governance.md` and `Coding-Agent-Access.md`.
 5. **Unsafe-code scan** — no `subprocess`, `os.system`, `eval`, `exec`,

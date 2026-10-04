@@ -41,6 +41,16 @@ FORBIDDEN_IMPORT_ROOTS = frozenset({
     "requests", "httpx", "urllib", "http", "importlib",
 })
 
+# Narrow, explicit exemption: the LLM provider layer must reach a
+# configured local/cloud endpoint, and the project deliberately uses the
+# standard library for that call instead of adding a dependency. Only
+# ``urllib`` and ``http`` are permitted, and only inside this one
+# package. Every other banned root (subprocess, socket, shutil, pickle,
+# marshal, ctypes, importlib, requests, httpx) stays banned there too,
+# and the full list stays banned everywhere else in application code.
+LLM_PACKAGE_PREFIX = "living_authenticity/llm/"
+NETWORK_IMPORT_ALLOWANCE = frozenset({"urllib", "http"})
+
 FORBIDDEN_BUILTIN_CALLS = frozenset({
     "eval", "exec", "__import__", "compile",
 })
@@ -139,21 +149,69 @@ def test_all_open_calls_in_src_are_read_mode():
     assert offenders == [], f"non-read open() in application code: {offenders}"
 
 
+def _is_allowed_network_import(relative: str, root: str) -> bool:
+    """True only for urllib/http inside the LLM provider package."""
+    return (relative.startswith(LLM_PACKAGE_PREFIX)
+            and root in NETWORK_IMPORT_ALLOWANCE)
+
+
+def _import_offenders(tree, relative: str) -> list:
+    """Return ``path:root`` for every banned import in one module."""
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots = [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            roots = [(node.module or "").split(".")[0]]
+        else:
+            continue
+        for root in roots:
+            if root not in FORBIDDEN_IMPORT_ROOTS:
+                continue
+            if _is_allowed_network_import(relative, root):
+                continue
+            offenders.append(relative + ":" + root)
+    return offenders
+
+
 def test_no_process_network_or_deserialization_imports():
     offenders = []
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                roots = [alias.name.split(".")[0] for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                roots = [(node.module or "").split(".")[0]]
-            else:
-                continue
-            for root in roots:
-                if root in FORBIDDEN_IMPORT_ROOTS:
-                    offenders.append(_relative(path) + ":" + root)
+        offenders.extend(_import_offenders(tree, _relative(path)))
     assert offenders == [], f"forbidden import in application code: {offenders}"
+
+
+def test_network_import_allowance_is_limited_to_the_llm_package():
+    """The allowance covers exactly urllib/http, exactly in ``llm/``.
+
+    Everything else — including the rest of the banned list and every
+    other application package — stays rejected, and the scan has real
+    discriminating power (proved against synthetic modules rather than
+    asserted by name).
+    """
+    llm_relative = LLM_PACKAGE_PREFIX + "provider.py"
+    other_relative = "living_authenticity/knowledge/output/module.py"
+
+    network_only = ast.parse("import urllib.request\nfrom http.client import X\n")
+    assert _import_offenders(network_only, llm_relative) == []
+    assert _import_offenders(network_only, other_relative) == [
+        other_relative + ":urllib", other_relative + ":http",
+    ]
+
+    still_banned_in_llm = ast.parse(
+        "import subprocess\nimport pickle\nimport socket\nimport shutil\n"
+        "import marshal\nimport ctypes\nimport importlib\n"
+        "import requests\nimport httpx\n"
+    )
+    found = _import_offenders(still_banned_in_llm, llm_relative)
+    for banned in ("subprocess", "pickle", "socket", "shutil", "marshal",
+                   "ctypes", "importlib", "requests", "httpx"):
+        assert llm_relative + ":" + banned in found, banned
+
+    # The allowance must not be reachable by a name-prefix trick.
+    lookalike = "living_authenticity/llm_extra/module.py"
+    assert _import_offenders(network_only, lookalike) != []
 
 
 def test_no_dynamic_code_execution_calls():

@@ -90,7 +90,20 @@ class EvidenceFirstPipeline:
     def run_file(self, file_path: str, corpus=(), core_units=()) -> IntegratedResult:
         if not isinstance(file_path, str) or not file_path:
             raise TypeError("file_path must be a non-empty string")
-        ingestion = self.ingestion.ingest(file_path)
+        return self.run_ingestion(
+            self.ingestion.ingest(file_path), corpus, core_units)
+
+    def run_ingestion(self, ingestion, corpus=(), core_units=()) -> IntegratedResult:
+        """Run the analytical chain over one already-ingested result.
+
+        Where input comes from (file, explicit directory, or terminal
+        text) is decided by the caller before ingestion; every stage
+        from Retrieval onward is identical for all of them, so the
+        integration layer reuses this one chain instead of building a
+        parallel path.
+        """
+        if not isinstance(ingestion, IngestionResult):
+            raise TypeError("ingestion must be an IngestionResult")
         corpus_units = self._corpus_units(corpus)
         cores = list(core_units) if core_units is not None else []
         for item in cores:
@@ -100,7 +113,9 @@ class EvidenceFirstPipeline:
         note = "analysis-only integrated result for human review; not approval or execution."
         if not unit_results:
             note = "no knowledge units extracted; nothing analyzed."
-        return IntegratedResult(source=file_path, ingestion=ingestion, units=unit_results, note=note)
+        return IntegratedResult(
+            source=ingestion.file_path, ingestion=ingestion,
+            units=unit_results, note=note)
     def run_unit(self, query: KnowledgeUnit, corpus=(), core_units=()) -> IntegratedUnitResult:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError("query must be a KnowledgeUnit")

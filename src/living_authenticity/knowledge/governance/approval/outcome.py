@@ -27,10 +27,16 @@ class ApprovalRequest:
     proposal_hash: str = ""
     strategy: str = ""
     note: str = ""
+    # True when this request was built while bound to a specific
+    # generated-note markdown (the exact text shown for review and
+    # later written to staging). Requests built without a note keep the
+    # historical payload shape and stay verifiable as before.
+    note_bound: bool = False
     is_authoritative: bool = False
     requires_human_review: bool = True
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "note_bound", bool(self.note_bound))
         object.__setattr__(self, "is_authoritative", False)
         object.__setattr__(self, "requires_human_review", True)
 

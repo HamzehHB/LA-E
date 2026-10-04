@@ -27,20 +27,24 @@ PATH_PREFIX_EXEMPT_FILES = (
 
 IGNORED_ENTRIES = (
     "Config/paths.local.yaml",
+    "Config/llm.local.yaml",
     ".project/",
     ".clinerules/",
     "Venv/",
     ".env",
     "Logs/*",
+    "tests/local/",
 )
 
 CHECK_IGNORE_PATHS = (
     "Config/paths.local.yaml",
+    "Config/llm.local.yaml",
     ".project/",
     ".clinerules/",
     "Venv/",
     ".env",
     "Logs/dev.log",
+    "tests/local/test_real_ollama_local.py",
 )
 
 UNSAFE_CODE_SNIPPETS = (

@@ -3,3 +3,9 @@ lancedb
 pyyaml
 pyarrow
 numpy
+# anyio is pinned by the SECURITY checklist (tests reference anyio==4.14.2);
+# CVE-2026-63374/64847/63349 fix at 4.14.2 aligns with that requirement.
+anyio==4.14.2
+# CVE-2026-97687/97688/97689: force the patched urllib3 (transitive via
+# lance-namespace-urllib3-client); keeps the rest of the pin set stable.
+urllib3>=2.8.0

@@ -16,6 +16,16 @@
 # * The repository-internal locations ("project", "logs" and
 #   "prompts") are always derived automatically from the repository
 #   root. Do not set them in this file or in paths.local.yaml.
+#
+# STAGING
+# -------
+# ``staging.root`` declares the single directory that may be used as a
+# controlled-execution staging destination. It is an explicit, named
+# exception: every location listed below remains guarded, and staging is
+# still refused anywhere else, including arbitrary children of
+# ``data.root`` and any other subdirectory of the declared staging root.
+# Leave it unset (or empty) to authorize no staging location inside
+# guarded persistent data at all.
 
 data:
   root: "C:/LivingAuthenticity_Data"
@@ -40,3 +50,8 @@ exports:
 
 cache:
   root: "C:/LivingAuthenticity_Data/Database/Cache"
+
+staging:
+  # Portable placeholder. Set the real directory only in the
+  # gitignored paths.local.yaml.
+  root: "C:/LivingAuthenticity_Data/Knowledge/Staging"

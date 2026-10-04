@@ -11,7 +11,7 @@ class ApprovalGate(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def build_request(self, query, proposal=None, confidence=None):
+    def build_request(self, query, proposal=None, confidence=None, note=None):
         raise NotImplementedError
 
     @abstractmethod
@@ -23,5 +23,6 @@ class ApprovalGate(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def request_approval(self, query, proposal=None, confidence=None, reader=None):
+    def request_approval(self, query, proposal=None, confidence=None,
+                         reader=None, note=None):
         raise NotImplementedError

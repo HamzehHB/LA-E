@@ -11,8 +11,15 @@ def canonical_proposal_hash(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def proposal_payload(proposal, confidence=None) -> dict:
-    """Extract the exact displayed fields bound by approval."""
+def proposal_payload(proposal, confidence=None, note=None) -> dict:
+    """Extract the exact displayed fields bound by approval.
+
+    When ``note`` is supplied, the canonical payload also covers a
+    sha256 of the exact generated-note markdown (Addendum C): the text
+    shown to the human reviewer and the bytes written to staging must
+    be the text that was hashed. With ``note=None`` the payload keeps
+    its historical shape, so existing requests remain verifiable.
+    """
     from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
 
     if not isinstance(proposal, Proposal):
@@ -37,4 +44,14 @@ def proposal_payload(proposal, confidence=None) -> dict:
         if not isinstance(confidence, ConfidenceAssessment):
             raise TypeError("confidence must be a ConfidenceAssessment")
         payload["confidence_level"] = confidence.level
+    if note is not None:
+        from src.living_authenticity.knowledge.output.outcome import GeneratedNote
+
+        if not isinstance(note, GeneratedNote):
+            raise TypeError("note must be a GeneratedNote")
+        if not isinstance(note.markdown, str) or not note.markdown:
+            raise ValueError("note markdown must be a non-empty string")
+        payload["note_markdown_sha256"] = hashlib.sha256(
+            note.markdown.encode("utf-8")
+        ).hexdigest()
     return payload

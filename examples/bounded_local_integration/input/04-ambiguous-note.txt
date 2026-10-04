@@ -1,0 +1,6 @@
+This synthetic text input has no recognizable section label and no
+distinctive classification cues, so it is expected to resolve
+conservatively to NEEDS_REVIEW rather than to a guessed knowledge type.
+
+It exists only to demonstrate that unresolved input stays unresolved and
+is never upgraded silently.

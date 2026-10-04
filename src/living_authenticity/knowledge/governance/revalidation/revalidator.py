@@ -22,7 +22,7 @@ class Revalidator:
     """
 
     def revalidate(self, request, outcome, proposal=None, confidence=None,
-                   schema_version=""):
+                   schema_version="", note=None):
         if not isinstance(request, ApprovalRequest):
             raise TypeError("request must be an ApprovalRequest")
         if not isinstance(outcome, ApprovalOutcome):
@@ -60,7 +60,9 @@ class Revalidator:
             return _fail("proposal_contents", "proposal contents changed after approval")
         if proposal.reason != request.reason:
             return _fail("proposal_contents", "proposal contents changed after approval")
-        live = proposal_payload(proposal, confidence)
+        live = proposal_payload(
+            proposal, confidence,
+            note if getattr(request, "note_bound", False) else None)
         if confidence is None:
             if request.confidence_level:
                 return _fail("relevant_data", "confidence evidence missing for revalidation")

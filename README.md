@@ -47,8 +47,31 @@ Implemented foundations include:
   staging root only, and an observational audit/traceability record
   built from those same lifecycle objects (audit authorizes and
   executes nothing)
+- A mandatory formal LLM synthesis stage (`living_authenticity/llm/`)
+  after the Knowledge Filter and before human review: deterministic
+  bounded context, strict result contract, per-candidate governance.
+  Without a usable provider the affected unit stops safely
+  (`llm_safe_stop`) instead of proceeding — LLM output is never
+  authorization.
+- A bounded local-integration runner (`knowledge/integration/`) that
+  composes those contracts over an explicitly supplied source root and
+  an explicitly supplied, isolated staging root, with a staging
+  eligibility guard (explicit, existing, non-symlink, outside the
+  repository, outside every configured persistent-data root, pinned for
+  the whole run) and per-unit human approval only — no batch, standing,
+  or transferred approval
+- An injectable vector-similarity retriever (`LanceDBVectorRetriever`)
+  implementing the existing retrieval contract over a locally configured
+  LanceDB vector store and local embedding service, wired into the
+  bounded local-integration command through `--embed --vector-db`; the
+  default integrated pipeline keeps its deterministic token-overlap
+  retriever unless embedding is explicitly requested. Vector results are
+  evidence only (Retrieval ≠ Decision; Similarity ≠ Identity), and the
+  vector store is a retrieval index, never an authoritative store
+- A synthetic, public-safe example of that workflow under
+  [examples/bounded_local_integration/](examples/bounded_local_integration/README.md)
 
-Advanced components such as semantic retrieval, embeddings, LanceDB, knowledge evolution, and agent systems belong to later development phases and are not represented as completed features.
+Advanced components such as knowledge evolution and agent systems belong to later development phases and are not represented as completed features.
 
 Technology
 

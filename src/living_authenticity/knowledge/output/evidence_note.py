@@ -1,14 +1,9 @@
 """Deterministic Obsidian note generation from proposal evidence.
 
-The generator copies meaning, provenance, evidence, uncertainties,
-and summaries already recorded on the Proposal (plus optional
-ClassificationResult and ConfidenceAssessment context) into a
-proposed Obsidian Markdown representation. It performs no analysis,
-no retrieval, no comparison, no classification, and no decision: the
-proposal action is represented, never re-decided. Missing or
-contradictory input fails conservatively via TypeError/ValueError
-rather than invented content. No filesystem, network, provider, or
-model operations are performed.
+Copies meaning, provenance, evidence, uncertainties, and summaries
+already recorded on the Proposal into a proposed Markdown
+representation. No analysis, retrieval, comparison, classification,
+or decision is performed here. No filesystem, network, or model use.
 """
 from src.living_authenticity.knowledge.analysis.classification.result import (
     CLASSIFICATION_TYPES,
@@ -61,7 +56,9 @@ def _render_frontmatter(pairs) -> str:
     return "\n".join(lines)
 
 
-def _render_body(query, proposal, classification, confidence) -> str:
+def _render_body(query, proposal, classification, confidence,
+                 retrieval=None, comparisons=(), relation=None, core=None,
+                 filter_outcome=None) -> str:
     lines = []
     lines.append("# " + (proposal.title or "Untitled proposed note"))
     lines.append("")
@@ -109,11 +106,48 @@ def _render_body(query, proposal, classification, confidence) -> str:
         for item in sorted(set(proposal.relevant_candidates)):
             lines.append("- " + item)
     lines.append("")
-    lines.append("## Uncertainties")
+    lines.append("## Analysis")
+    lines.append("")
+    lines.append("Comparison: "
+                 + (proposal.comparison_summary or "(none recorded)"))
+    lines.append("Relations: "
+                 + (proposal.relation_summary or "(none recorded)"))
+    lines.append("Core relevance: "
+                 + (proposal.core_relevance or "(none recorded)"))
+    if filter_outcome is not None:
+        lines.append("Filter verdict: " + str(filter_outcome.verdict))
+        lines.append("Filter basis: "
+                     + (filter_outcome.basis or "(none recorded)"))
+    lines.append("")
+    lines.append("## Retrieved Context")
+    lines.append("")
+    if retrieval is not None and getattr(
+            retrieval, "candidates", ()):
+        for candidate in list(retrieval.candidates)[:10]:
+            lines.append("- " + str(getattr(candidate, "unit_id", ""))
+                         + " @ " + str(getattr(candidate, "source", ""))
+                         + ": " + str(getattr(candidate, "text", ""))[:1000])
+    else:
+        lines.append("- (no retrieval candidates recorded)")
+    lines.append("")
+    lines.append("## Proposed Knowledge")
+    lines.append("")
+    lines.append("Title: " + (proposal.title or "(untitled)"))
+    lines.append("Type: " + (ptype or "(unresolved)"))
+    if classification is not None:
+        lines.append("Classification rationale: "
+                     + (classification.rationale or "(none recorded)"))
+    if confidence is not None:
+        lines.append("Confidence basis: "
+                     + (confidence.basis or "(none recorded)"))
+    lines.append("")
+    lines.append("## Uncertainty")
     lines.append("")
     gaps = list(proposal.uncertainties)
     if confidence is not None:
         gaps.extend(confidence.uncertainties)
+    if filter_outcome is not None:
+        gaps.extend(list(filter_outcome.uncertainties))
     if gaps:
         for item in sorted(set(gaps)):
             lines.append("- " + item)

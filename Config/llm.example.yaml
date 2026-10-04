@@ -1,0 +1,51 @@
+# LLM provider configuration template for the LivingAuthenticity
+# Environment.
+#
+# HOW TO USE
+# ----------
+# 1. Copy this file next to itself and rename the copy to:
+#
+#        llm.local.yaml
+#
+# 2. Adjust the values in your llm.local.yaml for your machine.
+#
+# NOTES
+# -----
+# * This file is a committed template. It contains only generic,
+#   portable values and never real credentials or machine paths.
+# * llm.local.yaml is ignored by git and must never be committed.
+# * ``provider`` selects the implementation behind the LLM layer. The
+#   layer itself is a formal part of the workflow (after the Knowledge
+#   Filter, before human review); only the provider is replaceable.
+# * ``disabled`` is a valid, network-free configuration: the layer still
+#   runs, produces no candidates, and the safe stop with an explicit reason. There is no bypass path.
+#   affected unit stops safely instead of proceeding without synthesis.
+# * API credentials are read from the environment variable named in
+#   ``credential_env`` and are never written to configuration, logs, or
+#   audit records.
+
+llm:
+  # "disabled" (safe default, no network) | "ollama" (local server) |
+  # "cloud" (one example cloud request/response shape; see
+  # src/living_authenticity/llm/registry.py for how to add another)
+  provider: "disabled"
+
+  # Model name as known to the selected provider (never a filesystem
+  # path, never hardcoded in code — change it here whenever you like).
+  model: "<your-model-name>"
+
+  # Provider endpoint. Locality is resolved from this value, never from
+  # the provider name: a remote endpoint always triggers the privacy
+  # gate even when the provider is called "ollama".
+  endpoint: "http://127.0.0.1:11434"
+
+  # Name of the environment variable holding the API credential. Only
+  # consulted for non-local endpoints.
+  credential_env: ""
+
+  timeout_seconds: 120
+  max_tokens: 1024
+
+  # Bounded synthesis limits (untrusted output protection).
+  max_candidates: 3
+  max_body_characters: 20000

@@ -8,8 +8,10 @@ annotated-doc==0.0.4
     # via typer
 annotated-types==0.7.0
     # via pydantic
-anyio==4.14.1
-    # via httpx
+anyio==4.14.2
+    # via
+    #   -r requirements.in
+    #   httpx
 certifi==2026.6.17
     # via
     #   httpcore
@@ -153,8 +155,10 @@ typing-extensions==4.15.0
     #   typing-inspection
 typing-inspection==0.4.2
     # via pydantic
-urllib3==2.7.0
-    # via lance-namespace-urllib3-client
+urllib3==2.8.0
+    # via
+    #   -r requirements.in
+    #   lance-namespace-urllib3-client
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
