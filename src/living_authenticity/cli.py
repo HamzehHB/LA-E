@@ -135,6 +135,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", action="store_true",
         help="Print inspectable intermediates for each unit.",
     )
+    parser.add_argument(
+        "--app-language", default="",
+        help="APP/UI/process presentation language (en/fa); defaults to "
+             "language.app from Config/localization.example.yaml.",
+    )
+    parser.add_argument(
+        "--staging-language", default="",
+        help="STAGING NOTE output language (en/fa), independent of app "
+             "and audit languages.",
+    )
+    parser.add_argument(
+        "--audit-language", default="",
+        help="AUDIT human-readable presentation language (en/fa), "
+             "independent of app and staging languages.",
+    )
     return parser
 
 

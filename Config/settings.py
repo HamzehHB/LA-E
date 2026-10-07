@@ -47,6 +47,8 @@ PATHS_LOCAL_FILE = "paths.local.yaml"
 MODELS_FILE = "models.yaml"
 LLM_EXAMPLE_FILE = "llm.example.yaml"
 LLM_LOCAL_FILE = "llm.local.yaml"
+LOCALIZATION_EXAMPLE_FILE = "localization.example.yaml"
+LOCALIZATION_LOCAL_FILE = "localization.local.yaml"
 
 _PATHS_REQUIRED_KEYS = (
     "data.root",
@@ -291,5 +293,46 @@ def load_llm(config_dir: Path | str = CONFIG_DIR) -> dict:
     return data
 
 
+_LANGUAGES_SUPPORTED = ("en", "fa")
+_LANGUAGES_DEFAULTS = {"app": "en", "staging": "en", "audit": "en"}
+
+
+def load_languages(config_dir: Path | str = CONFIG_DIR) -> dict:
+    """Load and validate the three independent language domains.
+
+    Follows the same contract as :func:`load_llm`: the committed
+    ``localization.example.yaml`` provides portable defaults and an
+    optional gitignored ``localization.local.yaml`` overrides each domain
+    independently. Only ``en``/``fa`` are accepted; anything else raises
+    ``ConfigError``. The three domains never collapse to one value.
+    """
+    config_dir = Path(config_dir)
+    source = config_dir / LOCALIZATION_EXAMPLE_FILE
+    data = _load_yaml(source)
+    local = config_dir / LOCALIZATION_LOCAL_FILE
+    if local.is_file():
+        data = _deep_merge(data, _load_yaml(local))
+    section = data.get("language")
+    if not isinstance(section, dict):
+        raise ConfigError(
+            f"Invalid configuration in {source}: "
+            f"'language' must be a mapping."
+        )
+    result = {}
+    for domain in ("app", "staging", "audit"):
+        raw = section.get(domain, _LANGUAGES_DEFAULTS[domain])
+        text = raw.strip().lower() if isinstance(raw, str) else ""
+        aliases = {"english": "en", "persian": "fa", "farsi": "fa"}
+        code = aliases.get(text, text)
+        if code not in _LANGUAGES_SUPPORTED:
+            raise ConfigError(
+                f"Invalid configuration in {source}: "
+                f"'language.{domain}' must be one of: en, fa."
+            )
+        result[domain] = code
+    return {"language": result}
+
+
 PATHS = load_paths()
 MODELS = load_models()
+LANGUAGES = load_languages()

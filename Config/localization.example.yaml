@@ -1,0 +1,27 @@
+# Localization configuration template for the LivingAuthenticity Environment.
+#
+# HOW TO USE
+# ----------
+# 1. This committed example provides portable defaults (all English).
+# 2. Optionally create `localization.local.yaml` next to it (gitignored)
+#    overriding only the domains you want in another language.
+#
+# NOTES
+# -----
+# * Three INDEPENDENT language domains; changing one never changes another:
+#     language.app      -> APP / UI / PROCESS presentation language
+#     language.staging  -> STAGING NOTE output language (new journal content)
+#     language.audit    -> AUDIT human-readable presentation language
+# * Supported values: "en", "fa" only. Anything else is rejected.
+# * Knowledge language always follows the source knowledge itself unless
+#   `staging` is explicitly set otherwise; app/audit languages never
+#   translate source knowledge.
+# * Machine-readable fields (IDs, hashes, paths, timestamps, enums,
+#   provider/model identifiers) are never localized.
+# * Technical/system layer (code, config keys, docs for developers) stays
+#   English per project scope conventions.
+
+language:
+  app: "en"
+  staging: "en"
+  audit: "en"

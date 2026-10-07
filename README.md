@@ -132,6 +132,8 @@ The committed [Config/paths.example.yaml](Config/paths.example.yaml) provides a 
 
 See [SETUP.md](SETUP.md) for development setup, configuration, dependencies, and testing.
 
+Localization (app/staging/audit languages, English/Persian) is documented in [docs/localization.md](docs/localization.md).
+
 Testing
 
 Install the dev dependencies ([requirements-dev.txt](requirements-dev.txt)) and run the test suite:

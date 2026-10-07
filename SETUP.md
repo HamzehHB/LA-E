@@ -157,6 +157,8 @@ Current configuration files include:
 * [`models.yaml`](Config/models.yaml)
 * [`llm.example.yaml`](Config/llm.example.yaml)
 * `llm.local.yaml` (not committed; set `provider: "ollama"` locally)
+* [`localization.example.yaml`](Config/localization.example.yaml)
+* `localization.local.yaml` (not committed; per-domain en/fa overrides)
 
 ### `paths.example.yaml`
 
