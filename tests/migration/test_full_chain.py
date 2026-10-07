@@ -63,5 +63,8 @@ def test_stage_identity_and_llm_safe_stop():
     _handle_unit("child.md", unit, synthesis=_Failing(), entries=entries,
                  audits=audits)
     assert entries[0].outcome == "llm_safe_stop"
-    assert audits == []
+    assert len(audits) == 1, (
+        "safe stops persist a non-approved audit record, never approval")
+    assert audits[0].approval_approved is False
+    assert audits[0].execution_executed is False
 

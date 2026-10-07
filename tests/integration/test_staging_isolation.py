@@ -59,12 +59,13 @@ def test_guarded_keys_cover_config_contract():
     assert GUARDED_PATH_KEYS == (
         "data.root", "models.bge_m3", "vector_db.lancedb", "memory.root",
         "obsidian.vault", "zotero.library", "exports.root", "cache.root",
+        "audit.root",
     )
 
 
 def test_resolve_guarded_roots_uses_example_values():
     roots = resolve_guarded_roots()
-    assert len(roots) == 8
+    assert len(roots) == 9
     assert all(isinstance(value, str) and value.strip() for value in roots)
 
 

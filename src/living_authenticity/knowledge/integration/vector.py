@@ -27,6 +27,10 @@ from .guard import _ALLOWED_SOURCE_SUFFIXES
 # validation database must never resolve to this location.
 PRODUCTION_VECTOR_DB_KEY = "vector_db.lancedb"
 
+# Configuration keys for disjointness checks against audit/staging roots.
+AUDIT_PATH_KEY = "audit.root"
+STAGING_PATH_KEY = "staging.root"
+
 
 def _lookup(data: dict, dotted_key: str):
     """Walk nested mappings for one dotted key; return None when absent."""
@@ -46,16 +50,19 @@ def resolve_production_vector_db(config=None) -> str:
 
 
 def check_vector_store_eligible(db_path, production_vector_db="",
-                               vault_root="") -> tuple:
+                               vault_root="", audit_root="",
+                               staging_root="") -> tuple:
     """Return ``(eligible, reason, check)`` for one vector store candidate.
 
     The candidate must be explicitly supplied, outside the repository,
     and never identical to (or inside) the configured production vector
     database. As a non-authoritative retrieval index it must also stay
     outside the configured Obsidian vault root, so index artifacts can
-    never be written into authoritative notes. The directory may or may
-    not exist yet: LanceDB creates an empty database on first connect.
-    When it exists, it must be a real directory and not a symlink.
+    never be written into authoritative notes. It must additionally stay
+    disjoint from the configured audit and staging roots. The directory
+    may or may not exist yet: LanceDB creates an empty database on first
+    connect. When it exists, it must be a real directory and not a
+    symlink.
     """
     if not isinstance(db_path, str) or not db_path.strip():
         return (False, "vector store path missing", "vector_db")
@@ -77,6 +84,16 @@ def check_vector_store_eligible(db_path, production_vector_db="",
     vault = vault_root.strip() if isinstance(vault_root, str) else ""
     if vault and PathBoundary(vault).is_allowed(db_path):
         return (False, "vector store inside the Obsidian vault",
+                "vector_db")
+    audit = audit_root.strip() if isinstance(audit_root, str) else ""
+    if audit and (PathBoundary(audit).is_allowed(db_path)
+                  or PathBoundary(db_path).is_allowed(audit)):
+        return (False, "vector store overlaps the audit root",
+                "vector_db")
+    staging = staging_root.strip() if isinstance(staging_root, str) else ""
+    if staging and (PathBoundary(staging).is_allowed(db_path)
+                    or PathBoundary(db_path).is_allowed(staging)):
+        return (False, "vector store overlaps the staging root",
                 "vector_db")
     return (True, "", "")
 

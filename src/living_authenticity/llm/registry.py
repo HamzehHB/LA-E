@@ -1,4 +1,4 @@
-"""Provider selection for the formal LLM layer.
+"""Provider selection for the AI synthesis capability.
 
 Switching provider *and* model is a configuration edit only
 (``Config/llm.local.yaml``): neither is hardcoded in code, and no
@@ -52,10 +52,10 @@ def build_provider(config: dict | None = None) -> LLMProvider:
 
     ``config`` is the mapping produced by ``Config.settings.load_llm``.
     An absent or unreadable section yields the safe ``disabled``
-    provider: the formal LLM stage still runs, attempts no network
-    call, produces no candidates, and the affected unit stops safely
-    with an explicit reason instead of proceeding without LLM
-    synthesis. There is no bypass path around the formal stage.
+    provider: the mandatory synthesis step still runs, attempts no
+    network call, produces no candidates, and the affected unit stops
+    safely with an explicit reason instead of proceeding without
+    synthesis. There is no bypass path around the mandatory step.
 
     Model names are never invented here: a provider that requires one
     fails safely when the configuration does not supply it.

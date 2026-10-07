@@ -1,4 +1,4 @@
-"""Strict result contract for the formal LLM stage.
+"""Strict result contract for the AI synthesis capability.
 
 The contract is one JSON object with a ``candidates`` array. Every rule
 here is enforced fail-closed: an unusable response stops the unit

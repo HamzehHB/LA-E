@@ -1,22 +1,26 @@
-"""Write-surface security proof: ControlledExecutor is the only filesystem writer.
+"""Write-surface security proof: enumerated filesystem writers.
 
 Static AST scan over the current application source tree (proven from
 code, not from historical reports):
 
-* the single filesystem-mutation call site in ``src/`` is the
-  controlled-execution staging ``write_text``;
-* the executor performs exactly one write and never deletes, renames,
-  creates directories, or replaces paths;
+* exactly two filesystem-mutation modules exist: the
+  controlled-execution staging ``write_text`` (``executor.py``) and the
+  append-only audit writer (``audit/persistence.py``);
+* the executor performs exactly one staging write and never deletes,
+  renames, creates directories, or replaces paths;
+* the audit writer appends audit lines only (``open`` in ``"a"`` mode),
+  creates only its configured audit root (``makedirs``), and never
+  deletes, renames, or replaces paths;
 * the governance and security boundary families contain no
   rename/replace capability at all, and no ``os.*`` path mutation is
   called anywhere in application code;
-* every ``open`` call in ``src/`` is read-mode only;
+* every other ``open`` call in ``src/`` is read-mode only;
 * no process, network, dynamic-code, or deserialization import exists
-  in application code.
+  in application code (outside the narrow LLM urllib/http allowance).
 
-Together these prove the end-to-end security invariants -- controlled
-execution remains CREATE-only and staging-confined, and no alternate
-filesystem execution path exists across the current package structure.
+Together these prove the end-to-end security invariants --
+ControlledExecutor writes staging only, AuditWriter writes audit only,
+and no third filesystem execution path exists.
 """
 import ast
 from pathlib import Path
@@ -24,6 +28,12 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[2] / "src"
 
 EXECUTOR = "living_authenticity/knowledge/governance/execution/executor.py"
+
+AUDIT_WRITER = "living_authenticity/knowledge/governance/audit/persistence.py"
+
+WRITER_MODULES = frozenset({EXECUTOR, AUDIT_WRITER})
+
+AUDIT_ALLOWED_MUTATIONS = frozenset({"write", "makedirs"})
 
 MUTATION_ATTRS = frozenset({
     "write_text", "write_bytes", "write",
@@ -94,19 +104,98 @@ def _extract_mode(node: ast.Call, is_method: bool) -> str:
 def test_controlled_executor_is_the_sole_mutation_call_site():
     offenders = []
     executor_seen = False
+    audit_seen = False
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for attr, _base, _node in _iter_calls(tree):
             if attr not in MUTATION_ATTRS:
                 continue
-            if _relative(path) == EXECUTOR:
+            relative = _relative(path)
+            if relative == EXECUTOR:
                 executor_seen = True
+            elif relative == AUDIT_WRITER:
+                audit_seen = True
             else:
-                offenders.append(_relative(path) + ":" + attr)
+                offenders.append(relative + ":" + attr)
     assert executor_seen is True, (
         "scan found no write in the executor; the scan itself is broken"
     )
+    assert audit_seen is True, (
+        "scan found no write in the audit writer; the scan itself is broken"
+    )
     assert offenders == [], f"alternate filesystem mutation found: {offenders}"
+
+
+def test_only_two_writer_modules_exist():
+    found = set()
+    for path in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for attr, _base, _node in _iter_calls(tree):
+            if attr in MUTATION_ATTRS:
+                found.add(_relative(path))
+    assert found == set(WRITER_MODULES), f"writer modules changed: {sorted(found)}"
+
+
+def test_audit_writer_appends_only_and_never_deletes_or_renames():
+    tree = ast.parse((SRC / AUDIT_WRITER).read_text(encoding="utf-8"))
+    counts = {}
+    for attr, _base, _node in _iter_calls(tree):
+        counts[attr] = counts.get(attr, 0) + 1
+    for forbidden in ("unlink", "rename", "replace", "rmdir", "remove",
+                      "rmtree", "symlink", "link", "move", "write_text",
+                      "write_bytes", "touch"):
+        assert counts.get(forbidden, 0) == 0, (
+            f"audit writer must not perform {forbidden}"
+        )
+    assert counts.get("write", 0) >= 1, "audit writer must append lines"
+    assert counts.get("makedirs", 0) >= 1, "audit writer may create its root"
+
+
+def test_audit_writer_uses_append_mode_only():
+    tree = ast.parse((SRC / AUDIT_WRITER).read_text(encoding="utf-8"))
+    for attr, base, node in _iter_calls(tree):
+        if attr != "open":
+            continue
+        is_method = bool(base) or isinstance(node.func, ast.Attribute)
+        mode = _extract_mode(node, is_method)
+        assert mode.startswith("a"), (
+            f"audit writer open() must be append-mode, got {mode!r}")
+    text = (SRC / AUDIT_WRITER).read_text(encoding="utf-8")
+    assert '"w"' not in text.replace("AuditWriter", ""), (
+        "audit writer must not contain truncate-write mode")
+
+
+def _code_text_without_docstrings(path: Path) -> str:
+    """Return source text minus docstrings for capability scans.
+
+    Docstrings may legitimately name sibling boundaries to document
+    disjointness (e.g. the audit writer states it never touches
+    staging); capability must be proven from code, not prose.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                first.value.value = ""
+    return ast.unparse(tree)
+
+
+def test_audit_writer_cannot_reach_vault_or_staging():
+    code = _code_text_without_docstrings(SRC / AUDIT_WRITER)
+    for marker in ("staging", "vault", "vector", "lance", "ControlledExecutor"):
+        assert marker.lower() not in code.lower(), (
+            f"audit writer must not reference {marker}")
+    assert "audit" in code.lower()
+
+
+def test_executor_cannot_reach_audit_root():
+    code = _code_text_without_docstrings(SRC / EXECUTOR)
+    assert "audit" not in code.lower(), (
+        "executor must not reference the audit root")
 
 
 def test_executor_writes_once_and_never_deletes_or_renames():
@@ -138,6 +227,9 @@ def test_no_rename_or_replace_in_boundary_families_or_via_os():
 def test_all_open_calls_in_src_are_read_mode():
     offenders = []
     for path in sorted(SRC.rglob("*.py")):
+        relative = _relative(path)
+        if relative == AUDIT_WRITER:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for attr, base, node in _iter_calls(tree):
             if attr != "open":

@@ -13,10 +13,36 @@ from .outcome import IntegrationRunReport
 from .unit_loop import _handle_unit
 
 
+def _persist_audits(audit_writer, audits, audit_receipts) -> None:
+    """Append every in-memory audit record; receipts stay inspectable.
+
+    Persistence failure is fail-closed at the caller contract level:
+    receipts record the failure and callers must treat a configured but
+    unwritable audit root as a stop condition for execution paths.
+    Here the append loop records per-record receipts or failure notes;
+    it never raises, never retries silently, and never writes elsewhere.
+    """
+    if audit_writer is None:
+        return
+    for record in list(audits):
+        try:
+            receipt = audit_writer.append(record)
+        except Exception as exc:
+            audit_receipts.append({"record_id": getattr(
+                record, "record_id", ""), "persisted": False,
+                "reason": str(exc) or "audit persistence failed"})
+            continue
+        entry = dict(receipt)
+        entry["persisted"] = True
+        audit_receipts.append(entry)
+
+
 def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
              runner, pinned, guarded, schema_version, approval_reader,
              entries, audits, authorized, synthesis, details,
-             vault_context=None):
+             vault_context=None, operating_mode="", run_id="",
+             audit_writer=None, audit_receipts=None,
+             audit_guard_error="", llm_config=None):
     """Ingest (unless already ingested), analyse, then govern every unit."""
     if ingestion is None:
         try:
@@ -34,6 +60,10 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
             schema_version, approval_reader, entries, audits,
             authorized, synthesis, details=details,
             vault_context=vault_context,
+            operating_mode=operating_mode, run_id=run_id,
+             audit_writer=audit_writer,
+             audit_receipts=audit_receipts,
+             audit_guard_error=audit_guard_error, llm_config=llm_config,
         )
     return True
 
@@ -46,7 +76,13 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                             authorized_staging_root=None,
                             synthesis=None, llm_config=None,
                             source_files=None,
-                            ingestion=None, vault_context=None) -> IntegrationRunReport:
+                            ingestion=None, vault_context=None,
+                            operating_mode: str = "personal_vault",
+                            audit_root: str = "",
+                            authorized_audit_root=None,
+                            authorized_audit_passed="",
+                            authorized_audit_failed="",
+                            run_id: str = "") -> IntegrationRunReport:
     """Run one bounded local-integration pass; return an in-memory report.
 
     Three explicit input shapes, one governance path:
@@ -72,12 +108,54 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
     from src.living_authenticity.knowledge.governance.approval.explicit_gate import (
         ExplicitApprovalGate,
     )
+    from .guard import (check_audit_eligible, resolve_authorized_audit_root,
+                        resolve_authorized_audit_passed,
+                        resolve_authorized_audit_failed)
 
     guarded = tuple(guarded_roots) if guarded_roots is not None else resolve_guarded_roots()
     authorized = (
         authorized_staging_root if authorized_staging_root is not None
         else resolve_authorized_staging_root()
     )
+    authorized_audit = (
+        authorized_audit_root if authorized_audit_root is not None
+        else resolve_authorized_audit_root()
+    )
+    authorized_passed = (
+        authorized_audit_passed if authorized_audit_passed is not None
+        else resolve_authorized_audit_passed()
+    )
+    authorized_failed = (
+        authorized_audit_failed if authorized_audit_failed is not None
+        else resolve_authorized_audit_failed()
+    )
+    audit_writer = None
+    audit_guard_error = ""
+    if isinstance(audit_root, str) and audit_root.strip():
+        audit_ok, audit_reason, _audit_check = check_audit_eligible(
+            audit_root, guarded, authorized_audit,
+            authorized_passed, authorized_failed)
+        if not audit_ok:
+            return IntegrationRunReport(
+                source_root=source_root if isinstance(source_root, str) else "",
+                staging_root=staging_root if isinstance(staging_root, str) else "",
+                max_files=max_files, accepted=False,
+                rejection_reason=audit_reason, rejection_check="audit",
+            )
+        from src.living_authenticity.knowledge.governance.audit.persistence import (
+            AuditWriter,
+        )
+        try:
+            audit_writer = AuditWriter(audit_root, authorized_passed, authorized_failed)
+        except Exception as exc:
+            audit_guard_error = str(exc)
+            audit_writer = None
+    active_run_id = run_id if isinstance(run_id, str) and run_id else ""
+    if not active_run_id:
+        import uuid
+        active_run_id = "run-" + uuid.uuid4().hex[:12]
+    mode_value = operating_mode if isinstance(operating_mode, str) else ""
+    audit_receipts: list = []
     pipe = pipeline if pipeline is not None else EvidenceFirstPipeline()
     gate = approval_gate if approval_gate is not None else ExplicitApprovalGate()
     runner = executor if executor is not None else ControlledExecutor()
@@ -150,14 +228,20 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                     gate, validator, runner, pinned, guarded,
                     schema_version, approval_reader, entries, audits,
                     authorized, synthesis, details,
-                    vault_context=vault_context):
+                    vault_context=vault_context,
+                    operating_mode=mode_value, run_id=active_run_id,
+                    audit_writer=audit_writer,
+                    audit_receipts=audit_receipts,
+                    audit_guard_error=audit_guard_error,
+                    llm_config=llm_config):
             processed = 1
+        _persist_audits(audit_writer, audits, audit_receipts)
         return IntegrationRunReport(
             source_root=str(source_label), staging_root=pinned,
             max_files=max_files, files_seen=1,
             files_processed=processed, files_skipped=0,
             accepted=True, units=tuple(entries), audits=tuple(audits),
-            details=tuple(details),
+            details=tuple(details), audit_receipts=tuple(audit_receipts),
         )
 
     # Default: scan source_root
@@ -190,15 +274,21 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
         if _run_one(child, None, pipe, corpus_units, cores, gate, validator,
                     runner, pinned, guarded, schema_version, approval_reader,
                     entries, audits, authorized, synthesis, details,
-                    vault_context=vault_context):
+                    vault_context=vault_context,
+                    operating_mode=mode_value, run_id=active_run_id,
+                    audit_writer=audit_writer,
+                    audit_receipts=audit_receipts,
+                    audit_guard_error=audit_guard_error,
+                    llm_config=llm_config):
             processed += 1
         else:
             skipped += 1
     skipped += max(0, len(candidates) - min(len(candidates), max_files))
+    _persist_audits(audit_writer, audits, audit_receipts)
     return IntegrationRunReport(
         source_root=source_root, staging_root=pinned,
         max_files=max_files, files_seen=len(candidates),
         files_processed=processed, files_skipped=skipped,
         accepted=True, units=tuple(entries), audits=tuple(audits),
-        details=tuple(details),
+        details=tuple(details), audit_receipts=tuple(audit_receipts),
     )

@@ -27,11 +27,30 @@ Facts verified against the repository at this checkpoint:
   No dynamic code execution (`eval`/`exec`), no shell-out
   (`subprocess`/`os.system`), and no deserialization of untrusted data.
 * The analytical pipeline is analysis-only: it performs no authoritative writes
-  to knowledge. The single controlled-execution boundary
-  (`knowledge/governance/execution/`) writes exactly one approved + revalidated
-  `CREATE` artifact (`<proposal_hash>.md`) into an explicitly supplied
-  staging root confined by `PathBoundary`, with no overwrite and no
-  authoritative-vault placement. Current executable action scope is
+  to knowledge. Exactly **three** narrowly scoped write surfaces exist, with
+  disjoint roots (staging and audit proved by
+  `tests/security/test_execution_write_surface.py`; vector isolation proved by
+  vector eligibility tests):
+  1. **ControlledExecutor** (`knowledge/governance/execution/`) writes exactly
+     one approved + revalidated `CREATE` artifact (`<proposal_hash>.md`) into
+     an explicitly supplied staging root confined by `PathBoundary`, with no
+     overwrite and no authoritative-vault placement;
+  2. **AuditWriter** (`knowledge/governance/audit/persistence.py`) appends
+     append-only JSONL records under the config-declared `audit.root`,
+     partitioned into configurable `passed` / `failed` subroots (defaults
+     `<audit.root>/passed` and `<audit.root>/failed`; `passed/` holds
+      ONLY the executed-CREATE terminal record, `failed/` holds every
+      other terminal record including pre-execution checkpoints).
+      It never overwrites,
+     deletes, or renames existing records and never writes to vault, staging,
+     index, or any other root. Credential-like keys are stripped recursively
+     before persistence. When an audit root is configured, the required
+     pre-execution audit append must succeed before staging execution;
+  3. **Vector/index subsystem** may write only its own derived LanceDB index
+     under an explicitly supplied, isolated vector root (never the production
+     vector database, never vault/staging/audit). Indexing is explicit
+     operator action only — no watcher and no background reindex.
+  Current executable action scope is
   `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` — everything else is future work.
 * Private configuration and private documents are physically outside the
   tracked tree: `Config/paths.local.yaml`, `Config/llm.local.yaml`,
@@ -46,9 +65,11 @@ Facts verified against the repository at this checkpoint:
   development agents, and knowing a path is not permission.
 * Reusable runtime security utilities live in `src/living_authenticity/security/`: a default-deny path boundary (`PathBoundary`) and value-safe sensitive-data detection (`find_secrets` / `contains_secret`). `PathBoundary` is wired into the controlled-execution boundary (`knowledge/governance/execution/`) as its staging confinement; it remains unwired into the ingestion/analysis pipeline, which performs no writes.
 * The bounded local-integration runner (`knowledge/integration/`) adds no
-  new write path: it composes the existing approval, revalidation,
-  controlled-execution, and audit contracts, and routes every write
-  through `ControlledExecutor`. Its staging eligibility guard is
+  new write authority: it composes the existing approval, revalidation,
+  controlled-execution, and audit contracts, routing staging writes
+  through `ControlledExecutor` and, only when a valid `audit.root` is
+  configured and passes the audit guard, traceability appends through
+  `AuditWriter`. Its staging eligibility guard is
   computed from the deployment's own configuration
   (`Config/paths.local.yaml` via `Config/settings.py`) — staging must be
   explicitly supplied, already exist, be a real directory, not be a
@@ -82,7 +103,7 @@ Facts verified against the repository at this checkpoint:
 
 ## 2. Per-Checkpoint Security Checklist (run before every commit)
 
-Steps 1–5 are automated in `tests/test_repository_security.py` — keep it green:
+Steps 1–5 are automated in `tests/security/test_repository_security.py` — keep it green:
 
 1. **Secret scan** — no known secret patterns in tracked files.
 2. **Machine-path scan** — the configured production data root and the

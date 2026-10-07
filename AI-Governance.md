@@ -972,6 +972,17 @@ A less capable model does not receive a different governance principle.
 
 The governance layer must remain stable while models and providers can change.
 
+AI synthesis capability (bounded analytical role): where the current
+implementation invokes model-backed synthesis, that capability is a
+replaceable analytical collaborator operating under the surrounding
+deterministic contracts. It produces candidate outputs for human
+review; it never approves, authorizes, executes, or evolves
+knowledge. The distinctions of §48 apply to its outputs without
+exception: AI analysis is not authorization, AI output is not
+approval, AI confidence is not permission, and AI failure never
+permits bypassing the mandatory step — the affected unit stops safely
+instead.
+
 
 ---
 

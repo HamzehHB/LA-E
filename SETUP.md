@@ -203,7 +203,7 @@ registry branch — never by editing the shared interface.
 
 2. Edit `Config/paths.local.yaml` and set the real locations for
    your machine (persistent data root, model path, vector database,
-   Obsidian vault, Zotero library, exports, cache, and staging).
+   Obsidian vault, Zotero library, exports, cache, staging, and audit).
 
 3. Set `staging.root` to the single directory that may receive
    controlled-execution artifacts. This is an explicit, config-declared
@@ -212,7 +212,23 @@ registry branch — never by editing the shared interface.
    subdirectory of the declared staging root. Leaving it unset
    authorizes no staging location inside guarded persistent data.
 
-4. Run the test suite (see [Testing](#testing)) to verify your configuration
+4. Set `audit.root` to the single directory that receives persistent
+   audit records (append-only traceability, one JSON line per record).
+   It is part of the guarded-root family: it must resolve outside the
+   repository and must not overlap the vault, staging, or vector
+   database roots. When configured, the audit writer may create the
+   root and its category subroots if missing; it never creates anything
+   outside that boundary. Leaving it unset keeps audit records in
+   memory only. Optional `audit.passed` and `audit.failed` select
+   independently where successful vs unsuccessful terminal records are
+   stored; each must resolve inside `audit.root` (defaults:
+   `<audit.root>/passed` and `<audit.root>/failed`). Storage category
+   `failed` includes intentional safety holds/rejections and is not
+   synonymous with a system error — richer lifecycle outcomes remain
+   on the audit record. A future UI will expose these as folder picks
+   without editing YAML manually.
+
+5. Run the test suite (see [Testing](#testing)) to verify your configuration
    loads correctly.
 
 Repository-internal locations — the repository root itself and the

@@ -110,6 +110,7 @@ class IntegrationRunReport:
     units: tuple = field(default_factory=tuple)
     audits: tuple = field(default_factory=tuple)
     details: tuple = field(default_factory=tuple)
+    audit_receipts: tuple = field(default_factory=tuple)
     is_authoritative: bool = False
     requires_human_review: bool = True
 
@@ -117,6 +118,8 @@ class IntegrationRunReport:
         object.__setattr__(self, "units", tuple(self.units))
         object.__setattr__(self, "audits", tuple(self.audits))
         object.__setattr__(self, "details", tuple(self.details))
+        object.__setattr__(self, "audit_receipts",
+                           tuple(self.audit_receipts))
         object.__setattr__(self, "is_authoritative", False)
         object.__setattr__(self, "requires_human_review", True)
 

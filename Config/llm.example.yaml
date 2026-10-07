@@ -14,10 +14,11 @@
 # * This file is a committed template. It contains only generic,
 #   portable values and never real credentials or machine paths.
 # * llm.local.yaml is ignored by git and must never be committed.
-# * ``provider`` selects the implementation behind the LLM layer. The
-#   layer itself is a formal part of the workflow (after the Knowledge
-#   Filter, before human review); only the provider is replaceable.
-# * ``disabled`` is a valid, network-free configuration: the layer still
+# * ``provider`` selects the implementation behind the AI synthesis
+#   capability. The synthesis step itself is a mandatory part of the
+#   workflow (after the Knowledge Filter, before human review); only
+#   the provider is replaceable.
+# * ``disabled`` is a valid, network-free configuration: the step still
 #   runs, produces no candidates, and the safe stop with an explicit reason. There is no bypass path.
 #   affected unit stops safely instead of proceeding without synthesis.
 # * API credentials are read from the environment variable named in
@@ -28,6 +29,9 @@ llm:
   # "disabled" (safe default, no network) | "ollama" (local server) |
   # "cloud" (one example cloud request/response shape; see
   # src/living_authenticity/llm/registry.py for how to add another)
+  # Local LLM is the default experience: the later UI lists available
+  # local models (see llm/discovery.py) and the user picks one with a
+  # click; cloud selection stays explicit and privacy-gated.
   provider: "disabled"
 
   # Model name as known to the selected provider (never a filesystem

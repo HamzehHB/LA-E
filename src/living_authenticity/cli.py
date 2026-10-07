@@ -7,6 +7,9 @@ from src.living_authenticity.knowledge.integration import (
     check_staging_eligible,
     index_corpus,
     ingest_units,
+    resolve_authorized_audit_failed,
+    resolve_authorized_audit_passed,
+    resolve_authorized_audit_root,
     resolve_authorized_staging_root,
     resolve_guarded_roots,
     run_bounded_integration,
@@ -68,6 +71,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--staging-root", default="",
         help="Explicit staging destination; defaults to the config-declared "
              "staging.root and must still pass the unchanged guard.",
+    )
+    parser.add_argument(
+        "--audit-root", default="",
+        help="Explicit persistent audit root; defaults to the config-declared "
+             "audit.root. Leave unset to keep audit records in memory only.",
+    )
+    parser.add_argument(
+        "--audit-passed", default="",
+        help="Explicit directory for passed audit records (approved CREATE "
+             "that actually created its staging artifact); defaults "
+             "to <audit-root>/passed. Must resolve inside the audit root.",
+    )
+    parser.add_argument(
+        "--audit-failed", default="",
+        help="Explicit directory for failed/rejected/held audit records; defaults "
+             "to <audit-root>/failed. Must resolve inside the audit root.",
     )
     parser.add_argument(
         "--max-files", type=int, default=1,
@@ -180,6 +199,18 @@ def main(argv=None) -> int:
     print("input: " + (args.input_file or args.source_root)
           if not args.text.strip() else "input: <text> (in memory)")
     print("staging root: " + (staging_arg or "(none)"))
+    authorized_audit_preview = resolve_authorized_audit_root(paths)
+    audit_root_preview = args.audit_root.strip() or authorized_audit_preview
+    print("audit root: " + (audit_root_preview or "(memory only)"))
+    if audit_root_preview:
+        passed_preview = (args.audit_passed.strip()
+                          or resolve_authorized_audit_passed(paths)
+                          or (audit_root_preview.rstrip("/\\") + "/passed"))
+        failed_preview = (args.audit_failed.strip()
+                          or resolve_authorized_audit_failed(paths)
+                          or (audit_root_preview.rstrip("/\\") + "/failed"))
+        print("audit passed: " + passed_preview)
+        print("audit failed: " + failed_preview)
     print("max files (source, corpus, core): " + str(args.max_files))
     print("corpus root: " + (args.corpus_root or "(none)"))
     print("core root: " + (core_source or "(none)") + (
@@ -391,43 +422,24 @@ def main(argv=None) -> int:
         except Exception as exc:
             print("error: text ingestion failed: " + str(exc))
             return 2
-        from src.living_authenticity.knowledge.integration.runner import (
-            _handle_unit as _govern,
+        authorized_audit = resolve_authorized_audit_root(paths)
+        authorized_passed = resolve_authorized_audit_passed(paths)
+        authorized_failed = resolve_authorized_audit_failed(paths)
+        audit_root_arg = args.audit_root.strip() or authorized_audit
+        audit_passed_arg = args.audit_passed.strip() or authorized_passed
+        audit_failed_arg = args.audit_failed.strip() or authorized_failed
+        report = run_bounded_integration(
+            "", staging_arg, pipeline=pipe,
+            corpus=corpus_units, core_units=core_units,
+            max_files=args.max_files,
+            llm_config=llm_config, synthesis=synthesis,
+            ingestion=ingestion,
+            vault_context=vault_context_excerpts or None,
+            audit_root=audit_root_arg,
+            authorized_audit_root=authorized_audit,
+            authorized_audit_passed=audit_passed_arg,
+            authorized_audit_failed=audit_failed_arg,
         )
-        from src.living_authenticity.knowledge.integration.outcome import (
-            IntegrationRunReport as _Report,
-        )
-        integrated = pipe.run_ingestion(
-            ingestion, corpus=corpus_units, core_units=core_units)
-        from src.living_authenticity.knowledge.governance.approval.explicit_gate import (
-            ExplicitApprovalGate as _Gate,
-        )
-        from src.living_authenticity.knowledge.governance.execution.executor import (
-            ControlledExecutor as _Exec,
-        )
-        from src.living_authenticity.knowledge.governance.revalidation.revalidator import (
-            Revalidator as _Val,
-        )
-        from src.living_authenticity.knowledge.integration.runner import (
-            _handle_unit as _govern,
-        )
-        from src.living_authenticity.knowledge.integration.outcome import (
-            IntegrationRunReport as _Report,
-        )
-        entries: list = []
-        audits: list = []
-        details: list = []
-        for unit_result in integrated.units:
-            _govern("text-input", unit_result, _Gate(), _Val(), _Exec(),
-                    staging_arg, guarded, "", None, entries, audits,
-                    authorized, synthesis, details=details,
-                    vault_context=vault_context_excerpts or None)
-        report = _Report(source_root="text-input", staging_root=staging_arg,
-                         max_files=1, files_seen=1,
-                         files_processed=len(integrated.units),
-                         files_skipped=0, accepted=True,
-                         units=tuple(entries), audits=tuple(audits),
-                         details=tuple(details))
     elif args.input_file.strip():
         from pathlib import Path as _Path
         single = _Path(args.input_file)
@@ -437,20 +449,41 @@ def main(argv=None) -> int:
         if single.suffix.lower() not in (".md", ".txt"):
             print("error: --input-file must be .md or .txt")
             return 2
+        authorized_audit = resolve_authorized_audit_root(paths)
+        authorized_passed = resolve_authorized_audit_passed(paths)
+        authorized_failed = resolve_authorized_audit_failed(paths)
+        audit_root_arg = args.audit_root.strip() or authorized_audit
+        audit_passed_arg = args.audit_passed.strip() or authorized_passed
+        audit_failed_arg = args.audit_failed.strip() or authorized_failed
         report = run_bounded_integration(
             str(single.parent), staging_arg, pipeline=pipe,
             corpus=corpus_units, core_units=core_units,
             max_files=args.max_files,
             llm_config=llm_config, synthesis=synthesis,
+            source_files=[str(single)],
             vault_context=vault_context_excerpts or None,
+            audit_root=audit_root_arg,
+            authorized_audit_root=authorized_audit,
+            authorized_audit_passed=audit_passed_arg,
+            authorized_audit_failed=audit_failed_arg,
         )
     else:
+        authorized_audit = resolve_authorized_audit_root(paths)
+        authorized_passed = resolve_authorized_audit_passed(paths)
+        authorized_failed = resolve_authorized_audit_failed(paths)
+        audit_root_arg = args.audit_root.strip() or authorized_audit
+        audit_passed_arg = args.audit_passed.strip() or authorized_passed
+        audit_failed_arg = args.audit_failed.strip() or authorized_failed
         report = run_bounded_integration(
             args.source_root, staging_arg, pipeline=pipe,
             corpus=corpus_units, core_units=core_units,
             max_files=args.max_files,
             llm_config=llm_config, synthesis=synthesis,
             vault_context=vault_context_excerpts or None,
+            audit_root=audit_root_arg,
+            authorized_audit_root=authorized_audit,
+            authorized_audit_passed=audit_passed_arg,
+            authorized_audit_failed=audit_failed_arg,
         )
     if not report.accepted:
         print("run rejected: " + report.rejection_reason)

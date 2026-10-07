@@ -1,4 +1,4 @@
-"""Provider-neutral response normalization for the formal LLM stage.
+"""Provider-neutral response normalization for the AI synthesis capability.
 
 This is the one shared boundary where a raw model string becomes a
 candidate JSON document. It is deliberately minimal and deterministic:

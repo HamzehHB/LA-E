@@ -17,11 +17,13 @@ explicit source root
   → proposal
   → confidence
   → knowledge filter
+  → LLM synthesis (mandatory)
   → human review
   → explicit approval
   → revalidation
+  → audit checkpoint (when audit.root is configured)
   → controlled execution into an isolated staging root
-  → audit record
+  → audit record (passed/failed storage categories)
 ```
 
 Every boundary is unchanged by this workflow:

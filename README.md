@@ -68,6 +68,44 @@ Implemented foundations include:
   retriever unless embedding is explicitly requested. Vector results are
   evidence only (Retrieval ≠ Decision; Similarity ≠ Identity), and the
   vector store is a retrieval index, never an authoritative store
+- An explicit Personal Vault vs Examples operating-mode contract
+  (`knowledge/modes.py`): examples mode fails closed rather than ever
+  resolving the configured personal vault; mode is recorded in audit
+  records
+- Guarded `audit.root` configuration key with optional independently
+  selectable `audit.passed` / `audit.failed` subroots, resolved-path
+  validation, overlap rejection against vault/staging/vector roots
+  (`check_audit_eligible`, `check_roots_disjoint`), and an append-only
+  `AuditWriter` as a second, explicitly-scoped write surface disjoint
+  from `ControlledExecutor` (proved by re-scoped write-surface security
+  tests with negative controls). `passed/` holds ONLY the
+  executed-CREATE terminal record (approved CREATE that actually
+  created its staging artifact); `failed/` holds every other terminal
+  record, including approved + revalidated pre-execution checkpoints
+  (a safety prerequisite, never a passed outcome). Richer lifecycle
+  outcomes remain on the record. Pre-execution audit persistence must
+  succeed before `ControlledExecutor` may write a staging artifact
+  when an audit root is configured.
+- Persistent audit covering executed *and* non-executed/rejected/held
+  paths: LLM safe stops, held non-executable candidates, revalidation
+  failures, and rejections persist non-approved audit records with
+  traceability fields (input/evidence hashes, retrieval provenance with
+  considered/retrieved/passed_downstream/used_as_evidence, prompt hash,
+  artifact path/hash/timestamp on success, stop reasons); credentials
+  are never persisted (recursive sanitizer)
+- An inspectable vault manifest/freshness contract
+  (`snapshot_vault`, `diff_manifests`, `verify_index_freshness`) plus an
+  explicit `synchronize_index` action — vault-derived state stays
+  inspectable and synchronized only by explicit operator action, never
+  by a hidden background watcher
+- An LLM provider/model discovery and selection contract
+  (`llm/discovery.py`): read-only local model discovery, local-first
+  default, cloud as an explicit choice, validated selection states for a
+  future UI; no downloads, no credential exposure, mandatory gate
+  unchanged
+- An artifact lifecycle matrix documenting, for every pipeline state,
+  what exists in memory, what persists, and when a staging artifact does
+  or does not exist ([docs/artifact-lifecycle-matrix.md](docs/artifact-lifecycle-matrix.md))
 - A synthetic, public-safe example of that workflow under
   [examples/bounded_local_integration/](examples/bounded_local_integration/README.md)
 

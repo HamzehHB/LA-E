@@ -1,15 +1,19 @@
-"""Formal LLM layer for the knowledge workflow.
+"""Replaceable AI synthesis capability for the knowledge workflow.
 
-The LLM layer is a first-class workflow component: it sits after the
-Knowledge Filter and before human review, receives the real structured
-outputs of the analytical stages, and produces candidate outputs for
-review. Only the *provider* behind it is replaceable, selected through
+``llm/`` is infrastructure, not a pipeline stage and not an
+authority: it hosts the provider implementations (``disabled`` safe
+default, ``ollama`` local, ``cloud`` explicit) plus the bounded
+``Synthesis`` collaborator that the integration driver invokes once
+per unit between the Knowledge Filter and human review. Only the
+provider/model behind the capability is replaceable, selected through
 ``Config/llm.example.yaml`` / ``Config/llm.local.yaml``.
 
 ``LLM output != authorization``: suggested actions, confidence, and
 reasoning from any provider are analysis material only. Governance
 (action eligibility, approval, revalidation, execution, staging
-destination) stays deterministic and unchanged.
+destination) stays deterministic and unchanged. AI participates in
+analysis and synthesis; it never approves, authorizes, executes, or
+evolves knowledge.
 
 Public surface:
 

@@ -11,7 +11,8 @@ from src.living_authenticity.security.path_boundary import PathBoundary
 from .guard import _ALLOWED_SOURCE_SUFFIXES
 
 
-__all__ = ("index_corpus", "index_units", "ingest_units")
+__all__ = ("index_corpus", "index_units", "ingest_units",
+           "synchronize_index", "describe_index_state")
 
 
 def _unit_text(unit) -> str:
@@ -182,3 +183,64 @@ def index_corpus(corpus_root, pipeline, embedder, store,
             units_indexed += 1
             vectors_stored += 1
     return (files_indexed, units_indexed, vectors_stored, files_skipped)
+
+
+def describe_index_state(store, manifest) -> dict:
+    """Describe whether ``store`` covers ``manifest`` without mutating.
+
+    Returns the freshness report plus the stored row count. The vault
+    manifest is the source of truth; the vector store is derived state.
+    """
+    try:
+        rows = store.show_all()
+    except Exception:
+        rows = []
+    indexed = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        source = row.get("source")
+        if not isinstance(source, str) or not source:
+            continue
+        text = row.get("text", "") if isinstance(row.get("text"), str) else ""
+        import hashlib
+        indexed[source] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    from src.living_authenticity.knowledge.vault.context import (
+        verify_index_freshness,
+    )
+    report = verify_index_freshness(manifest, indexed)
+    report["stored_rows"] = len(rows) if isinstance(rows, list) else 0
+    return report
+
+
+def synchronize_index(corpus_root, pipeline, embedder, store,
+                       max_files: int = 1,
+                       manifest=None) -> dict:
+    """Explicitly rebuild a stale index into a fresh store.
+
+    Refuses when ``store`` is not empty (same rule as ``index_corpus``):
+    the operator supplies a fresh empty vector directory and the sync
+    result records the pre-sync freshness report plus the indexing
+    outcome. No background watcher, no auto-mutation, no authoritative
+    semantics — an explicit operator action with an inspectable report.
+    """
+    from src.living_authenticity.knowledge.vault.context import snapshot_vault
+    before = describe_index_state(store, manifest or {})
+    existing = _existing_vector_count(store)
+    if existing:
+        return {"action": "refused_non_empty_store",
+                "stored_rows": existing, "freshness_before": before,
+                "indexed": None}
+    outcome = index_corpus(corpus_root, pipeline, embedder, store,
+                           max_files=max_files)
+    try:
+        current = snapshot_vault(corpus_root, max_files=max_files)
+    except Exception:
+        current = {}
+    after = describe_index_state(store, current)
+    return {"action": "indexed", "stored_rows": outcome[2],
+            "freshness_before": before, "freshness_after": after,
+            "indexed": {"files_indexed": outcome[0],
+                        "units_indexed": outcome[1],
+                        "vectors_stored": outcome[2],
+                        "files_skipped": outcome[3]}}

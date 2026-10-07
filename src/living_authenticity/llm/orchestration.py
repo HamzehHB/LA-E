@@ -1,4 +1,4 @@
-"""Mandatory driver-level synthesis behind the formal LLM stage."""
+"""Mandatory driver-level synthesis behind the AI synthesis capability."""
 import hashlib
 
 from .base import LLMUnavailable

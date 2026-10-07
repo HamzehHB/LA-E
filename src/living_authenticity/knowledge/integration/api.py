@@ -2,13 +2,22 @@
 from typing import TYPE_CHECKING
 
 from .guard import (
+    AUDIT_PATH_KEY,
+    AUDIT_FAILED_PATH_KEY,
+    AUDIT_PASSED_PATH_KEY,
     GUARDED_PATH_KEYS,
     STAGING_PATH_KEY,
+    check_audit_eligible,
+    check_roots_disjoint,
     check_staging_eligible,
+    resolve_authorized_audit_failed,
+    resolve_authorized_audit_passed,
+    resolve_authorized_audit_root,
     resolve_authorized_staging_root,
     resolve_guarded_roots,
 )
-from .indexing import index_corpus, index_units, ingest_units
+from .indexing import (index_corpus, index_units, ingest_units,
+                     describe_index_state, synchronize_index)
 from .outcome import (
     IntegrationRunReport,
     IntegrationUnitDetail,
@@ -39,6 +48,9 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "AUDIT_FAILED_PATH_KEY",
+    "AUDIT_PATH_KEY",
+    "AUDIT_PASSED_PATH_KEY",
     "GUARDED_PATH_KEYS",
     "PRODUCTION_VECTOR_DB_KEY",
     "STAGING_PATH_KEY",
@@ -46,12 +58,19 @@ __all__ = [
     "IntegrationUnitDetail",
     "IntegrationUnitEntry",
     "build_vector_components",
+    "check_audit_eligible",
+    "check_roots_disjoint",
     "check_staging_eligible",
     "check_vector_store_eligible",
+    "describe_index_state",
+    "synchronize_index",
     "index_corpus",
     "index_units",
     "ingest_units",
     "render_review_block",
+    "resolve_authorized_audit_failed",
+    "resolve_authorized_audit_passed",
+    "resolve_authorized_audit_root",
     "resolve_authorized_staging_root",
     "resolve_guarded_roots",
     "resolve_production_vector_db",

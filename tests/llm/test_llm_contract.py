@@ -194,7 +194,11 @@ def test_schema_rejects_a_destination_naming_field():
     assert entries[0].outcome == "llm_safe_stop"
     assert entries[0].reason == "llm_unavailable"
     assert entries[0].proposal_hash == ""
-    assert audits == []
+    assert len(audits) == 1, (
+        "safe stops persist a non-approved audit record, never approval")
+    assert audits[0].approval_approved is False
+    assert audits[0].execution_executed is False
+    assert audits[0].stop_reason == "llm_unavailable"
 
 
 def _noop() -> None:

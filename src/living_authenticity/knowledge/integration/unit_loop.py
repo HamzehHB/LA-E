@@ -1,4 +1,6 @@
 """Per-unit governance loop for the bounded local-integration run driver."""
+from pathlib import Path
+
 from .guard import check_staging_eligible
 from .outcome import IntegrationUnitEntry, IntegrationUnitDetail
 
@@ -222,9 +224,8 @@ def _request_non_create_review(child, query, proposal, candidate, note,
     Strictly review/presentation: the operator sees the rendered note and
     presses Enter to acknowledge it (EOF/timeout/interruption also
     acknowledge). No approval is requested, no decision is recorded, no
-    revalidation, no execution, no audit record. This keeps the human-review
-    boundary generic and interactive for every candidate instead of
-    accidentally coupling the ``input()`` prompt to the ``CREATE`` branch.
+    revalidation, and no execution. The caller may still append a
+    held/non-executable audit record for traceability.
     """
     from src.living_authenticity.knowledge.integration.review_display import (
         render_review_block,
@@ -246,17 +247,135 @@ def _request_non_create_review(child, query, proposal, candidate, note,
         pass
 
 
+def _trace_for_audit(query=None, unit_result=None, llm_result=None,
+                     prompt_sha256="", synthesis=None, llm_config=None,
+                     operating_mode="", run_id="", record_id="",
+                     human_review_state="", stop_reason="",
+                     validation_result="", artifact_sha256="",
+                     proposal=None) -> dict:
+    """Build the traceability mapping attached to one audit record.
+
+    Identifiers and hashes only; never credentials, never raw secrets.
+    Candidate entries distinguish considered / retrieved /
+    passed_downstream / used_as_evidence explicitly.
+    """
+    import hashlib
+    retrieval = (getattr(unit_result, "retrieval_result", None)
+                 if unit_result is not None else None)
+    if proposal is None and unit_result is not None:
+        proposal = getattr(unit_result, "proposal", None)
+    candidates = []
+    strategy = ""
+    note = ""
+    evidence_ids = set()
+    if proposal is not None:
+        for item in getattr(proposal, "evidence", ()) or ():
+            if isinstance(item, str) and item:
+                evidence_ids.add(item)
+            elif hasattr(item, "unit_id"):
+                evidence_ids.add(str(getattr(item, "unit_id", "") or ""))
+    if retrieval is not None:
+        strategy = getattr(retrieval, "strategy", "") or ""
+        note = getattr(retrieval, "note", "") or ""
+        for order, item in enumerate(getattr(retrieval, "candidates", ()) or ()):
+            unit_id = getattr(item, "unit_id", "")
+            candidates.append({
+                "unit_id": unit_id,
+                "source": getattr(item, "source", ""),
+                "position": getattr(item, "position", 0),
+                "overlap_score": getattr(item, "overlap_score", 0),
+                "matched_terms": list(getattr(item, "matched_terms", ()) or ()),
+                "retriever": getattr(item, "retriever", ""),
+                "rank": order,
+                # Considered + retrieved: present in the retrieval result.
+                "considered": True,
+                "retrieved": True,
+                # Downstream: handed to comparison/relation/LLM context.
+                "passed_downstream": True,
+                # Evidence-use: only when the proposal cites this candidate.
+                "used_as_evidence": unit_id in evidence_ids,
+            })
+    query_text = _query_text(query) if query is not None else ""
+    input_hash = (hashlib.sha256(query_text.encode("utf-8")).hexdigest()
+                  if query_text else "")
+    evidence_bits = [entry.get("unit_id", "") for entry in candidates
+                     if entry.get("used_as_evidence")]
+    # No-evidence case is explicit: an empty hash means no candidate was
+    # actually used as evidence (never a hash over all candidates).
+    evidence_hash = (hashlib.sha256("|".join(
+        evidence_bits).encode("utf-8")).hexdigest() if evidence_bits else "")
+    provider_name = ""
+    model_name = ""
+    if synthesis is not None:
+        provider_name = getattr(synthesis, "provider_name", "") or ""
+        model_name = getattr(synthesis, "model_name", "") or ""
+        if not model_name and hasattr(synthesis, "provider"):
+            model_name = getattr(synthesis.provider, "model", "") or ""
+    config_text = ""
+    if isinstance(llm_config, dict):
+        import json
+        try:
+            config_text = json.dumps(llm_config, sort_keys=True, default=str)
+        except Exception:
+            config_text = ""
+        if not provider_name:
+            provider_name = str(
+                (llm_config.get("llm") or {}).get("provider", "")
+                if isinstance(llm_config.get("llm"), dict)
+                else llm_config.get("provider", "") or "")
+        if not model_name:
+            model_name = str(
+                (llm_config.get("llm") or {}).get("model", "")
+                if isinstance(llm_config.get("llm"), dict)
+                else llm_config.get("model", "") or "")
+    llm_config_hash = (hashlib.sha256(config_text.encode("utf-8")).hexdigest()
+                       if config_text else "")
+    synthesis_id = ""
+    if llm_result is not None:
+        titles = [getattr(item, "title", "") or ""
+                  for item in getattr(llm_result, "candidates", ()) or ()]
+        synthesis_id = hashlib.sha256("|".join(
+            titles).encode("utf-8")).hexdigest() if titles else ""
+    core = (getattr(unit_result, "core_analysis", None)
+            if unit_result is not None else None)
+    return {"record_id": record_id, "run_id": run_id,
+            "operating_mode": operating_mode, "input_hash": input_hash,
+            "retrieval_strategy": strategy,
+            "retrieval_candidates": tuple(candidates),
+            "retrieval_note": note, "evidence_hash": evidence_hash,
+            "llm_provider": provider_name, "llm_model": model_name,
+            "llm_config_hash": llm_config_hash,
+            "prompt_sha256": prompt_sha256 or "",
+            "synthesis_result_id": synthesis_id,
+            "validation_result": validation_result,
+            "stop_reason": stop_reason,
+            "human_review_state": human_review_state,
+            "artifact_sha256": artifact_sha256,
+            "core_relevance": getattr(core, "relevance", "") if core else "",
+            "core_basis": getattr(core, "basis", "") if core else ""}
+
+
 def _govern_candidate(child, query, proposal, confidence, note, gate,
                       validator, runner, pinned_staging, guarded,
                       schema_version, approval_reader, entries, audits,
                       authorized_staging="", details=None, query_unit=None,
                       unit_result=None, llm_result=None, candidate_index=0,
                       retrieval=None, relation=None, core=None,
-                      comparisons=(), filter_outcome=None, classification=None):
+                      comparisons=(), filter_outcome=None, classification=None,
+                      operating_mode="", run_id="", prompt_sha256="",
+                      synthesis=None, llm_config=None,
+                      audit_writer=None, audit_receipts=None,
+                      audit_guard_error=""):
     """Govern one candidate: approval, guard re-check, revalidation."""
+    from src.living_authenticity.knowledge.governance.audit.clock import (
+        local_now_iso,
+    )
     from src.living_authenticity.knowledge.governance.audit.outcome import (
         build_audit_record,
         record_audit_for_execution,
+    )
+    from src.living_authenticity.knowledge.governance.audit.persistence import (
+        persist_record,
     )
     from src.living_authenticity.knowledge.integration.review_display import (
         render_review_block,
@@ -276,8 +395,20 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
         pinned_staging, guarded, authorized_staging)
     display = _entry_display_fields(
         child, query, proposal, confidence, unit_result, llm_result)
+    import uuid as _uuid
+    record_id = "rec-" + _uuid.uuid4().hex[:12]
+    base_trace = _trace_for_audit(
+        query=query, unit_result=unit_result, llm_result=llm_result,
+        prompt_sha256=prompt_sha256, synthesis=synthesis,
+        llm_config=llm_config, operating_mode=operating_mode,
+        run_id=run_id, record_id=record_id,
+        human_review_state=("approved" if outcome.approved else "rejected"))
     if not live_ok:
-        audits.append(build_audit_record(request, outcome, None, None, proposal))
+        audits.append(build_audit_record(request, outcome, None, None,
+                                         proposal, trace={
+                                             **base_trace,
+                                             "validation_result": "staging_guard_failed",
+                                             "stop_reason": live_reason}))
         entries.append(IntegrationUnitEntry(
             source_file=str(child), query_unit_id=query.id,
             query_source=query.source, query_position=query.position,
@@ -293,7 +424,9 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     )
     if not revalidation.valid:
         audits.append(build_audit_record(
-            request, outcome, revalidation, None, proposal))
+            request, outcome, revalidation, None, proposal, trace={
+                **base_trace, "validation_result": "revalidation_failed",
+                "stop_reason": revalidation.reason}))
         entries.append(IntegrationUnitEntry(
             source_file=str(child), query_unit_id=query.id,
             query_source=query.source, query_position=query.position,
@@ -305,13 +438,58 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             note_markdown=note.markdown, **display,
         ))
         return
+    pre_trace = {
+        **base_trace,
+        "audit_phase": "pre_execution",
+        "validation_result": "approved_pending_execution",
+    }
+    pre_record = build_audit_record(
+        request, outcome, revalidation, None, proposal, trace=pre_trace)
+    if audit_writer is not None:
+        if not persist_record(audit_writer, pre_record, audit_receipts):
+            audits.append(build_audit_record(
+                request, outcome, revalidation, None, proposal, trace={
+                    **base_trace,
+                    "validation_result": "audit_persistence_failed",
+                    "stop_reason": "audit persistence failed before execution",
+                }))
+            entries.append(IntegrationUnitEntry(
+                source_file=str(child), query_unit_id=query.id,
+                query_source=query.source, query_position=query.position,
+                proposal_hash=request.proposal_hash,
+                proposal_action=proposal.action,
+                approval_approved=bool(outcome.approved),
+                revalidation_valid=True,
+                outcome="audit_persistence_failed",
+                reason="audit persistence failed before execution",
+                note_markdown=note.markdown, **display,
+            ))
+            return
     execution = runner.execute(
         request, outcome, proposal, confidence, note,
         staging_root=pinned_staging,
         schema_version=schema_version or "",
     )
+    import hashlib as _hashlib
+    artifact_digest = _hashlib.sha256(
+        note.markdown.encode("utf-8")).hexdigest() if note.markdown else ""
+    exec_ts = local_now_iso()
+    full_artifact_path = ""
+    if execution.executed and execution.artifact_path:
+        full_artifact_path = str(
+            Path(pinned_staging) / execution.artifact_path)
     audits.append(record_audit_for_execution(
-        request, outcome, revalidation, execution, proposal))
+        request, outcome, revalidation, execution, proposal, trace={
+            **base_trace,
+            "audit_phase": "post_execution",
+            "validation_result": "executed"
+            if execution.executed else "execution_rejected",
+            "stop_reason": "" if execution.executed else execution.reason,
+            "artifact_sha256": artifact_digest if execution.executed else "",
+            "execution_timestamp": exec_ts if execution.executed else "",
+            "artifact_created_at": exec_ts if execution.executed else "",
+            "artifact_path": full_artifact_path,
+        }))
     if execution.executed:
         state = "executed"
     elif (execution.failed_check == "destination"
@@ -359,10 +537,13 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                  runner=None, pinned_staging="", guarded=(),
                  schema_version="", approval_reader=None, entries=None,
                  audits=None, authorized_staging="", synthesis=None,
-                 generator=None, details=None, vault_context=None):
-    """Govern one unit through the mandatory formal LLM stage.
+                 llm_config=None,
+                 generator=None, details=None, vault_context=None,
+                 operating_mode="", run_id="", audit_writer=None,
+                 audit_receipts=None, audit_guard_error=""):
+    """Govern one unit through the mandatory AI synthesis step.
 
-    The formal stage always runs: synthesis produces 1..N candidates
+    The mandatory synthesis step always runs: synthesis produces 1..N candidates
     and each candidate is governed independently. When synthesis
     fails (disabled, unreachable, invalid, privacy-declined), the
     unit stops safely with an explicit reason — no candidate is
@@ -395,6 +576,42 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
         reason = _llm_safe_reason(exc)
         entries.append(_safe_stop_entry(
             child, query, proposal, reason, unit_result=unit_result))
+        try:
+            from src.living_authenticity.knowledge.governance.audit.outcome import (
+                build_audit_record as _build,
+            )
+            from src.living_authenticity.knowledge.governance.approval.outcome import (
+                ApprovalOutcome as _Outcome,
+                ApprovalRequest as _Request,
+            )
+            import uuid as _uuid2
+            _record_id = "rec-" + _uuid2.uuid4().hex[:12]
+            _trace = _trace_for_audit(
+                query=query, unit_result=unit_result,
+                llm_result=None, prompt_sha256="",
+                synthesis=synthesis, llm_config=llm_config,
+                operating_mode=operating_mode, run_id=run_id,
+                record_id=_record_id,
+                human_review_state="not_requested",
+                stop_reason=reason,
+                validation_result="llm_safe_stop")
+            _request = _Request(proposal_hash="",
+                                query_unit_id=query.id,
+                                query_source=query.source,
+                                query_position=query.position,
+                                proposal_action=proposal.action,
+                                title="", destination="",
+                                reason="", confidence_level="",
+                                strategy="", note="")
+            _outcome = _Outcome(approved=False, proposal_hash="",
+                                query_unit_id=query.id,
+                                proposal_action=proposal.action,
+                                input_value="", reason=reason, strategy="",
+                                timestamp="", note="")
+            audits.append(_build(_request, _outcome, None, None, proposal,
+                                 trace=_trace))
+        except Exception:
+            pass
         return
     for candidate_index, candidate in enumerate(llm_result.candidates):
         if proposal.action != "CREATE":
@@ -426,6 +643,48 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                 note_markdown=note.markdown,
                 **display,
             ))
+            try:
+                from src.living_authenticity.knowledge.governance.audit.outcome import (
+                    build_audit_record as _build_held,
+                )
+                from src.living_authenticity.knowledge.governance.approval.outcome import (
+                    ApprovalOutcome as _HeldOutcome,
+                    ApprovalRequest as _HeldRequest,
+                )
+                import uuid as _uuid_held
+                _held_id = "rec-" + _uuid_held.uuid4().hex[:12]
+                _held_trace = _trace_for_audit(
+                    query=query, unit_result=unit_result,
+                    llm_result=llm_result, prompt_sha256=_digest,
+                    synthesis=synthesis, llm_config=llm_config,
+                    operating_mode=operating_mode, run_id=run_id,
+                    record_id=_held_id,
+                    human_review_state="acknowledged_non_executable",
+                    stop_reason="candidate proposal action is not CREATE",
+                    validation_result="held_non_executable",
+                    proposal=proposal)
+                _held_request = _HeldRequest(
+                    proposal_hash="", query_unit_id=query.id,
+                    query_source=query.source,
+                    query_position=query.position,
+                    proposal_action=proposal.action,
+                    title=getattr(candidate, "title", ""),
+                    destination=getattr(proposal, "destination", ""),
+                    reason=getattr(candidate, "reason", ""),
+                    confidence_level=getattr(confidence, "level", "")
+                    if confidence is not None else "",
+                    strategy="", note="")
+                _held_outcome = _HeldOutcome(
+                    approved=False, proposal_hash="",
+                    query_unit_id=query.id,
+                    proposal_action=proposal.action,
+                    input_value="", reason="held_non_executable",
+                    strategy="", timestamp="", note="")
+                audits.append(_build_held(
+                    _held_request, _held_outcome, None, None, proposal,
+                    trace=_held_trace))
+            except Exception:
+                pass
             continue
         note = _rendered_note_for_candidate(
             query, proposal, unit_result.classification, confidence,
@@ -442,5 +701,11 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
             comparisons=unit_result.comparisons,
             filter_outcome=unit_result.filter_outcome,
             classification=unit_result.classification,
+            operating_mode=operating_mode, run_id=run_id,
+            prompt_sha256=_digest, synthesis=synthesis,
+            llm_config=llm_config,
+            audit_writer=audit_writer,
+            audit_receipts=audit_receipts,
+            audit_guard_error=audit_guard_error,
         )
 

@@ -63,8 +63,16 @@ _PATHS_REQUIRED_KEYS = (
 # never stages anything does not need them. ``staging.root`` is the single
 # explicitly authorized controlled-execution staging destination; leaving
 # it unset authorizes no staging location inside guarded persistent data.
+# ``audit.root`` is the single explicitly authorized persistent-audit
+# destination (append-only traceability records); ``audit.passed`` and
+# ``audit.failed`` optionally relocate the two storage categories to
+# independently selectable directories inside that root (defaults:
+# ``<audit.root>/passed`` and ``<audit.root>/failed``).
 _PATHS_OPTIONAL_STRING_KEYS = (
     "staging.root",
+    "audit.root",
+    "audit.passed",
+    "audit.failed",
 )
 
 

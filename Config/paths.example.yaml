@@ -55,3 +55,14 @@ staging:
   # Portable placeholder. Set the real directory only in the
   # gitignored paths.local.yaml.
   root: "C:/LivingAuthenticity_Data/Knowledge/Staging"
+
+audit:
+  # Portable placeholder. Durable append-only traceability records.
+  # Set the real directory only in the gitignored paths.local.yaml.
+  # Leave unset/empty to keep audit records in memory only.
+  root: "C:/LivingAuthenticity_Data/Knowledge/Audit"
+  # Optional: independently selectable storage locations for the two
+  # audit categories. Each must resolve INSIDE the audit root above.
+  # Defaults when omitted: "<audit.root>/passed" and "<audit.root>/failed".
+  # passed: "C:/LivingAuthenticity_Data/Knowledge/Audit/passed"
+  # failed: "C:/LivingAuthenticity_Data/Knowledge/Audit/failed"

@@ -1,4 +1,4 @@
-"""Deterministic bounded context builder for the formal LLM stage."""
+"""Deterministic bounded context builder for the AI synthesis capability."""
 import json
 from typing import Any
 

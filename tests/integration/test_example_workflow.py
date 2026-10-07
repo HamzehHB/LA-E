@@ -152,4 +152,7 @@ def test_no_provider_means_no_candidate_and_no_execution(tmp_path):
     assert all(unit.outcome == "llm_safe_stop" for unit in report.units)
     assert all(unit.reason == "llm_unavailable" for unit in report.units)
     assert list(staging.iterdir()) == [], "no candidate may reach staging"
-    assert report.audits == (), "no approval may be requested or recorded"
+    assert len(report.audits) == len(report.units), (
+        "safe stops are audited as non-approved traceability records")
+    assert all(audit.approval_approved is False for audit in report.audits)
+    assert all(audit.execution_executed is False for audit in report.audits)

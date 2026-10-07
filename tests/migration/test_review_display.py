@@ -187,7 +187,10 @@ def test_invalid_llm_output_stops_the_unit_with_the_right_reason(tmp_path):
         assert len(entries) == 1
         assert entries[0].outcome == "llm_safe_stop", raw
         assert entries[0].reason == "llm_invalid_output", raw
-        assert audits == [], "no approval may be recorded for a safe stop"
+        assert len(audits) == 1, (
+            "safe stops persist a non-approved audit record, never approval")
+        assert audits[0].approval_approved is False
+        assert audits[0].execution_executed is False
 
 
 def test_missing_fields_and_bad_types_are_invalid_output(tmp_path):
@@ -218,7 +221,11 @@ def test_unavailable_provider_stops_the_unit_safely(tmp_path):
                  pinned_staging=str(staging))
     assert entries[0].outcome == "llm_safe_stop"
     assert entries[0].reason == "llm_unavailable"
-    assert audits == []
+    assert len(audits) == 1, (
+        "safe stops persist a non-approved audit record, never approval")
+    assert audits[0].approval_approved is False
+    assert audits[0].execution_executed is False
+    assert audits[0].stop_reason == "llm_unavailable"
 
 
 def test_timeout_maps_to_the_timeout_reason(tmp_path):

@@ -6,9 +6,10 @@ class DisabledProvider(LLMProvider):
     """No network, no model call; every completion attempt fails safely.
 
     Being disabled is an explicit configuration state, not a broken
-    architecture: the formal LLM stage still runs and then stops safely
-    with an explicit reason. It produces no candidates, so no candidate
-    is displayed, no approval is requested, and nothing executes.
+    architecture: the mandatory synthesis step still runs and then stops
+    safely with an explicit reason. It produces no candidates, so no
+    candidate is displayed, no approval is requested, and nothing
+    executes.
     """
 
     def __init__(self, model: str = "") -> None:

@@ -194,6 +194,88 @@ def read_vault_units(vault_root, pipeline, max_files=_MAX_FILES,
     return (units, len(files), skipped)
 
 
+def file_identity(path) -> dict:
+    """Return a stable read-only identity dict for one vault file."""
+    import hashlib
+
+    target = Path(path)
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return {"path": str(path), "readable": False}
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        stat = target.stat()
+        size = int(stat.st_size)
+        mtime_ns = int(stat.st_mtime_ns)
+    except OSError:
+        size = len(data)
+        mtime_ns = 0
+    return {"path": str(path), "readable": True, "size": size,
+            "mtime_ns": mtime_ns, "sha256": digest}
+
+
+def snapshot_vault(vault_root, max_files=_MAX_FILES,
+                   max_bytes_per_file=_MAX_BYTES_PER_FILE,
+                   max_total_bytes=_MAX_TOTAL_BYTES) -> dict:
+    """Return an inspectable read-only manifest of the vault.
+
+    The manifest maps repository-relative paths to identity dicts
+    (size, mtime, sha256). It introduces no watcher and no background
+    work: callers snapshot explicitly, then diff or reindex explicitly.
+    """
+    files, skipped = discover_vault_files(
+        vault_root, max_files, max_bytes_per_file, max_total_bytes)
+    root = Path(vault_root) if isinstance(vault_root, str) else None
+    entries = {}
+    for child in files:
+        identity = file_identity(child)
+        try:
+            rel = str(child.relative_to(root)) if root is not None else str(child)
+        except Exception:
+            rel = str(child)
+        entries[rel] = identity
+    return {"vault_root": vault_root, "entries": entries,
+            "files_discovered": len(files), "files_skipped": skipped}
+
+
+def diff_manifests(previous, current) -> dict:
+    """Diff two manifests; return added/modified/removed/unchanged lists."""
+    prev = previous.get("entries", {}) if isinstance(previous, dict) else {}
+    curr = current.get("entries", {}) if isinstance(current, dict) else {}
+    added = sorted([key for key in curr if key not in prev])
+    removed = sorted([key for key in prev if key not in curr])
+    modified = sorted([key for key in curr if key in prev
+                       and curr[key].get("sha256") != prev[key].get("sha256")])
+    unchanged = sorted([key for key in curr if key in prev
+                        and curr[key].get("sha256") == prev[key].get("sha256")])
+    renamed_hint = sorted([(old, new) for old in removed for new in added
+                           if prev[old].get("sha256") == curr[new].get("sha256")])
+    return {"added": added, "modified": modified, "removed": removed,
+            "unchanged": unchanged, "renamed_hint": renamed_hint,
+            "stale": bool(added or modified or removed)}
+
+
+def verify_index_freshness(manifest, indexed_hashes) -> dict:
+    """Report whether a derived index covers the manifest.
+
+    ``indexed_hashes`` maps relative paths (or unit sources) to the
+    content hash captured at index time. Missing or mismatched hashes
+    are reported as stale; this function mutates nothing.
+    """
+    entries = manifest.get("entries", {}) if isinstance(manifest, dict) else {}
+    indexed = indexed_hashes if isinstance(indexed_hashes, dict) else {}
+    missing = sorted([key for key in entries if key not in indexed])
+    changed = sorted([key for key in entries
+                      if key in indexed and indexed[key] != entries[key].get("sha256")])
+    orphaned = sorted([key for key in indexed if key not in entries])
+    return {"missing": missing, "changed": changed, "orphaned": orphaned,
+            "fresh": not (missing or changed or orphaned),
+            "indexed_count": len(indexed),
+            "manifest_count": len(entries)}
+
+
 __all__ = ("discover_vault_files", "read_vault_context", "read_vault_units",
-           "resolve_vault_core_root")
+           "resolve_vault_core_root", "file_identity", "snapshot_vault",
+           "diff_manifests", "verify_index_freshness")
 

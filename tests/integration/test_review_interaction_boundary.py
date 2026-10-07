@@ -123,4 +123,7 @@ def test_each_candidate_reaches_review_one_at_a_time(capsys, monkeypatch):
                  details=[], vault_context=None)
     assert len(entries) == 2
     assert reads and len(reads) == 2
-    assert audits == []
+    assert len(audits) == 2
+    assert all(a.approval_approved is False for a in audits)
+    assert all(a.execution_executed is False for a in audits)
+    assert all(a.validation_result == "held_non_executable" for a in audits)
