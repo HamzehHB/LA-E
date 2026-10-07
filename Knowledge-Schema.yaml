@@ -1186,12 +1186,65 @@ audit:
       type: "provenance"
       required: false
 
+    run_id:
+      type: "string"
+      required: false
+      description: "Correlates every record produced by one invocation of the integration runner."
+
+    proposal_hash:
+      type: "string"
+      required: false
+      description: "Canonical hash binding the record to one exact proposal, across approval, revalidation, and execution."
+
+    revalidation_result:
+      type: "string"
+      required: false
+      description: "Outcome of the fresh pre-execution revalidation check, when the record reached that stage."
+
+    artifact_path:
+      type: "string"
+      required: false
+      description: "Staging-relative reference to the created artifact. Present only when execution actually created a staging file."
+
+    artifact_hash:
+      type: "string"
+      required: false
+
+    artifact_created_at:
+      type: "datetime"
+      required: false
+      description: "Local system time of staging artifact creation, distinct from the record's own timestamp."
+
+    llm_provider:
+      type: "string"
+      required: false
+      description: "Identity of the LLM provider/model consulted during synthesis, where the pipeline reached that stage."
+
+    prompt_hash:
+      type: "string"
+      required: false
+      description: "Hash of the prompt/context supplied to the LLM. The prompt content itself is never persisted."
+
+    errors_warnings:
+      type: "array"
+      items: "string"
+      required: false
+
+    storage_category:
+      type: "string"
+      allowed_values: ["passed", "failed"]
+      required: false
+      description: "Terminal storage category for a persisted record. 'passed' is reserved for an approved CREATE whose staging artifact was actually written; every other terminal record (including an approved-and-revalidated pre-execution state, any hold, rejection, or safe stop) is 'failed'. This is a storage-location distinction, not a judgment that the record represents a system error."
+
   rules:
     - "Audit events should be append-oriented."
     - "Execution events must be traceable to approval."
     - "Rejected actions should remain distinguishable."
     - "Failed actions should remain distinguishable."
     - "Audit history must not be silently altered to conceal prior events."
+    - "A record belongs in a 'passed' storage location only when its execution actually created the staging artifact it references; every other terminal record, including an approved and revalidated proposal that did not yet execute, belongs in 'failed'."
+    - "Non-executed, rejected, held, and safe-stopped candidates must still produce a persisted audit record; absence of an artifact is itself traceable information, not an absence of audit."
+    - "Prompt and evidence content supplied to or produced by an LLM may be referenced by hash for traceability; raw prompt content and credentials must never be persisted in the audit record."
 
 
 # ============================================================================
@@ -1219,9 +1272,12 @@ pipeline:
     - "GENERATE_CLEAN_NOTE"
     - "CALCULATE_CONFIDENCE"
     - "APPLY_CONFIDENCE_GUARD"
+    - "APPLY_KNOWLEDGE_FILTER"
+    - "LLM_SYNTHESIS"
     - "PROPOSE_ACTION"
     - "EXPLAIN_REASONING"
     - "WAIT_FOR_HUMAN_APPROVAL"
+    - "REVALIDATE"
     - "EXECUTE_APPROVED_ACTION"
     - "RECORD_AUDIT_EVENT"
 
@@ -1238,11 +1294,20 @@ pipeline:
         - "compare"
         - "analyze"
         - "generate"
+        - "synthesize"
         - "propose"
         - "explain"
 
       authoritative_write:
         allowed: false
+
+      note: >
+        LLM_SYNTHESIS is a mandatory, non-authoritative stage within the
+        analysis phase. If no usable provider is configured or the
+        provider's output fails strict validation, the unit stops safely
+        (no proposal reaches approval) rather than proceeding without
+        synthesis. Synthesis output never authorizes an action, selects
+        a destination, or modifies Core.
 
     approval_phase:
       purpose: "Human evaluation of the proposal."
@@ -1253,6 +1318,7 @@ pipeline:
       condition: "Explicit approval exists."
       requirements:
         - "Validate approval."
+        - "Revalidate the exact approved proposal immediately before execution; a material change invalidates the approval."
         - "Validate action."
         - "Validate target."
         - "Validate scope."

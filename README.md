@@ -115,7 +115,12 @@ Technology
 
 The current foundation is built primarily with Python.
 
-LanceDB and BGE-M3 are retained as planned components of the future architecture.
+LanceDB and BGE-M3 are implemented and wired as an optional local
+retrieval path: embedding generation, isolated vector storage, and
+vault synchronization are available through `--embed` and the vault
+manifest/sync contract described above. The default integrated
+pipeline keeps its deterministic token-overlap retriever unless
+embedding is explicitly requested.
 
 Configuration
 

@@ -354,6 +354,35 @@ Notes:
 A synthetic walkthrough lives in
 [examples/bounded_local_integration/](examples/bounded_local_integration/README.md).
 
+### Additional input and vault flags
+
+Besides `--source-root`, the CLI also accepts:
+
+* `--input-file <path>` — process a single existing file instead of
+  scanning a directory.
+* `--text "<text>"` — process a single piece of text supplied directly
+  on the command line, with no file read. Exactly one of
+  `--input-file`, `--text`, or `--source-root` must be given.
+* `--vault-context` — include a small number of bounded, read-only
+  excerpts from the configured Vault directly in the LLM prompt
+  (informational context, not retrieval evidence).
+* `--vault-retrieval` — include the configured Vault as part of the
+  retrieval corpus (token-overlap by default; semantic when combined
+  with `--embed` and an isolated `--vector-db`). The Vault is always
+  read-only: nothing in this path ever writes to it.
+* `--verbose` — print the full inspectable intermediate result for
+  every candidate (retrieval, comparison, relation, core, classification,
+  proposal, confidence, filter, LLM synthesis), not just the summary line.
+
+### Personal Vault vs. Examples mode
+
+The project distinguishes two operating modes (`knowledge/modes.py`):
+**Personal Vault mode**, which resolves the Vault configured in
+`Config/paths.local.yaml`, and **Examples mode**, which uses only the
+synthetic material under `examples/` and fails closed rather than ever
+resolving a configured personal Vault. The active mode is recorded on
+every audit record produced during that run.
+
 ---
 
 ## Private Project Documents

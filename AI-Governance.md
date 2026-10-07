@@ -114,6 +114,37 @@ Therefore:
 
 > **Analysis does not imply authority, and execution does not imply decision-making.**
 
+### 3.4 LLM Synthesis
+
+LLM synthesis is one specific instance of AI's "generation" role under
+3.1: a formal, mandatory, non-authoritative analytical stage that runs
+after the Knowledge Filter and before human review.
+
+LLM synthesis may:
+
+- analyze the bounded, structured context already produced by the
+  preceding analytical stages;
+- propose candidate titles, bodies, suggested types, reasons, and
+  uncertainty for human review.
+
+LLM synthesis must NOT:
+
+- authorize any action;
+- select or influence an authoritative destination;
+- bypass the Knowledge Filter, human review, explicit approval, or
+  revalidation;
+- modify Core;
+- modify the Vault;
+- change the proposal's action, which is already determined before
+  synthesis runs and is never recomputed from LLM output.
+
+If no usable provider is configured, or the provider's output fails
+strict validation (timeout, malformed response, schema violation), the
+affected unit must stop safely without reaching approval or execution,
+rather than silently proceeding without synthesis.
+
+> **LLM synthesis does not imply authority, and LLM output does not imply approval.**
+
 ---
 
 # 4. Proposal vs. Execution
