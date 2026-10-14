@@ -44,7 +44,8 @@ class EvidenceFirstPipeline:
                  cleaner=None, normalizer=None, parser=None, metadata_extractor=None,
                  retriever=None, comparator=None, relation_detector=None, core_analyzer=None,
                  classifier=None, proposal_builder=None, confidence_guard=None,
-                 knowledge_filter=None, output_generator=None, destination: str = "") -> None:
+                 knowledge_filter=None, output_generator=None, destination: str = "",
+                 stage_observer=None) -> None:
         from src.living_authenticity.knowledge.ingestion.chunking.chunker_registry import ChunkerRegistry as _CR
         from src.living_authenticity.knowledge.analysis.classification.rule_based_classifier import DefaultClassifier
         from src.living_authenticity.knowledge.ingestion.cleaning.cleaner import Cleaner as _Cleaner
@@ -84,6 +85,21 @@ class EvidenceFirstPipeline:
         if not isinstance(destination, str):
             raise TypeError("destination must be a string")
         self.destination = destination
+        # Optional observational hook only (default off): receives raw dicts
+        # {"kind", "stage", "message"}. Never changes stage order, results,
+        # or authorization; sink errors are swallowed.
+        if stage_observer is not None and not callable(stage_observer):
+            raise TypeError("stage_observer must be callable or None")
+        self._stage_observer = stage_observer
+
+    def _observe(self, kind: str, stage: str, message: str = "") -> None:
+        if self._stage_observer is None:
+            return
+        try:
+            self._stage_observer(
+                {"kind": kind, "stage": stage, "message": message})
+        except Exception:
+            pass
     @property
     def stage_order(self) -> tuple:
         return STAGE_ORDER
@@ -124,38 +140,57 @@ class EvidenceFirstPipeline:
         for item in cores:
             if not isinstance(item, KnowledgeUnit):
                 raise TypeError("core_units must hold KnowledgeUnit objects")
+        uid = query.id if isinstance(query, KnowledgeUnit) else ""
+        self._observe("stage_started", "retrieval", uid)
         retrieval = self.retriever.retrieve(query, corpus_units)
+        self._observe("stage_completed", "retrieval", uid)
         if not isinstance(retrieval, RetrievalResult):
             raise TypeError("retriever must return a RetrievalResult")
+        self._observe("stage_started", "comparison", uid)
         comparisons = tuple(self.comparator.compare(query, retrieval.candidates))
+        self._observe("stage_completed", "comparison", uid)
         for item in comparisons:
             if not isinstance(item, ComparisonResult):
                 raise TypeError("comparator must return ComparisonResult items")
+        self._observe("stage_started", "relation", uid)
         relation = self.relation_detector.detect(query, comparisons)
+        self._observe("stage_completed", "relation", uid)
         if not isinstance(relation, RelationDetectionResult):
             raise TypeError("detector must return a RelationDetectionResult")
+        self._observe("stage_started", "core", uid)
         core = self.core_analyzer.analyze(query, cores)
+        self._observe("stage_completed", "core", uid)
         if not isinstance(core, CoreAnalysisResult):
             raise TypeError("analyzer must return a CoreAnalysisResult")
+        self._observe("stage_started", "classification", uid)
         classification = self.classifier.classify(query)
+        self._observe("stage_completed", "classification", uid)
         if not isinstance(classification, ClassificationResult):
             raise TypeError("classifier must return a ClassificationResult")
+        self._observe("stage_started", "proposal", uid)
         proposal = self.proposal_builder.build(query, classification=classification,
             retrieval=retrieval, comparisons=comparisons, relation=relation,
             core=core, destination=self.destination)
+        self._observe("stage_completed", "proposal", uid)
         if not isinstance(proposal, Proposal):
             raise TypeError("proposal builder must return a Proposal")
+        self._observe("stage_started", "confidence", uid)
         confidence = self.confidence_guard.assess(query, proposal, classification=classification,
             retrieval=retrieval, comparisons=comparisons, relation=relation, core=core)
+        self._observe("stage_completed", "confidence", uid)
         if not isinstance(confidence, ConfidenceAssessment):
             raise TypeError("confidence guard must return a ConfidenceAssessment")
+        self._observe("stage_started", "knowledge_filter", uid)
         filter_outcome = self.knowledge_filter.filter(query, proposal, classification=classification,
             retrieval=retrieval, comparisons=comparisons, relation=relation,
             core=core, confidence=confidence)
+        self._observe("stage_completed", "knowledge_filter", uid)
         if not isinstance(filter_outcome, FilterOutcome):
             raise TypeError("knowledge filter must return a FilterOutcome")
+        self._observe("stage_started", "representation", uid)
         generated = self.output_generator.generate(query, proposal=proposal,
             classification=classification, confidence=confidence)
+        self._observe("stage_completed", "representation", uid)
         if not isinstance(generated, GeneratedNote):
             raise TypeError("output generator must return a GeneratedNote")
         return IntegratedUnitResult(query_unit=query, retrieval_result=retrieval,

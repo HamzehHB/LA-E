@@ -3,7 +3,8 @@
  *
  * Every type in this folder header carries a `@category` tag:
  * - backend-dto: mirrors an existing frozen Python dataclass (field names preserved).
- * - transport-proposal: proposed launcher wire format for future integration (NOT yet implemented).
+ * - transport: implemented launcher wire format (GET /api/health, /api/journals,
+ *   /api/events; POST /api/folders/pick, /api/run, /api/approve, /api/consent).
  * - ui-model: frontend-only presentation state.
  * - fixture: synthetic demo data.
  *

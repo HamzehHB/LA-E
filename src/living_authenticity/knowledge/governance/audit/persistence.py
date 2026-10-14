@@ -42,30 +42,54 @@ from .clock import local_now_iso
 AUDIT_LOG_FILENAME = "audit.jsonl"
 PASSED_SUBDIR = "passed"
 FAILED_SUBDIR = "failed"
+# Operational (non-proposal) failures — infrastructure errors, aborted
+# runs, and cancellation outcomes — are routed to their own partition so
+# they are never mistaken for proposal pass/fail terminal outcomes.
+ERRORS_SUBDIR = "errors"
 
-_STORAGE_CATEGORIES = frozenset({"passed", "failed"})
+_STORAGE_CATEGORIES = frozenset({"passed", "failed", "errors"})
+
+# Terminal outcomes that classify as operational errors rather than
+# proposal pass/fail records. The set is closed: anything not listed
+# keeps the existing passed/failed contract.
+_ERROR_TERMINAL_OUTCOMES = frozenset({
+    "llm_safe_stop",
+    "audit_persistence_failed",
+    "cancelled",
+    "cancel_requested",
+    "interrupted",
+    "infrastructure_error",
+    "guard_error",
+})
+
+
+def _audit_storage_category(record) -> str:
+    """Return passed/failed/errors for one audit record (see docstring contract).
+
+    passed: ONLY executed-CREATE (execution_executed). errors: ONLY the
+    closed operational-outcome set. failed: everything else, including
+    pre-execution checkpoints, rejections, holds, NEEDS_REVIEW,
+    DO_NOT_IMPORT, safe stops, guard/revalidation/execution failures.
+    """
+    if getattr(record, "execution_executed", False):
+        return "passed"
+    outcome = str(
+        getattr(record, "terminal_outcome", "")
+        or getattr(record, "outcome", "") or "").strip()
+    if outcome in _ERROR_TERMINAL_OUTCOMES:
+        return "errors"
+    return "failed"
+
+
+def audit_storage_category(record) -> str:
+    """Public entry point for the partition contract (passed/failed/errors)."""
+    return _audit_storage_category(record)
+
 
 _FORBIDDEN_RECORD_KEYS = frozenset({
     "credential", "credentials", "secret", "secrets", "token",
     "api_key", "apikey", "password", "credential_env_value",
 })
-
-
-def audit_storage_category(record) -> str:
-    """Return ``"passed"`` or ``"failed"`` for one audit record.
-
-    Authoritative contract: ``passed`` holds ONLY the executed-CREATE
-    terminal record — an approved CREATE that actually succeeded in
-    creating its staging artifact (``execution_executed``). Everything
-    else — including approved + revalidated pre-execution checkpoints
-    (a safety prerequisite, not proof of a passed terminal outcome),
-    rejections, holds, NEEDS_REVIEW, DO_NOT_IMPORT, safe stops,
-    guard/revalidation/execution failures — is a ``failed``-category
-    terminal record.
-    """
-    if getattr(record, "execution_executed", False):
-        return "passed"
-    return "failed"
 
 
 def _sanitize(value: object) -> object:
@@ -120,7 +144,8 @@ class AuditWriter:
     destination taken from record content.
     """
 
-    def __init__(self, audit_root="", passed_dir="", failed_dir="") -> None:
+    def __init__(self, audit_root="", passed_dir="", failed_dir="",
+                 errors_dir="") -> None:
         if not isinstance(audit_root, str) or not audit_root.strip():
             raise ValueError("audit_root must be a non-empty string")
         candidate = Path(audit_root)
@@ -148,9 +173,12 @@ class AuditWriter:
 
         self._passed = _resolve_subdir(passed_dir, PASSED_SUBDIR)
         self._failed = _resolve_subdir(failed_dir, FAILED_SUBDIR)
-        if self._passed == self._failed:
+        self._errors = _resolve_subdir(errors_dir, ERRORS_SUBDIR)
+        resolved = {self._passed, self._failed, self._errors}
+        if len(resolved) != 3:
             raise ValueError(
-                "passed and failed audit subroots must resolve differently")
+                "passed, failed, and errors audit subroots must resolve "
+                "differently")
 
     @property
     def root(self) -> str:
@@ -164,8 +192,17 @@ class AuditWriter:
     def failed_dir(self) -> str:
         return str(self._failed)
 
+    @property
+    def errors_dir(self) -> str:
+        return str(self._errors)
+
     def _target(self, category: str) -> Path:
-        directory = self._passed if category == "passed" else self._failed
+        if category == "passed":
+            directory = self._passed
+        elif category == "errors":
+            directory = self._errors
+        else:
+            directory = self._failed
         target = directory / AUDIT_LOG_FILENAME
         # Re-validated on every append: the only writable path shape is
         # <validated subroot>/audit.jsonl.
@@ -181,13 +218,19 @@ class AuditWriter:
         if not payload.get("timestamp"):
             payload["timestamp"] = local_now_iso()
         payload["terminal_outcome"] = str(
-            getattr(record, "outcome", "") or "")
+            getattr(record, "terminal_outcome", "")
+            or getattr(record, "outcome", "") or "")
         category = audit_storage_category(record)
         payload["storage_category"] = category
         digest = record_digest(payload)
         payload["record_digest"] = digest
         payload["persistence_timestamp"] = local_now_iso()
-        directory = self._passed if category == "passed" else self._failed
+        if category == "passed":
+            directory = self._passed
+        elif category == "errors":
+            directory = self._errors
+        else:
+            directory = self._failed
         try:
             os.makedirs(str(directory), exist_ok=True)
         except OSError as exc:
@@ -234,5 +277,5 @@ def persist_record(writer, record, receipts=None) -> bool:
 
 
 __all__ = ("AUDIT_LOG_FILENAME", "PASSED_SUBDIR", "FAILED_SUBDIR",
-           "AuditWriter", "audit_storage_category", "persist_record",
-           "record_digest", "record_to_dict")
+           "ERRORS_SUBDIR", "AuditWriter", "audit_storage_category",
+           "persist_record", "record_digest", "record_to_dict")

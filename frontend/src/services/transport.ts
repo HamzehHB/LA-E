@@ -1,8 +1,8 @@
 /**
- * Single configured transport abstraction.
- * Foundation build: mock transport backed by static fixtures. No URLs, no fetch,
- * no sockets in components. The eventual launcher origin/port/token
- * will be configured here only.
+ * Fixture/demo transport abstraction (mock only).
+ * Used by demo flows and unit tests. Live launcher traffic goes through
+ * src/live/client.ts (token in memory, same-origin fetch + SSE reader);
+ * no URLs, fetch, or sockets in components.
  */
 import { FIXTURE_AUDITS, FIXTURE_STAGING, FIXTURE_RUN } from "../fixtures/demo";
 import type { JournalsResponse } from "../contracts/transport";

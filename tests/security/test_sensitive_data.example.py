@@ -36,7 +36,7 @@ def test_detection_reports_only_known_labels():
 def test_machine_specific_path_detection():
     assert contains_machine_specific_path("plain research note") is False
     assert contains_machine_specific_path(
-        "root = C:/LivingAuthenticity_Data"
+        "root = Q:/SyntheticMachineOnly/PrivateData"
     ) is False
 
 
@@ -50,5 +50,5 @@ def test_machine_specific_path_detection_with_synthetic_prefix(monkeypatch):
         "root = Q:/SyntheticMachineOnly/PrivateVault"
     ) is True
     assert contains_machine_specific_path(
-        "root = C:/LivingAuthenticity_Data"
+        "root = Q:/SyntheticMachineOnly/PrivateData"
     ) is False

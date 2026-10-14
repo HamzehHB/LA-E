@@ -290,6 +290,33 @@ The tests run against the real `Config/` directory for the
 integration check and against synthetic temporary configurations for
 everything else. No production data is read by the test suite.
 
+Three verification states stay distinct (see also [README.md](README.md)):
+
+1. **Synthetic test coverage** — the committed suite above; fixtures
+   and temporary directories only, no production data.
+2. **Real-environment readiness** — bounded, read-only checks against
+   the actual local deployment (config resolution, staging isolation
+   guards, local model load, read-only vector-store probe). Results
+   are machine-local and never committed.
+3. **An authorized real-data run** — a separately bounded operation on
+   explicitly selected real data, only with explicit human
+   authorization and every existing safety control. Tests and
+   readiness checks never imply this state.
+
+### Local-infrastructure tests (opt-in, never in ordinary runs)
+
+`tests/local/` holds machine-specific checks that cannot be expressed
+with synthetic values (real model load, local LLM endpoint, bounded
+read-only vault read). They skip unless explicitly opted in:
+
+```bash
+set LIVINGAUTHENTICITY_RUN_LOCAL=1
+python -m pytest tests/local -q
+```
+
+Each has a tracked public `.example` counterpart. The ordinary suite
+never contacts a model service and never reads the vault.
+
 ---
 
 ## Bounded Local Integration (optional)
@@ -384,6 +411,51 @@ The project distinguishes two operating modes (`knowledge/modes.py`):
 synthetic material under `examples/` and fails closed rather than ever
 resolving a configured personal Vault. The active mode is recorded on
 every audit record produced during that run.
+
+---
+
+## Running the Application (interim browser launcher)
+
+The delivery method for the current stage is a local loopback launcher
+that serves the React/TypeScript presentation layer in the system
+browser. A dedicated application window is a separate future packaging
+decision.
+
+### 1. Build the frontend (once, and after frontend changes)
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+### 2. Start the launcher
+
+```bash
+python -m src.living_authenticity.adapter
+```
+
+The launcher binds `127.0.0.1` only, mints a fresh in-memory launch
+token per start (never persisted, never placed in URLs or logs), and
+opens the system browser. If `frontend/dist` is missing, a placeholder
+page explains that the frontend must be built first.
+
+Transport surface (JSON + SSE, token header on every non-health route):
+`GET /api/health`, `GET /api/journals`, `GET /api/events`,
+`POST /api/folders/pick`, `POST /api/run`, `POST /api/approve`,
+`POST /api/consent`. Without a launcher token (for example plain
+`npm run dev`), the UI stays in fixture/demo mode and performs no
+backend calls.
+
+Portable directory selection: the Staging, Audit, and Vault buttons
+open the launcher's native folder dialog (`POST /api/folders/pick`)
+on the user's own computer; the backend validates the choice through
+the existing PathBoundary/destination guards and remembers a
+validated Staging/Audit selection for that launch only (memory,
+never written to configuration files). Later runs prefer the
+validated session choice and fall back to the config-declared
+location. No source file edits or machine-specific paths are needed
+to use the application on another computer.
 
 ---
 

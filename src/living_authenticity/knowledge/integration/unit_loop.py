@@ -365,7 +365,8 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                       operating_mode="", run_id="", prompt_sha256="",
                       synthesis=None, llm_config=None,
                       audit_writer=None, audit_receipts=None,
-                      audit_guard_error=""):
+                      audit_guard_error="", event_sink=None,
+                      should_cancel=None):
     """Govern one candidate: approval, guard re-check, revalidation."""
     from src.living_authenticity.knowledge.governance.audit.clock import (
         local_now_iso,
@@ -381,6 +382,16 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
         render_review_block,
     )
 
+    def _emit(kind, stage, message):
+        if event_sink is None:
+            return
+        try:
+            event_sink({"kind": kind, "run_id": run_id, "stage": stage,
+                        "message": message if isinstance(message, str) else "",
+                        "timestamp": ""})
+        except Exception:
+            pass
+
     block = render_review_block(
         candidate=None, proposal=proposal, confidence=confidence,
         filter_outcome=filter_outcome, retrieval=retrieval,
@@ -389,8 +400,13 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
         query=query_unit, classification=classification,
         relation=relation, core=core, comparisons=comparisons)
 
+    _emit("human_review_required", "human_review",
+          "one explicit decision requested for unit "
+          + str(getattr(query, "id", "")))
     request, outcome = _request_decision(
         gate, query, proposal, confidence, approval_reader, note, block)
+    _emit("approval_decided", "human_review",
+          "approved" if outcome.approved else "rejected")
     live_ok, live_reason, _live = check_staging_eligible(
         pinned_staging, guarded, authorized_staging)
     display = _entry_display_fields(
@@ -404,6 +420,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
         run_id=run_id, record_id=record_id,
         human_review_state=("approved" if outcome.approved else "rejected"))
     if not live_ok:
+        _emit("stopped", "staging_guard", live_reason)
         audits.append(build_audit_record(request, outcome, None, None,
                                          proposal, trace={
                                              **base_trace,
@@ -422,6 +439,9 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     revalidation = validator.revalidate(
         request, outcome, proposal, confidence, schema_version or "", note
     )
+    _emit("revalidation_result", "revalidation",
+          "valid" if revalidation.valid
+          else (revalidation.reason or "revalidation failed"))
     if not revalidation.valid:
         audits.append(build_audit_record(
             request, outcome, revalidation, None, proposal, trace={
@@ -435,6 +455,30 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             approval_approved=bool(outcome.approved),
             outcome="revalidation_failed",
             reason=revalidation.reason,
+            note_markdown=note.markdown, **display,
+        ))
+        return
+    # Cooperative cancellation boundary immediately before the controlled
+    # write: a cancelled run cannot proceed into execution even if every
+    # earlier step already completed. Cancellation is auditable and lands
+    # in the errors/ partition as an operational terminal outcome.
+    if should_cancel is not None and should_cancel():
+        _emit("stopped", "cancellation", "run cancelled before execution")
+        audits.append(build_audit_record(
+            request, outcome, revalidation, None, proposal, trace={
+                **base_trace, "outcome": "cancelled",
+                "validation_result": "cancelled",
+                "stop_reason": "run cancelled before execution",
+            }))
+        entries.append(IntegrationUnitEntry(
+            source_file=str(child), query_unit_id=query.id,
+            query_source=query.source, query_position=query.position,
+            proposal_hash=request.proposal_hash,
+            proposal_action=proposal.action,
+            approval_approved=bool(outcome.approved),
+            revalidation_valid=True,
+            outcome="cancelled",
+            reason="run cancelled before execution",
             note_markdown=note.markdown, **display,
         ))
         return
@@ -464,12 +508,17 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                 reason="audit persistence failed before execution",
                 note_markdown=note.markdown, **display,
             ))
+            _emit("stopped", "audit_persistence",
+                  "audit persistence failed before execution")
             return
     execution = runner.execute(
         request, outcome, proposal, confidence, note,
         staging_root=pinned_staging,
         schema_version=schema_version or "",
     )
+    _emit("execution_result", "controlled_execution",
+          "executed" if execution.executed
+          else (execution.reason or "not executed"))
     import hashlib as _hashlib
     artifact_digest = _hashlib.sha256(
         note.markdown.encode("utf-8")).hexdigest() if note.markdown else ""
@@ -540,7 +589,8 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                  llm_config=None,
                  generator=None, details=None, vault_context=None,
                  operating_mode="", run_id="", audit_writer=None,
-                 audit_receipts=None, audit_guard_error=""):
+                 audit_receipts=None, audit_guard_error="",
+                 event_sink=None, should_cancel=None):
     """Govern one unit through the mandatory AI synthesis step.
 
     The mandatory synthesis step always runs: synthesis produces 1..N candidates
@@ -569,11 +619,24 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
             DeterministicObsidianGenerator,
         )
         generator = DeterministicObsidianGenerator()
+
+    def _emit(kind, stage, message):
+        if event_sink is None:
+            return
+        try:
+            event_sink({"kind": kind, "run_id": run_id, "stage": stage,
+                        "message": message if isinstance(message, str) else "",
+                        "timestamp": ""})
+        except Exception:
+            pass
+
+    _emit("stage_started", "llm_synthesis", str(getattr(query, "id", "")))
     try:
         llm_result, _prompt, _digest = _synthesize_candidates(
             synthesis, unit_result, vault_context=vault_context)
     except Exception as exc:
         reason = _llm_safe_reason(exc)
+        _emit("stopped", "llm_synthesis", reason)
         entries.append(_safe_stop_entry(
             child, query, proposal, reason, unit_result=unit_result))
         try:
@@ -613,8 +676,11 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
         except Exception:
             pass
         return
+    _emit("stage_completed", "llm_synthesis", str(getattr(query, "id", "")))
     for candidate_index, candidate in enumerate(llm_result.candidates):
         if proposal.action != "CREATE":
+            _emit("status", "human_review",
+                  "held_non_executable: proposal action is not CREATE")
             note = _rendered_note_for_candidate(
                 query, proposal, unit_result.classification, confidence,
                 candidate, generator)
@@ -707,5 +773,6 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
             audit_writer=audit_writer,
             audit_receipts=audit_receipts,
             audit_guard_error=audit_guard_error,
+            event_sink=event_sink, should_cancel=should_cancel,
         )
 

@@ -8,21 +8,21 @@ from Config.settings import ROOT, ConfigError, load_models, load_paths
 
 EXAMPLE_YAML = """
 data:
-  root: "C:/LivingAuthenticity_Data"
+  root: "Q:/SyntheticMachineOnly/PrivateData"
 models:
-  bge_m3: "C:/LivingAuthenticity_Data/Models/BGE_M3"
+  bge_m3: "Q:/SyntheticMachineOnly/PrivateData/Models/BGE_M3"
 vector_db:
-  lancedb: "C:/LivingAuthenticity_Data/Database/Vector_Database"
+  lancedb: "Q:/SyntheticMachineOnly/PrivateData/Database/Vector_Database"
 memory:
-  root: "C:/LivingAuthenticity_Data/Memory"
+  root: "Q:/SyntheticMachineOnly/PrivateData/Memory"
 obsidian:
-  vault: "C:/LivingAuthenticity_Data/Knowledge/Obsidian"
+  vault: "Q:/SyntheticMachineOnly/PrivateData/Knowledge/Obsidian"
 zotero:
-  library: "C:/LivingAuthenticity_Data/Knowledge/Zotero"
+  library: "Q:/SyntheticMachineOnly/PrivateData/Knowledge/Zotero"
 exports:
-  root: "C:/LivingAuthenticity_Data/Knowledge/Exports"
+  root: "Q:/SyntheticMachineOnly/PrivateData/Knowledge/Exports"
 cache:
-  root: "C:/LivingAuthenticity_Data/Database/Cache"
+  root: "Q:/SyntheticMachineOnly/PrivateData/Database/Cache"
 """
 
 LOCAL_OVERRIDE_YAML = """
@@ -62,9 +62,9 @@ def test_load_paths_without_local_file_returns_example_values(tmp_path):
 
     paths = load_paths(tmp_path)
 
-    assert paths["data"]["root"] == "C:/LivingAuthenticity_Data"
+    assert paths["data"]["root"] == "Q:/SyntheticMachineOnly/PrivateData"
     assert paths["vector_db"]["lancedb"] == (
-        "C:/LivingAuthenticity_Data/Database/Vector_Database"
+        "Q:/SyntheticMachineOnly/PrivateData/Database/Vector_Database"
     )
 
 
@@ -76,7 +76,7 @@ def test_load_paths_local_file_overrides_example_values(tmp_path):
 
     assert paths["data"]["root"] == "F:/MyData"
     assert paths["vector_db"]["lancedb"] == "F:/MyData/Database/Vector_Database"
-    assert paths["obsidian"]["vault"] == "C:/LivingAuthenticity_Data/Knowledge/Obsidian"
+    assert paths["obsidian"]["vault"] == "Q:/SyntheticMachineOnly/PrivateData/Knowledge/Obsidian"
 
 
 def test_load_paths_always_derives_repository_internal_locations(tmp_path):
@@ -97,7 +97,7 @@ def test_load_paths_missing_example_file_raises_clear_error(tmp_path):
 
 def test_load_paths_empty_required_value_raises_clear_error(tmp_path):
     content = EXAMPLE_YAML.replace(
-        '  root: "C:/LivingAuthenticity_Data"',
+        '  root: "Q:/SyntheticMachineOnly/PrivateData"',
         '  root: ""',
         1,
     )

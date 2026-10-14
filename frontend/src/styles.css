@@ -1,44 +1,149 @@
 :root {
-  --bg: #f7f5ef;
-  --ink: #1c1a15;
-  --panel: #fffdf7;
-  --accent: #2456c6;
-  --warn: #a97b00;
-  --line: #d8d2c2;
+  --bg: #f4f2ec; --bg-2: #eae7dd; --ink: #14120d; --muted: #5b5648;
+  --panel: #fffdf7; --panel-2: #fbf9f2; --accent: #2456c6; --warn: #b07d00;
+  --line: #d9d3c3; --ok: #1c7a2e; --ok-bg: #e4f3e7; --danger: #b3261e; --danger-bg: #fbe6e4;
+  --star: #e6b800; --star-web: #e6b800;
+  --mono: "Cascadia Code", "Consolas", monospace;
+  --r-sm: 6px; --r: 10px; --r-lg: 16px;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04);
+  --s1: .5rem; --s2: 1rem; --s3: 1.5rem; --s4: 2rem;
 }
 [data-theme="dark"] {
-  --bg: #0c0f16;
-  --ink: #eef1f7;
-  --panel: #11141c;
-  --accent: #6f9bff;
-  --warn: #ffd75e;
-  --line: #2a3040;
+  --bg: #0b0e14; --bg-2: #0f131c; --ink: #f2f4f8; --muted: #a7b0c0;
+  --panel: #12161f; --panel-2: #0e1219; --accent: #7aa2ff; --warn: #ffd75e;
+  --line: #273042; --ok: #4ade80; --ok-bg: #10281a; --danger: #f87171; --danger-bg: #2a1414;
+  --star: #5b8cff; --star-web: #5b8cff;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 2px 10px rgba(0,0,0,.35);
 }
 * { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: "Segoe UI", Tahoma, sans-serif;
-}
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font-family: "Segoe UI", Tahoma, system-ui, sans-serif; font-size: 15px; line-height: 1.45; }
+h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -.01em; }
+h2 { font-size: 1.02rem; } h3 { font-size: .9rem; }
+p { margin: 0; }
+button { font: inherit; color: var(--ink); }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
 .app { min-height: 100vh; display: flex; flex-direction: column; }
-.topnav {
-  display: flex; gap: 0.5rem; flex-wrap: wrap;
-  padding: 0.6rem 1rem; border-bottom: 1px solid var(--line);
-}
-.topnav button { padding: 0.4rem 0.7rem; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; }
-.topnav button:focus-visible, button:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-.badge { margin-inline-start: 0.4rem; font-size: 0.75rem; border: 1px solid var(--line); padding: 0 0.4rem; border-radius: 999px; }
+.app > header { position: sticky; top: 0; z-index: 20; background: var(--panel); border-bottom: 1px solid var(--line); padding: var(--s1) var(--s2); display: flex; flex-direction: column; gap: var(--s1); }
+.brand-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.brand { display: flex; align-items: baseline; gap: var(--s1); }
+.brand-cluster { position: relative; display: flex; align-items: center; gap: var(--s1); }
+.brand .logo { font-size: 1.35rem; font-weight: 800; letter-spacing: -.02em; }
+.logo-l { color: #3f9e4d; }
+.logo-a { color: #4f9fd8; }
+.logo-sep { color: #ff5c00; }
+[data-theme="dark"] .logo-sep { color: #ff7a2f; }
+.logo-e { color: #8a6d4b; }
+[data-theme="dark"] .logo-e { color: #c9a86a; }
+.brand .ver { font-size: .72rem; color: var(--muted); border: 1px solid var(--line); padding: 0 .4rem; border-radius: 999px; }
+/* Compact gear immediately right of the brand (§2). Dark glyph in light
+ * theme, light glyph in dark theme; toggles a dropdown below the brand. */
+.gear { font-size: 1.05rem; line-height: 1; padding: .3rem .45rem; border: 1px solid var(--line); background: var(--panel-2); border-radius: var(--r-sm); cursor: pointer; color: #1b1b1b; }
+[data-theme="dark"] .gear { color: #f2f4f8; }
+.gear:hover { border-color: var(--accent); }
+.live-line { font-size: .8rem; color: var(--muted); display: flex; gap: var(--s1); align-items: center; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.live-dot.on { background: var(--ok); } .live-dot.off { background: var(--danger); }
+.topnav { display: flex; gap: var(--s1); flex-wrap: wrap; align-items: center; }
+.topnav button { padding: .4rem .7rem; border: 1px solid var(--line); background: var(--panel-2); border-radius: var(--r-sm); display: inline-flex; align-items: center; gap: .35rem; cursor: pointer; }
+.topnav button:hover { border-color: var(--accent); }
+/* §3 Vault/Test mode tab treatment: red in Test, green only when Vault is
+ * a valid, verified selection; otherwise neutral. */
+.topnav .mode-test { border-color: var(--danger); color: var(--danger); background: var(--danger-bg); }
+.topnav .mode-vault { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
+.topnav .mode-vault:not(.mode-ready) { border-color: var(--line); color: var(--ink); background: var(--panel-2); }
+/* §15 display-only Translate affordance (social-post style, blue). */
+.translate-row { margin-top: var(--s1); }
+.translate-btn { background: transparent; border: none; color: var(--accent); font-size: .82rem; font-weight: 600; cursor: pointer; padding: .15rem .2rem; }
+.translate-btn:hover { text-decoration: underline; }
+.translate-note { font-size: .78rem; color: var(--muted); }
 .menu { position: relative; }
-.dropdown { position: absolute; inset-inline-start: 0; top: 110%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.4rem; display: flex; flex-direction: column; gap: 0.25rem; min-width: 12rem; z-index: 5; }
-main { display: grid; grid-template-columns: 1.2fr 1fr; gap: 1rem; padding: 1rem; flex: 1; }
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1rem; }
-.panel-head { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
-.stars { height: 64px; background: radial-gradient(circle at 20% 50%, var(--accent) 0 2px, transparent 3px), radial-gradient(circle at 60% 20%, var(--warn) 0 2px, transparent 3px), radial-gradient(circle at 80% 60%, var(--accent) 0 2px, transparent 3px); opacity: 0.5; border-radius: 12px; margin: 0 1rem; }
-.stages, .workflow { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
-.workflow { flex-direction: row; flex-wrap: wrap; gap: 0.6rem; }
+.dropdown { position: absolute; inset-inline-start: 0; top: calc(100% + 6px); background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s1); display: flex; flex-direction: column; gap: .3rem; min-width: 13rem; z-index: 30; box-shadow: var(--shadow); }
+.dropdown button { justify-content: flex-start; }
+.dropdown .note { font-size: .75rem; color: var(--muted); padding: .2rem .3rem; }
+.badge { margin-inline-start: .4rem; font-size: .72rem; font-weight: 600; border: 1px solid var(--line); padding: 0 .45rem; border-radius: 999px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.badge.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.bad { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+.constellation-stage { position: relative; margin: var(--s1) var(--s2) 0; min-height: 300px; }
+.stars { position: absolute; inset: 0; height: 100%; margin: 0; border-radius: var(--r-lg); }
+.star-web { position: absolute; inset: 0; width: 100%; height: 100%; }
+.star-web polyline { stroke: var(--star-web); stroke-width: .35; opacity: .4; vector-effect: non-scaling-stroke; }
+.star { position: absolute; transform: translate(-50%, -50%) scale(var(--star-scale, 1)); color: var(--star); font-size: 1.2rem; line-height: 1; user-select: none; filter: drop-shadow(0 0 4px var(--star)); }
+/* Current Audit overlays the constellation, covering ~the lower stars
+ * while leaving the upper three visible; it only appears while a run is
+ * active. Idle, the constellation stands alone. */
+.constellation-stage .current { position: absolute; inset-inline: 0; bottom: 0; top: 42%; z-index: 5; background: color-mix(in srgb, var(--panel) 88%, transparent); backdrop-filter: blur(2px); }
+.constellation-stage .current.idle { display: none; }
+/* §9 collapse hides the log body; the run keeps going. */
+.constellation-stage .current.collapsed .audit-log { display: none; }
+/* §9 enlarged reading view: taller, fully scrollable, still overlay-local. */
+.constellation-stage .current.enlarged { top: 26%; z-index: 6; }
+.constellation-stage .current.enlarged .audit-log { max-height: 62vh; }
+main.dashboard { flex: 1; display: grid; gap: var(--s2); padding: var(--s2); grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); align-items: stretch; }
+/* §1 layout: a narrow Workflow strip on the left, the large Processing Result
+ * filling the remaining center space. */
+.workspace { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: var(--s2); min-width: 0; align-items: start; }
+.workspace .panel.result { min-height: 420px; }
+.sidebar { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: var(--s2); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: var(--s1); min-width: 0; }
+.panel-head { display: flex; gap: var(--s2); align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+.panel .muted { color: var(--muted); font-size: .82rem; }
+.run-controls { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s1) var(--s2); }
+.btn { padding: .45rem .85rem; border: 1px solid var(--line); background: var(--panel-2); border-radius: var(--r-sm); cursor: pointer; }
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn.approve { background: var(--ok); border-color: var(--ok); color: #fff; }
+.btn.reject { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.ghost { background: transparent; }
+/* §2 vertical circular-node timeline. Each stage = a circular status node with
+ * a connecting line to the next node and its label. Colors follow the spec:
+ * idle white, current yellow, completed blue, terminal-success green, stopped
+ * red. Every state comes from real backend events via deriveWorkflow(). */
+.workflow-scroll { padding: var(--s1) 0; }
+ol.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+ol.timeline li { display: grid; grid-template-columns: 22px 1fr; align-items: center; gap: .75rem; position: relative; padding: .22rem 0; }
+ol.timeline li .node { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--line); background: var(--panel); justify-self: center; }
+ol.timeline li:not(:last-child)::after { content: ""; position: absolute; inset-inline-start: 10px; top: 21px; bottom: -1px; width: 2px; background: var(--line); }
+ol.timeline li .grp { font-size: .84rem; color: var(--muted); }
+ol.timeline li[data-state="completed"] .node { border-color: var(--accent); background: var(--accent); }
+ol.timeline li[data-state="completed"] .grp { color: var(--accent); }
+ol.timeline li[data-state="completed"]:not(:last-child)::after { background: var(--accent); }
+ol.timeline li[data-state="current"] .node { border-color: var(--warn); background: var(--warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 25%, transparent); }
+ol.timeline li[data-state="current"] .grp { color: var(--warn); font-weight: 650; }
+ol.timeline li[data-state="stopped"] .node { border-color: var(--danger); background: var(--danger); }
+ol.timeline li[data-state="stopped"] .grp { color: var(--danger); }
+/* Terminal success (strict evidence): completed nodes turn green. */
+ol.timeline[data-terminal="success"] li[data-state="completed"] .node { border-color: var(--ok); background: var(--ok); }
+ol.timeline[data-terminal="success"] li[data-state="completed"] .grp { color: var(--ok); }
+ol.timeline[data-terminal="success"] li[data-state="completed"]:not(:last-child)::after { background: var(--ok); }
+.audit-log { font-family: var(--mono); font-size: .8rem; white-space: pre-wrap; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s1); max-height: 220px; overflow: auto; color: var(--ink); }
+.audit-log .empty { color: var(--muted); font-style: italic; }
+.current.expanded .audit-log { max-height: 60vh; }
+.audit-log .ev { padding: 1px 0; }
+.audit-log .ev-error, .audit-log .ev-run_rejected, .audit-log .ev-stopped { color: var(--danger); }
+.audit-log .ev-human_review_required { color: var(--warn); }
+.audit-log .ev-execution_result, .audit-log .ev-run_completed, .audit-log .ev-completed { color: var(--ok); }
+ol.stages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
+ol.stages li { display: flex; gap: .5rem; align-items: baseline; font-size: .85rem; }
 [data-state="completed"] { color: var(--accent); }
 [data-state="current"] { color: var(--warn); font-weight: 700; }
+[data-state="pending"] { color: var(--muted); }
+.result-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s1); }
+.demo-banner { font-size: .8rem; color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border: 1px dashed var(--warn); border-radius: var(--r-sm); padding: .4rem .6rem; }
+.result-field { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s1); }
+.result-field dt { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+.result-field dd { margin: .2rem 0 0; font-weight: 650; }
+.output { white-space: pre-wrap; word-break: break-word; font-size: .9rem; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r); padding: var(--s1); max-height: 260px; overflow: auto; }
+.hash { font-size: .76rem; color: var(--muted); word-break: break-all; }
+.review { display: flex; gap: var(--s1); flex-wrap: wrap; align-items: center; }
+.state-pill { display: inline-flex; align-items: center; gap: .4rem; font-size: .8rem; padding: .2rem .6rem; border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2); }
+.state-pill.proc { color: var(--warn); border-color: var(--warn); }
+.state-pill.err { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+.state-pill.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.spinner { width: 12px; height: 12px; border: 2px solid var(--warn); border-top-color: transparent; border-radius: 50%; display: inline-block; animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 .journals { display: flex; flex-direction: column; gap: 1rem; }
 .journal { background: var(--panel); }
 [data-theme="dark"] .journal { background: #05070c; }
@@ -47,11 +152,86 @@ main { display: grid; grid-template-columns: 1.2fr 1fr; gap: 1rem; padding: 1rem
 .review { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
 .composer, .composer-collapsed { border-top: 1px solid var(--line); padding: 1rem; }
 .composer textarea { width: 100%; }
-.responsibility { text-align: center; }
+.responsibility { text-align: center; font-size: .8rem; color: var(--muted); }
 [dir="rtl"] .responsibility { text-align: center; }
-.safestop-actions { display: flex; gap: 0.75rem; }
-.safestop-actions .fix { background: #1c7a2e; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; }
-.safestop-actions .stop { background: #b3261e; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; }
-@media (max-width: 900px) {
-  main { grid-template-columns: 1fr; }
-}
+.safestop-actions { display: flex; gap: var(--s2); }
+.safestop-actions .fix { background: var(--ok); color: #fff; border: none; padding: .5rem 1rem; border-radius: var(--r-sm); }
+.safestop-actions .stop { background: var(--danger); color: #fff; border: none; padding: .5rem 1rem; border-radius: var(--r-sm); }
+.journals { display: flex; flex-direction: column; gap: var(--s2); flex: 1 1 auto; min-height: 0; }
+.journal { background: var(--panel); flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; }
+:root .journal { background: #fffefb; }
+[data-theme="dark"] .journal { background: #05070c; }
+.journal-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+.journal-table th, .journal-table td { text-align: start; padding: .35rem .4rem; border-bottom: 1px solid var(--line); }
+.journal-table th { color: var(--muted); font-weight: 600; font-size: .72rem; text-transform: uppercase; letter-spacing: .03em; }
+.journal-table tr:last-child td { border-bottom: none; }
+.journal-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--s1); font-size: .76rem; color: var(--muted); }
+.pager { display: inline-flex; gap: .3rem; align-items: center; }
+.composer-dock { border-top: 1px solid var(--line); background: var(--panel); padding: var(--s2); position: sticky; bottom: 0; }
+/* §3 focused composer: a bottom-sheet overlay that rises over the workflow /
+ * journals. The dashboard stays mounted behind it (state preserved). */
+.composer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 60; }
+.composer-overlay { position: fixed; inset-inline: 0; bottom: 0; z-index: 61; display: flex; justify-content: center; padding: var(--s2); animation: composer-rise .22s ease-out; }
+.composer-overlay .composer { width: 100%; max-width: 980px; margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: var(--s2); }
+@keyframes composer-rise { from { transform: translateY(18px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .composer-overlay { animation: none; } }
+.composer-collapsed { display: flex; justify-content: center; }
+.composer-collapsed button { width: 100%; max-width: 860px; text-align: start; padding: .9rem 1.1rem; border: 1px solid var(--line); border-radius: 999px; background: var(--panel-2); color: var(--muted); cursor: pointer; font-size: 1rem; }
+.composer { width: 100%; max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--s1); }
+.composer textarea { width: 100%; border: 1px solid var(--line); border-radius: var(--r-lg); padding: var(--s2); background: var(--panel-2); color: var(--ink); font-size: 1rem; resize: vertical; min-height: 120px; }
+.composer-actions { display: flex; gap: var(--s1); align-items: center; flex-wrap: wrap; }
+.composer-actions .spacer { flex: 1; }
+.welcome-overlay { position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; padding: var(--s2); overflow: auto; }
+.welcome { max-width: 560px; width: 100%; gap: var(--s2); }
+.welcome-list { margin: 0; display: grid; grid-template-columns: 1fr; gap: .35rem; }
+.welcome-list dt { font-weight: 650; font-size: .85rem; }
+.welcome-list dd { margin: 0; color: var(--muted); font-size: .82rem; }
+.pager-btn { padding: 0 .5rem; }
+main.focused { display: block; padding: var(--s3); }
+.settings-popover { position: absolute; inset-inline-start: 0; top: calc(100% + 6px); z-index: 40; width: min(280px, calc(100vw - 2rem)); box-shadow: var(--shadow); }
+.onboard, .engine { border-style: dashed; }
+/* ── gap-closure component styles ─────────────────────────────────────── */
+/* Tiny corner capability status (§6). */
+.corner-status { position: fixed; inset-inline-start: var(--s2); bottom: var(--s2); z-index: 30; display: flex; gap: .6rem; flex-wrap: wrap; font-size: .68rem; color: var(--muted); background: color-mix(in srgb, var(--panel) 85%, transparent); border: 1px solid var(--line); border-radius: 999px; padding: .2rem .6rem; }
+.corner-status .cs-item { display: inline-flex; align-items: center; gap: .25rem; }
+.corner-status .cs-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); }
+.corner-status .cs-dot.on { background: var(--ok); }
+/* Current Audit bottom collapse control (§9). */
+.current-foot { display: flex; justify-content: center; padding-top: .35rem; }
+/* Processing Result error/safe-stop (§ folded Fix/Stop). */
+.err-title { font-weight: 700; color: var(--danger); }
+.test-affordance { font-size: .76rem; opacity: .85; }
+/* Narrow Workflow strip: smaller labels to fit the left column. */
+.workspace ol.timeline li .grp { font-size: .74rem; }
+.workspace ol.timeline li { grid-template-columns: 18px 1fr; gap: .5rem; }
+/* Taller composer (§ chat field longer at the bottom). */
+.composer textarea { min-height: 180px; }
+.composer-overlay .composer textarea { min-height: 240px; }
+/* Newspaper-style journals (§): serif, ruled rows, drop-cap lead. */
+.journal { font-family: Georgia, "Times New Roman", serif; }
+.journal .panel-head h2 { font-family: "Segoe UI", Tahoma, system-ui, sans-serif; letter-spacing: .02em; text-transform: uppercase; font-size: .82rem; border-bottom: 3px double var(--line); padding-bottom: .4rem; }
+.journal-table { font-family: Georgia, "Times New Roman", serif; }
+.journal-table td { padding: .5rem .4rem; }
+.journal-table td:first-child { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+.journal-table tr { border-bottom: 1px solid var(--line); }
+.journal-foot { font-family: "Segoe UI", Tahoma, system-ui, sans-serif; }
+/* Dark-mode text contrast fixes (§): inputs, buttons, menus, notes. */
+[data-theme="dark"] input,
+[data-theme="dark"] textarea,
+[data-theme="dark"] select { color: var(--ink); background: var(--panel-2); border-color: var(--line); }
+[data-theme="dark"] input::placeholder,
+[data-theme="dark"] textarea::placeholder { color: var(--muted); }
+[data-theme="dark"] .btn { color: var(--ink); }
+[data-theme="dark"] .btn.approve { color: #06130a; }
+[data-theme="dark"] .btn.reject { color: #1a0908; }
+[data-theme="dark"] .topnav button { color: var(--ink); }
+[data-theme="dark"] .dropdown { background: var(--panel); color: var(--ink); border-color: var(--line); }
+[data-theme="dark"] .note { color: var(--muted); }
+[data-theme="dark"] .badge { color: var(--ink); }
+[data-theme="dark"] .muted { color: var(--muted); }
+[data-theme="dark"] .journal { color: var(--ink); }
+[data-theme="dark"] .composer-collapsed button { color: var(--ink); }
+[data-theme="dark"] .result-field dd { color: var(--ink); }
+
+@media (max-width: 1000px) { main.dashboard { grid-template-columns: 1fr; } .sidebar { position: static; } }
+@media (max-width: 620px) { .result-grid { grid-template-columns: 1fr; } .brand .ver { display: none; } main.dashboard { padding: var(--s1); } }

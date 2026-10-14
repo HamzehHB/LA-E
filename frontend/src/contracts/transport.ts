@@ -1,10 +1,13 @@
 /**
- * Transport proposals: proposed launcher wire format for future integration
- * ONLY — NOT implemented, no HTTP handlers. Documented as API/SSE contract.
+ * Launcher wire format (Increment 2, implemented).
+ * Served by src/living_authenticity/adapter/server.py on 127.0.0.1 only:
+ * GET /api/health, GET /api/journals, GET /api/events (SSE),
+ * POST /api/folders/pick, POST /api/run, POST /api/approve,
+ * POST /api/consent, POST /api/cancel, POST /api/proposal/edit.
  */
-import type { AuditStorageCategory } from "./backend";
+import type { AuditStorageCategory, ProposalAction } from "./backend";
 
-/** @category transport-proposal */
+/** @category transport */
 export type FolderPurpose =
   | "vault"
   | "staging"
@@ -13,19 +16,19 @@ export type FolderPurpose =
   | "local_llm"
   | "embedding_model";
 
-/** @category transport-proposal */
+/** @category transport */
 export type FolderPickStatus =
   | "configured"
   | "invalid"
   | "unavailable"
   | "cancelled";
 
-/** @category transport-proposal — POST /api/folders/pick */
+/** @category transport — POST /api/folders/pick */
 export interface FolderPickRequest {
   purpose: FolderPurpose;
 }
 
-/** @category transport-proposal — POST /api/folders/pick response */
+/** @category transport — POST /api/folders/pick response */
 export interface FolderPickResponse {
   purpose: FolderPurpose;
   status: FolderPickStatus;
@@ -35,30 +38,34 @@ export interface FolderPickResponse {
   validated_at: string;
 }
 
-/** @category transport-proposal — GET /api/health response */
+/** @category transport — GET /api/health response */
 export interface HealthResponse {
   app: "living-authenticity";
   version: string;
   instance_id: string;
 }
 
-/** @category transport-proposal — POST /api/run */
+/** @category transport — POST /api/run */
 export interface RunRequest {
   input_text: string;
   source_mode: "personal_vault" | "examples";
+  /** Requested retrieval mode; backend falls back honestly when unavailable. */
+  retrieval_mode?: "lexical" | "semantic";
   app_language: "en" | "fa";
   staging_language: "en" | "fa";
   audit_language: "en" | "fa";
 }
 
-/** @category transport-proposal — POST /api/run response */
+/** @category transport — POST /api/run response */
 export interface RunResponse {
   run_id: string;
   accepted: boolean;
   reason: string;
+  /** Effective retrieval actually used for this run. */
+  retrieval_mode?: "lexical" | "semantic";
 }
 
-/** @category transport-proposal — POST /api/approve */
+/** @category transport — POST /api/approve */
 export interface ApproveRequest {
   proposal_hash: string;
   query_unit_id: string;
@@ -66,14 +73,61 @@ export interface ApproveRequest {
   decision: "approve" | "reject";
 }
 
-/** @category transport-proposal — POST /api/approve response */
+/** @category transport — POST /api/approve response */
 export interface ApproveResponse {
   proposal_hash: string;
   approved: boolean;
   reason: string;
 }
 
-/** @category transport-proposal — GET /api/journals item */
+/** @category transport — POST /api/consent (per-call cloud consent) */
+export interface ConsentRequest {
+  consent_id: string;
+  /** Explicit UI decision for exactly one pending consent. */
+  decision: "approve" | "reject";
+}
+
+/** @category transport — POST /api/consent response */
+export interface ConsentResponse {
+  consent_id: string;
+  approved: boolean;
+}
+
+/** @category transport — POST /api/proposal/edit (server-side rehash) */
+export interface EditProposalRequest {
+  title?: string;
+  body?: string;
+  reason?: string;
+  /** Accepted for interface compatibility; ignored/non-authoritative. */
+  proposal_hash?: string;
+}
+
+/** @category transport — POST /api/proposal/edit response */
+export interface EditProposalResponse {
+  proposal_hash: string;
+  supersedes: string;
+  query_unit_id: string;
+  proposal_action: ProposalAction;
+  title: string;
+  body: string;
+  confidence_level: string;
+  review_state: string;
+  reason: string;
+}
+
+/** @category transport — POST /api/cancel (cooperative run cancellation) */
+export interface CancelRequest {
+  run_id: string;
+}
+
+/** @category transport — POST /api/cancel response */
+export interface CancelResponse {
+  run_id: string;
+  status: "cancel_requested" | "already_completed";
+  reason: string;
+}
+
+/** @category transport — GET /api/journals item */
 export interface JournalItem {
   record_id: string;
   run_id: string;
@@ -85,19 +139,23 @@ export interface JournalItem {
   staging_available: boolean;
 }
 
-/** @category transport-proposal — GET /api/journals response */
+/** @category transport — GET /api/journals response */
 export interface JournalsResponse {
   audits: JournalItem[];
   staging: JournalItem[];
 }
 
 /**
- * @category transport-proposal — GET /api/events (SSE) envelope.
+ * @category transport — GET /api/events (SSE) envelope.
  * Every run-scoped event carries run_id. Content is user-safe operational
  * info only: never private LLM reasoning, secrets, or raw tracebacks.
+ * Kinds cover run/stage lifecycle, live approval + consent gates, and
+ * observational backend results (revalidation/execution).
  */
 export type RunEventKind =
   | "run_started"
+  | "run_completed"
+  | "run_rejected"
   | "stage_started"
   | "stage_completed"
   | "status"
@@ -105,9 +163,13 @@ export type RunEventKind =
   | "error"
   | "stopped"
   | "human_review_required"
+  | "approval_decided"
+  | "consent_required"
+  | "revalidation_result"
+  | "execution_result"
   | "completed";
 
-/** @category transport-proposal */
+/** @category transport */
 export interface RunEvent {
   kind: RunEventKind;
   run_id: string;

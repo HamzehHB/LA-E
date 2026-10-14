@@ -22,6 +22,7 @@ class AuditRecord:
     query_source: str = ""
     query_position: int = 0
     proposal_action: str = ""
+    terminal_outcome: str = ""
     approval_approved: bool = False
     approval_proposal_hash: str = ""
     approval_query_unit_id: str = ""
@@ -228,6 +229,7 @@ def build_audit_record(request, outcome, revalidation=None, execution=None,
         query_source=request.query_source,
         query_position=request.query_position,
         proposal_action=request.proposal_action,
+        terminal_outcome=_text("outcome") or _text("validation_result"),
         approval_approved=bool(outcome.approved),
         approval_proposal_hash=outcome.proposal_hash,
         approval_query_unit_id=outcome.query_unit_id,

@@ -1,0 +1,249 @@
+/**
+ * Live launcher transport client (Increment 1).
+ * Token stays in memory: never localStorage/sessionStorage/URL/log.
+ * Same-origin fetch with X-LAE-Token; SSE via fetch reader.
+ * Without a bootstrap token (vite dev), reports unavailable and the
+ * UI keeps fixture/demo behavior.
+ */
+import type {
+  ApproveRequest,
+  ApproveResponse,
+  CancelRequest,
+  CancelResponse,
+  ConsentRequest,
+  ConsentResponse,
+  EditProposalRequest,
+  EditProposalResponse,
+  FolderPickResponse,
+  FolderPurpose,
+  HealthResponse,
+  JournalsResponse,
+  RunEvent,
+  RunRequest,
+  RunResponse,
+} from "../contracts/transport";
+
+export const TOKEN_HEADER = "X-LAE-Token";
+
+interface Bootstrap {
+  token?: string;
+  instanceId?: string;
+  version?: string;
+}
+
+function bootstrap(): Bootstrap | null {
+  try {
+    const w = window as unknown as { __LAE_BOOTSTRAP__?: Bootstrap };
+    const b = w.__LAE_BOOTSTRAP__;
+    if (b && typeof b.token === "string" && b.token.length > 0) return b;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+export interface LiveClient {
+  available: boolean;
+  instanceId: string;
+  version: string;
+  health(): Promise<HealthResponse>;
+  pickFolder(purpose: FolderPurpose): Promise<FolderPickResponse>;
+  startRun(req: RunRequest): Promise<RunResponse>;
+  approve(req: ApproveRequest): Promise<ApproveResponse>;
+  editProposal(req: EditProposalRequest): Promise<EditProposalResponse>;
+  consent(req: ConsentRequest): Promise<ConsentResponse>;
+  cancel(req: CancelRequest): Promise<CancelResponse>;
+  journals(): Promise<JournalsResponse>;
+  streamEvents(
+    onEvent: (event: RunEvent) => void,
+    onError: (message: string) => void,
+  ): () => void;
+}
+
+class FetchLiveClient implements LiveClient {
+  readonly available = true;
+  readonly instanceId: string;
+  readonly version: string;
+  private streamSeq = 0;
+
+  constructor(
+    token: string,
+    instanceId: string,
+    version: string,
+  ) {
+    this.instanceId = instanceId;
+    this.version = version;
+    // Token lives in closure scope only: attached via non-enumerable
+    // properties so JSON.stringify / spread / enumeration cannot leak it.
+    const headers = (): Record<string, string> => ({
+      [TOKEN_HEADER]: token,
+      "Content-Type": "application/json",
+    });
+    const authHeader = (): Record<string, string> => ({
+      [TOKEN_HEADER]: token,
+    });
+    Object.defineProperties(this, {
+      headers: { value: headers, enumerable: false, writable: false },
+      authHeader: { value: authHeader, enumerable: false, writable: false },
+    });
+  }
+
+  private readonly headers!: () => Record<string, string>;
+  private readonly authHeader!: () => Record<string, string>;
+
+  private async post<T>(path: string, body: unknown): Promise<T> {
+    let resp: Response;
+    try {
+      resp = await fetch(path, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+      });
+    } catch {
+      throw new Error("connection_unavailable");
+    }
+    if (!resp.ok) throw new Error(await this.errorKind(resp));
+    return (await resp.json()) as T;
+  }
+
+  private async errorKind(resp: Response): Promise<string> {
+    try {
+      const payload = (await resp.json()) as {
+        error?: { kind?: string; message?: string };
+      };
+      const kind = payload?.error?.kind;
+      if (typeof kind === "string" && kind.length > 0) return kind;
+    } catch {
+      /* fall through */
+    }
+    if (resp.status === 401 || resp.status === 403) {
+      return "authentication_error";
+    }
+    if (resp.status === 413) return "validation_error";
+    return "backend_error";
+  }
+
+  async health(): Promise<HealthResponse> {
+    const resp = await fetch("/api/health");
+    if (!resp.ok) throw new Error("connection_unavailable");
+    return (await resp.json()) as HealthResponse;
+  }
+
+  pickFolder(purpose: FolderPurpose): Promise<FolderPickResponse> {
+    return this.post<FolderPickResponse>("/api/folders/pick", { purpose });
+  }
+
+  startRun(req: RunRequest): Promise<RunResponse> {
+    return this.post<RunResponse>("/api/run", req);
+  }
+
+  approve(req: ApproveRequest): Promise<ApproveResponse> {
+    return this.post<ApproveResponse>("/api/approve", req);
+  }
+
+  editProposal(req: EditProposalRequest): Promise<EditProposalResponse> {
+    return this.post<EditProposalResponse>("/api/proposal/edit", req);
+  }
+
+  consent(req: ConsentRequest): Promise<ConsentResponse> {
+    return this.post<ConsentResponse>("/api/consent", req);
+  }
+
+  cancel(req: CancelRequest): Promise<CancelResponse> {
+    return this.post<CancelResponse>("/api/cancel", req);
+  }
+
+  async journals(): Promise<JournalsResponse> {
+    let resp: Response;
+    try {
+      resp = await fetch("/api/journals", {
+        headers: this.authHeader(),
+      });
+    } catch {
+      throw new Error("connection_unavailable");
+    }
+    if (!resp.ok) throw new Error(await this.errorKind(resp));
+    return (await resp.json()) as JournalsResponse;
+  }
+
+  streamEvents(
+    onEvent: (event: RunEvent) => void,
+    onError: (message: string) => void,
+  ): () => void {
+    const ctrl = new AbortController();
+    let stopped = false;
+    const client = this;
+    void (async () => {
+      try {
+        const resp = await fetch(`/api/events?after=${client.streamSeq}`, {
+          headers: {
+            ...client.authHeader(),
+            Accept: "text/event-stream",
+          },
+          signal: ctrl.signal,
+        });
+        if (!resp.ok || !resp.body) {
+          onError("connection_unavailable");
+          return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done || stopped) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buffer.indexOf("\n\n")) >= 0) {
+            const frame = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            const line = frame.split("\n").find((l) => l.startsWith("data:"));
+            if (!line) continue;
+            try {
+              const event = JSON.parse(line.slice(5).trim()) as RunEvent & {
+                seq?: number;
+              };
+              if (typeof event.seq === "number") client.streamSeq = event.seq;
+              onEvent(event);
+            } catch {
+              /* ignore malformed frame */
+            }
+          }
+        }
+      } catch (e) {
+        if (!stopped && (e as Error)?.name !== "AbortError") {
+          onError("connection_unavailable");
+        }
+      }
+    })();
+    return () => {
+      stopped = true;
+      ctrl.abort();
+    };
+  }
+}
+
+const unavailable: LiveClient = {
+  available: false,
+  instanceId: "",
+  version: "",
+  health: () => Promise.reject(new Error("connection_unavailable")),
+  pickFolder: () => Promise.reject(new Error("connection_unavailable")),
+  startRun: () => Promise.reject(new Error("connection_unavailable")),
+  approve: () => Promise.reject(new Error("connection_unavailable")),
+  editProposal: () => Promise.reject(new Error("connection_unavailable")),
+  consent: () => Promise.reject(new Error("connection_unavailable")),
+  cancel: () => Promise.reject(new Error("connection_unavailable")),
+  journals: () => Promise.reject(new Error("connection_unavailable")),
+  streamEvents: (_onEvent, onError) => {
+    queueMicrotask(() => onError("connection_unavailable"));
+    return () => undefined;
+  },
+};
+
+/** Build the live client once; token never leaves module memory. */
+export function createLiveClient(): LiveClient {
+  const b = bootstrap();
+  if (!b?.token) return unavailable;
+  return new FetchLiveClient(b.token, b.instanceId ?? "", b.version ?? "");
+}

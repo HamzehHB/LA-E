@@ -7,7 +7,7 @@ import type {
   FilterVerdict,
   ProposalAction,
 } from "./backend";
-import type { FolderPurpose } from "./transport";
+import type { FolderPurpose, RunEvent } from "./transport";
 
 /** @category ui-model — typed error categories */
 export type AppErrorKind =
@@ -89,12 +89,16 @@ export interface WorkflowStageView {
   group?: string;
 }
 
-/** @category ui-model — mock human-review state (presentation-only) */
+/** @category ui-model — mock + live human-review states (presentation-only) */
 export type HumanReviewState =
   | "awaiting_review"
   | "mock_approved"
   | "mock_rejected"
-  | "mock_edited_stale";
+  | "mock_edited_stale"
+  | "live_awaiting_review"
+  | "live_approved"
+  | "live_rejected"
+  | "live_consent_required";
 
 /** @category ui-model — current processing/run view */
 export interface CurrentRunView {
@@ -102,6 +106,9 @@ export interface CurrentRunView {
   current_stage: string;
   status: string;
   proposal_action: ProposalAction;
+  /** Obsidian knowledge class (Observation/Core/Concept) — distinct from the
+   *  proposal action. Source of the UI CLASS field. */
+  classification_type: string;
   proposal_title: string;
   proposal_body: string;
   confidence_level: ConfidenceLevel;
@@ -120,6 +127,11 @@ export interface JournalRow {
   timestamp: string;
   statusKey: string;
   stagingNoteKey: string | null;
+  /** Stable backend identity for cross-journal correlation (§4). Optional:
+   *  fixtures omit these; live records populate them from persisted data. */
+  runId?: string;
+  proposalHash?: string;
+  artifactReference?: string;
 }
 
 /** @category ui-model */
@@ -134,11 +146,15 @@ export interface AppState {
   llmMode: LlmMode;
   resources: Record<FolderPurpose, ConfigResourceState>;
   run: CurrentRunView;
+  /** @category ui-model — live run-scoped SSE events for the active run (bounded). */
+  runEvents: RunEvent[];
   recentAudits: JournalRow[];
   recentStaging: JournalRow[];
   composerOpen: boolean;
   composerText: string;
   journalIndex: number;
+  /** @category ui-model — first-launch Welcome dismissed (persisted). */
+  welcomed: boolean;
   /** @category ui-model — §§3–4, 7–11 vector-index lifecycle (fixtures only) */
   vectorIndex: VectorIndexState;
   /** @category ui-model — §10 vector engine install state (fixtures only) */

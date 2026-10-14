@@ -35,6 +35,13 @@ WRITER_MODULES = frozenset({EXECUTOR, AUDIT_WRITER})
 
 AUDIT_ALLOWED_MUTATIONS = frozenset({"write", "makedirs"})
 
+# The loopback launcher writes HTTP responses to the request socket via
+# ``self.wfile.write(...)``. That is a socket write, never a filesystem
+# mutation: file handles are still impossible to obtain because every
+# other ``open`` must be read-mode (tested separately), and ``write_text``
+# stays banned everywhere outside the two writer modules.
+SOCKET_WRITE_BASES = frozenset({"wfile"})
+
 MUTATION_ATTRS = frozenset({
     "write_text", "write_bytes", "write",
     "unlink", "rename", "mkdir", "rmdir",
@@ -60,6 +67,16 @@ FORBIDDEN_IMPORT_ROOTS = frozenset({
 # and the full list stays banned everywhere else in application code.
 LLM_PACKAGE_PREFIX = "living_authenticity/llm/"
 NETWORK_IMPORT_ALLOWANCE = frozenset({"urllib", "http"})
+
+# Narrow, explicit exemption: the loopback launcher package
+# (``living_authenticity/adapter/``) serves the built frontend and the
+# typed transport API over the standard library ``http.server`` on
+# 127.0.0.1 only. Only ``http`` is permitted, only inside this one
+# package; every other banned root (including ``socket`` and ``urllib``)
+# stays banned there, and the exemption does not extend to lookalike
+# paths such as ``living_authenticity/adapter_extra/``.
+ADAPTER_PACKAGE_PREFIX = "living_authenticity/adapter/"
+ADAPTER_NETWORK_IMPORT_ALLOWANCE = frozenset({"http"})
 
 FORBIDDEN_BUILTIN_CALLS = frozenset({
     "eval", "exec", "__import__", "compile",
@@ -87,6 +104,11 @@ def _iter_calls(tree):
             yield func.attr, base, node
 
 
+def _is_socket_write(attr, base) -> bool:
+    """True for HTTP response-socket writes (never a filesystem write)."""
+    return attr in ("write", "write_bytes") and base in SOCKET_WRITE_BASES
+
+
 def _extract_mode(node: ast.Call, is_method: bool) -> str:
     """Extract mode argument accurately whether positional, keyword, or default."""
     for kw in node.keywords:
@@ -107,8 +129,10 @@ def test_controlled_executor_is_the_sole_mutation_call_site():
     audit_seen = False
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for attr, _base, _node in _iter_calls(tree):
+        for attr, base, _node in _iter_calls(tree):
             if attr not in MUTATION_ATTRS:
+                continue
+            if _is_socket_write(attr, base):
                 continue
             relative = _relative(path)
             if relative == EXECUTOR:
@@ -130,8 +154,8 @@ def test_only_two_writer_modules_exist():
     found = set()
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for attr, _base, _node in _iter_calls(tree):
-            if attr in MUTATION_ATTRS:
+        for attr, base, _node in _iter_calls(tree):
+            if attr in MUTATION_ATTRS and not _is_socket_write(attr, base):
                 found.add(_relative(path))
     assert found == set(WRITER_MODULES), f"writer modules changed: {sorted(found)}"
 
@@ -242,9 +266,13 @@ def test_all_open_calls_in_src_are_read_mode():
 
 
 def _is_allowed_network_import(relative: str, root: str) -> bool:
-    """True only for urllib/http inside the LLM provider package."""
-    return (relative.startswith(LLM_PACKAGE_PREFIX)
-            and root in NETWORK_IMPORT_ALLOWANCE)
+    """True only for narrow allowances in llm/ (urllib+http) and
+    adapter/ (http only)."""
+    if relative.startswith(LLM_PACKAGE_PREFIX):
+        return root in NETWORK_IMPORT_ALLOWANCE
+    if relative.startswith(ADAPTER_PACKAGE_PREFIX):
+        return root in ADAPTER_NETWORK_IMPORT_ALLOWANCE
+    return False
 
 
 def _import_offenders(tree, relative: str) -> list:
@@ -304,6 +332,66 @@ def test_network_import_allowance_is_limited_to_the_llm_package():
     # The allowance must not be reachable by a name-prefix trick.
     lookalike = "living_authenticity/llm_extra/module.py"
     assert _import_offenders(network_only, lookalike) != []
+
+
+def test_network_import_allowance_is_limited_to_launcher_and_llm_packages():
+    """The launcher allowance covers exactly http, exactly in adapter/.
+
+    Negative controls prove the scan has discriminating power: unrelated
+    source paths, lookalike sibling paths, and every other banned root
+    (socket, subprocess, urllib, requests...) stay rejected inside the
+    launcher package itself.
+    """
+    adapter_relative = ADAPTER_PACKAGE_PREFIX + "server.py"
+    other_relative = "living_authenticity/knowledge/output/module.py"
+    lookalike = "living_authenticity/adapter_extra/module.py"
+
+    http_only = ast.parse("from http.server import HTTPServer\n")
+    assert _import_offenders(http_only, adapter_relative) == []
+    assert _import_offenders(http_only, other_relative) == [
+        other_relative + ":http",
+    ]
+    assert _import_offenders(http_only, lookalike) != []
+
+    still_banned_in_adapter = ast.parse(
+        "import socket\nimport subprocess\nimport urllib.request\n"
+        "import requests\nimport pickle\n"
+    )
+    found = _import_offenders(still_banned_in_adapter, adapter_relative)
+    for banned in ("socket", "subprocess", "urllib", "requests", "pickle"):
+        assert adapter_relative + ":" + banned in found, banned
+
+    # The pre-existing llm allowance must be unchanged by this extension.
+    llm_relative = LLM_PACKAGE_PREFIX + "provider.py"
+    llm_http = ast.parse("import urllib.request\nfrom http.client import X\n")
+    assert _import_offenders(llm_http, llm_relative) == []
+
+
+def test_launcher_package_performs_no_filesystem_mutations():
+    """The launcher is a bridge: it may never write directly.
+
+    Staging artifacts are produced only by ControlledExecutor and audit
+    records only by AuditWriter; the launcher must contain no filesystem
+    mutation capability at all.
+    """
+    adapter_dir = SRC / "living_authenticity" / "adapter"
+    offenders = []
+    for path in sorted(adapter_dir.rglob("*.py")):
+        relative = _relative(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for attr, base, _node in _iter_calls(tree):
+            if attr in MUTATION_ATTRS and not _is_socket_write(attr, base):
+                offenders.append(relative + ":" + attr)
+    assert offenders == [], (
+        f"filesystem mutation capability in launcher: {offenders}")
+
+
+def test_launcher_binds_loopback_only():
+    """The HTTP transport binds 127.0.0.1 and never 0.0.0.0."""
+    text = (SRC / "living_authenticity/adapter/server.py").read_text(
+        encoding="utf-8")
+    assert '"127.0.0.1"' in text
+    assert "0.0.0.0" not in text
 
 
 def test_no_dynamic_code_execution_calls():

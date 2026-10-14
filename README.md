@@ -108,6 +108,17 @@ Implemented foundations include:
   or does not exist ([docs/artifact-lifecycle-matrix.md](docs/artifact-lifecycle-matrix.md))
 - A synthetic, public-safe example of that workflow under
   [examples/bounded_local_integration/](examples/bounded_local_integration/README.md)
+- A local loopback launcher (`living_authenticity/adapter/`): binds
+  127.0.0.1 only, per-launch in-memory token, typed bounded errors, no
+  direct filesystem writes, and the only application subpath permitted
+  to import stdlib network modules. It serves the React/TypeScript
+  presentation layer (`frontend/`) together with a JSON/SSE transport
+  API (health, run, explicit approval, per-call cloud consent, journals,
+  event stream). The browser-based launcher is the interim delivery
+  method; a dedicated application window is a separate future packaging
+  decision. React components and all presentation logic stay in
+  `frontend/`; the Python side is launcher, transport, request
+  validation, and integration with existing backend contracts only
 
 Advanced components such as knowledge evolution and agent systems belong to later development phases and are not represented as completed features.
 
@@ -144,6 +155,24 @@ python -m pytest
 ```
 
 Tests use synthetic fixtures and temporary configurations only.
+
+Three verification states are deliberately distinct and must not be
+conflated:
+
+1. **Synthetic test coverage** — the committed suite (`python -m pytest`)
+   proves contracts, governance boundaries, and security invariants using
+   synthetic fixtures and temporary directories only. It reads no
+   production data.
+2. **Real-environment readiness** — a separate, bounded, read-only
+   verification against the actual local deployment: configuration
+   resolution, path-isolation guards, local model loading, and
+   read-only vector-store probes. Machine-specific results stay local;
+   they are never committed.
+3. **An authorized real-data run** — a separately bounded operation on
+   explicitly selected real data, performed only with explicit human
+   authorization and every existing safety control (explicit approval,
+   revalidation, controlled execution, audit). Passing tests or
+   readiness checks never implies this state.
 
 Direction
 

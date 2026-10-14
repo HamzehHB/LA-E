@@ -42,17 +42,30 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
              entries, audits, authorized, synthesis, details,
              vault_context=None, operating_mode="", run_id="",
              audit_writer=None, audit_receipts=None,
-             audit_guard_error="", llm_config=None):
+             audit_guard_error="", llm_config=None, event_sink=None,
+             should_cancel=None):
     """Ingest (unless already ingested), analyse, then govern every unit."""
+    def _emit(kind, stage, message):
+        if event_sink is not None:
+            try:
+                event_sink({"kind": kind, "run_id": run_id, "stage": stage,
+                            "message": message, "timestamp": ""})
+            except Exception:
+                pass
+
     if ingestion is None:
+        _emit("stage_started", "ingestion", str(child))
         try:
             ingestion = pipe.run_file(
                 str(child), corpus=corpus_units, core_units=cores)
         except Exception:
             return False
+        _emit("stage_completed", "ingestion", str(child))
     else:
+        _emit("stage_started", "ingestion", "text input")
         ingestion = pipe.run_ingestion(
             ingestion, corpus=corpus_units, core_units=cores)
+        _emit("stage_completed", "ingestion", "text input")
     for unit_result in ingestion.units:
         _handle_unit(
             child, unit_result,
@@ -64,7 +77,16 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
              audit_writer=audit_writer,
              audit_receipts=audit_receipts,
              audit_guard_error=audit_guard_error, llm_config=llm_config,
+             event_sink=event_sink, should_cancel=should_cancel,
         )
+        # Cooperative cancellation boundary between units: once a run is
+        # cancelled, no further unit is analysed or governed. The current
+        # unit has already passed through its own pre-execution boundary,
+        # so a cancelled run records its 'cancelled' outcome truthfully.
+        if should_cancel is not None and should_cancel():
+            _emit("stopped", "cancellation",
+                  "run cancelled before next unit")
+            break
     return True
 
 
@@ -82,7 +104,9 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                             authorized_audit_root=None,
                             authorized_audit_passed="",
                             authorized_audit_failed="",
-                            run_id: str = "") -> IntegrationRunReport:
+                            run_id: str = "",
+                             should_cancel=None,
+                            event_sink=None) -> IntegrationRunReport:
     """Run one bounded local-integration pass; return an in-memory report.
 
     Three explicit input shapes, one governance path:
@@ -154,6 +178,31 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
     if not active_run_id:
         import uuid
         active_run_id = "run-" + uuid.uuid4().hex[:12]
+    # Optional observational hook (default off). Sink errors are swallowed;
+    # no pipeline result, decision, or authorization ever depends on it.
+    if event_sink is not None and not callable(event_sink):
+        raise TypeError("event_sink must be callable or None")
+    from datetime import datetime, timezone
+
+    def emit(payload) -> None:
+        """Stamp one observational event; never raises; no-op when off."""
+        if event_sink is None:
+            return
+        try:
+            if not isinstance(payload, dict):
+                return
+            event_sink({
+                "kind": str(payload.get("kind", "")),
+                "run_id": str(payload.get("run_id") or active_run_id),
+                "stage": str(payload.get("stage", "")),
+                "message": str(payload.get("message", "")),
+                "timestamp": str(payload.get("timestamp") or
+                                 datetime.now(timezone.utc).isoformat()),
+            })
+        except Exception:
+            pass
+    emit({"kind": "run_started", "stage": "",
+          "message": "bounded integration run started"})
     mode_value = operating_mode if isinstance(operating_mode, str) else ""
     audit_receipts: list = []
     pipe = pipeline if pipeline is not None else EvidenceFirstPipeline()
@@ -233,7 +282,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                     audit_writer=audit_writer,
                     audit_receipts=audit_receipts,
                     audit_guard_error=audit_guard_error,
-                    llm_config=llm_config):
+                    llm_config=llm_config, event_sink=emit,
+                    should_cancel=should_cancel):
             processed = 1
         _persist_audits(audit_writer, audits, audit_receipts)
         return IntegrationRunReport(
@@ -279,7 +329,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                     audit_writer=audit_writer,
                     audit_receipts=audit_receipts,
                     audit_guard_error=audit_guard_error,
-                    llm_config=llm_config):
+                    llm_config=llm_config, event_sink=emit,
+                    should_cancel=should_cancel):
             processed += 1
         else:
             skipped += 1

@@ -78,7 +78,64 @@ def test_lifecycle_helper_records_same_flow(tmp_path):
     assert record.outcome == "executed"
 
 
-def test_provenance_preserved_without_execution():
+def test_audit_writer_routes_operational_errors_to_errors_partition(tmp_path):
+    """Operational failures land in errors/; executed CREATE in passed/.
+
+    Proves the three-way partition without touching any real destination:
+    everything uses a synthetic tmp_path root created by the writer.
+    """
+    import json
+
+    from src.living_authenticity.knowledge.governance.audit import (
+        ERRORS_SUBDIR,
+        AuditRecord,
+        AuditWriter,
+    )
+
+    writer = AuditWriter(str(tmp_path))
+    assert writer.errors_dir.endswith(ERRORS_SUBDIR)
+
+    executed = AuditRecord(
+        record_id="rec-exec", run_id="run-1", proposal_hash="h1",
+        execution_executed=True, terminal_outcome="executed",
+    )
+    rejected = AuditRecord(
+        record_id="rec-rej", run_id="run-1", proposal_hash="h2",
+        execution_executed=False, terminal_outcome="rejected",
+    )
+    infra = AuditRecord(
+        record_id="rec-err", run_id="run-1", proposal_hash="h3",
+        execution_executed=False, terminal_outcome="llm_safe_stop",
+    )
+    cancelled = AuditRecord(
+        record_id="rec-can", run_id="run-1", proposal_hash="",
+        execution_executed=False, terminal_outcome="cancelled",
+    )
+
+    receipts = [writer.append(r) for r in (executed, rejected, infra, cancelled)]
+    assert [r["storage_category"] for r in receipts] == [
+        "passed", "failed", "errors", "errors"]
+
+    def _read(subdir):
+        path = tmp_path / subdir / "audit.jsonl"
+        return [json.loads(line) for line in
+                path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    assert [r["record_id"] for r in _read("passed")] == ["rec-exec"]
+    assert [r["record_id"] for r in _read("failed")] == ["rec-rej"]
+    assert {r["record_id"] for r in _read("errors")} == {"rec-err", "rec-can"}
+
+
+def test_audit_writer_rejects_colliding_partitions(tmp_path):
+    """passed/failed/errors must resolve to three distinct directories."""
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    with pytest.raises(ValueError):
+        AuditWriter(str(tmp_path),
+                    passed_dir=str(tmp_path / "x"),
+                    failed_dir=str(tmp_path / "x"),
+                    errors_dir=str(tmp_path / "x"))
+
     request, outcome, prop, conf, _n, revalidation = _chain()
     record = build_audit_record(request, outcome, revalidation, None, prop)
     assert record.provenance == tuple(prop.provenance)
