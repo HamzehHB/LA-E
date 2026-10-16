@@ -186,16 +186,57 @@ class Launcher:
         # to configuration files). Set only by pick_folder() after the
         # existing backend validation accepts the selected path; consumed
         # by _execute_run()/journals() with revalidation on every use.
-        # Keys: "staging", "audit". Absent key = not selected this session.
         self._session_destinations: dict = {}
         self._lock = threading.RLock()
         self._active_run_id = ""
+        self._active_source_mode = "examples"
+        self._active_retrieval_mode = "lexical"
+        self._app_language = "en"
+        self._staging_language = "en"
+        self._audit_language = "en"
+        self._paused_run = None
         self._pending_approval = None
         self._pending_consent = None
         self._reports = {}
         from .events import RunEventLog
 
         self.events = RunEventLog()
+        self._bootstrap_from_paths()
+
+    def _bootstrap_from_paths(self) -> None:
+        """Initialize session destinations from valid configured paths if present on disk."""
+        try:
+            paths = self.paths()
+        except Exception:
+            return
+        if not isinstance(paths, dict):
+            return
+        vault = paths.get("obsidian", {}).get("vault", "")
+        if isinstance(vault, str) and vault.strip():
+            candidate = Path(vault.strip())
+            if candidate.is_dir() and not candidate.is_symlink():
+                self._session_destinations["vault"] = str(candidate)
+                self._active_source_mode = "personal_vault"
+        staging = paths.get("staging", {}).get("root", "")
+        if isinstance(staging, str) and staging.strip():
+            candidate = Path(staging.strip())
+            if candidate.is_dir() and not candidate.is_symlink():
+                self._session_destinations["staging"] = str(candidate)
+        audit = paths.get("audit", {}).get("root", "")
+        if isinstance(audit, str) and audit.strip():
+            candidate = Path(audit.strip())
+            if candidate.is_dir() and not candidate.is_symlink():
+                self._session_destinations["audit"] = str(candidate)
+        vector_db = paths.get("vector_db", {}).get("lancedb", "")
+        if isinstance(vector_db, str) and vector_db.strip():
+            candidate = Path(vector_db.strip())
+            if candidate.is_dir() and not candidate.is_symlink():
+                self._session_destinations["vector_db"] = str(candidate)
+        bge_m3 = paths.get("models", {}).get("bge_m3", "")
+        if isinstance(bge_m3, str) and bge_m3.strip():
+            candidate = Path(bge_m3.strip())
+            if candidate.exists() and not candidate.is_symlink():
+                self._session_destinations["embedding_model"] = str(candidate)
 
     # ---- token / auth -------------------------------------------------
 
@@ -255,6 +296,8 @@ class Launcher:
             "title": getattr(request, "title", ""),
             "body": body,
             "confidence_level": getattr(request, "confidence_level", ""),
+            "confidence_score": getattr(request, "confidence_score", 0.0),
+            "confidence_score_band": getattr(confidence, "score_band", ""),
             # Obsidian knowledge class (Observation/Core/Concept), distinct
             # from the proposal action. Already computed by classification;
             # exposed read-only for the UI's CLASS field. Not authorization.
@@ -485,8 +528,17 @@ class Launcher:
             with self._lock:
                 self._reports[run_id] = {"run_id": run_id,
                                          "error": type(exc).__name__}
-            self._sink({"kind": "run_rejected", "stage": "",
-                        "message": "run failed"})
+                self._paused_run = {
+                    "run_id": run_id,
+                    "input_text": input_text,
+                    "source_mode": mode_value,
+                    "retrieval_mode": retrieval_mode,
+                    "error": type(exc).__name__,
+                    "error_message": str(exc),
+                    "timestamp": _utcnow(),
+                }
+            self._sink({"kind": "run_rejected", "stage": "paused",
+                        "message": "run paused on error: " + (str(exc) or type(exc).__name__)})
         finally:
             with self._lock:
                 self._active_run_id = ""
@@ -714,6 +766,10 @@ class Launcher:
 
         Read-only: scans nothing the user did not configure; correlation
         uses record/artifact identifiers, never filenames or positions.
+        1:1 paired slots:
+        - Excludes 'errors/'
+        - Computes digests and newspaper summary
+        - Each audit slot is paired with a staging slot (or 'Unavailable' if missing/rejected)
         """
         from src.living_authenticity.knowledge.integration.guard import (
             resolve_authorized_audit_root,
@@ -730,62 +786,77 @@ class Launcher:
                         if session_staging else
                         resolve_authorized_staging_root(paths))
         audit_items = []
-        staged_files = {}
         if audit_root:
             for category in ("passed", "failed"):
                 log = Path(audit_root) / category / "audit.jsonl"
                 audit_items.extend(self._read_audit_log(log, category))
-        if staging_root and Path(staging_root).is_dir():
-            for child in Path(staging_root).iterdir():
-                if child.is_file() and child.suffix == ".md":
-                    staged_files[child.name] = str(child)
-        for item in audit_items:
+
+        audit_items.sort(key=lambda i: i.get("timestamp", ""), reverse=True)
+        try:
+            limit_val = max(1, min(int(limit), MAX_JOURNAL_ENTRIES))
+        except (TypeError, ValueError):
+            limit_val = MAX_JOURNAL_ENTRIES
+        selected_audits = audit_items[:limit_val]
+
+        paired_audits = []
+        paired_staging = []
+
+        for item in selected_audits:
             reference = item.get("artifact_reference") or ""
-            path = item.get("artifact_path") or (
+            artifact_p = item.get("artifact_path") or (
                 str(Path(staging_root) / reference)
                 if reference and staging_root else "")
-            item["staging_available"] = bool(
-                path and Path(path).is_file())
-        referenced = set()
-        for item in audit_items:
-            reference = item.get("artifact_reference") or ""
-            if reference:
-                referenced.add(reference)
-        staging_items = []
-        for item in audit_items:
-            if not item.get("staging_available"):
-                continue
-            staging_items.append({
-                "record_id": item["record_id"],
-                "run_id": item["run_id"],
-                "proposal_hash": item["proposal_hash"],
-                "timestamp": item["timestamp"],
-                "storage_category": item["storage_category"],
-                "outcome": "staged",
-                "artifact_reference": item["artifact_reference"],
-                "staging_available": True,
+
+            is_staged = bool(artifact_p and Path(artifact_p).is_file())
+            staging_excerpt = ""
+            staging_title = reference or "Unavailable"
+
+            if is_staged:
+                try:
+                    with Path(artifact_p).open("r", encoding="utf-8") as f:
+                        lines = [f.readline() for _ in range(10)]
+                        staging_excerpt = "".join(lines).strip()[:300]
+                except OSError:
+                    staging_excerpt = ""
+            else:
+                staging_excerpt = "No staged artifact produced (terminal outcome: %s)." % (
+                    item.get("outcome") or item.get("storage_category") or "none"
+                )
+
+            action = item.get("proposal_action") or "KNOWLEDGE_PROPOSAL"
+            outcome = item.get("outcome") or item.get("storage_category") or "evaluated"
+            summary = f"Proposal action {action} reached terminal outcome: {outcome}."
+            raw_digest = item.get("record_digest") or hashlib.sha256(
+                json.dumps(item, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+
+            audit_slot = dict(item)
+            audit_slot.update({
+                "staging_available": is_staged,
+                "digest": raw_digest[:16],
+                "title": f"Audit: {action}",
+                "summary": summary,
             })
-        for name, path in sorted(staged_files.items()):
-            if name in referenced:
-                continue
-            staging_items.append({
-                "record_id": name,
-                "run_id": "",
-                "proposal_hash": "",
-                "timestamp": _utcnow(),
-                "storage_category": "",
-                "outcome": "audit_missing",
-                "artifact_reference": name,
-                "staging_available": True,
-            })
-        audit_items.sort(key=lambda i: i.get("timestamp", ""), reverse=True)
-        staging_items.sort(key=lambda i: i.get("timestamp", ""), reverse=True)
-        try:
-            limit = max(1, min(int(limit), MAX_JOURNAL_ENTRIES))
-        except (TypeError, ValueError):
-            limit = MAX_JOURNAL_ENTRIES
-        return {"audits": audit_items[:limit],
-                "staging": staging_items[:limit]}
+
+            staging_slot = {
+                "record_id": item.get("record_id", ""),
+                "run_id": item.get("run_id", ""),
+                "proposal_hash": item.get("proposal_hash", ""),
+                "timestamp": item.get("timestamp", ""),
+                "storage_category": item.get("storage_category", ""),
+                "outcome": "staged" if is_staged else "unavailable",
+                "artifact_reference": reference if is_staged else "",
+                "artifact_path": artifact_p if is_staged else "",
+                "staging_available": is_staged,
+                "title": staging_title,
+                "excerpt": staging_excerpt,
+            }
+
+            paired_audits.append(audit_slot)
+            paired_staging.append(staging_slot)
+
+        return {"audits": paired_audits,
+                "staging": paired_staging}
 
     @staticmethod
     def _read_audit_log(log_path, category):
@@ -815,6 +886,8 @@ class Launcher:
                             record.get("artifact_reference", "")),
                         "artifact_path": str(record.get("artifact_path", "")),
                         "staging_available": False,
+                        "proposal_action": str(record.get("proposal_action", "")),
+                        "record_digest": str(record.get("record_digest", "")),
                     })
         except OSError:
             return items
@@ -825,17 +898,8 @@ class Launcher:
     def pick_folder(self, purpose):
         """Native dialog + backend validation; returns a typed result.
 
-        A validated selection is additionally remembered as this launch's
-        session destination (memory only), so later runs and journal reads
-        use the user's own validated choice instead of requiring a
-        machine-specific config file. ``staging``/``audit`` drive run
-        destinations; ``vector_db``/``embedding_model`` drive semantic-
-        retrieval availability checks. Every stored value was validated by
-        ``validate_purpose``; consumers revalidate before each use.
-
-        The stored value is the validated absolute path (not the safe
-        display label); the frontend still only ever receives the
-        typed ``(status, display, reason)`` result.
+        A validated selection is remembered as this launch's session
+        destination, and persisted to Config/paths.local.yaml.
         """
         from .picker import (
             STATUS_CONFIGURED,
@@ -852,8 +916,43 @@ class Launcher:
         result = validate_purpose(canonical, path, self.paths())
         if (result[0] == STATUS_CONFIGURED
                 and isinstance(path, str) and path.strip()):
+            clean_path = path.strip()
             with self._lock:
-                self._session_destinations[canonical] = path.strip()
+                self._session_destinations[canonical] = clean_path
+                if canonical == "vault":
+                    self._active_source_mode = "personal_vault"
+            try:
+                from Config.settings import save_paths_local
+                mapping = {}
+                if canonical == "vault":
+                    mapping = {"obsidian": {"vault": clean_path}}
+                elif canonical == "staging":
+                    mapping = {"staging": {"root": clean_path}}
+                elif canonical == "audit":
+                    mapping = {
+                        "audit": {
+                            "root": clean_path,
+                            "passed": str(Path(clean_path) / "passed"),
+                            "failed": str(Path(clean_path) / "failed"),
+                        }
+                    }
+                    try:
+                        from src.living_authenticity.knowledge.governance.audit.persistence import (
+                            AuditWriter,
+                        )
+                        writer = AuditWriter(clean_path)
+                        writer.ensure_directories()
+                    except Exception:
+                        pass
+                elif canonical == "vector_db":
+                    mapping = {"vector_db": {"lancedb": clean_path}}
+                elif canonical == "embedding_model":
+                    mapping = {"models": {"bge_m3": clean_path}}
+                if mapping:
+                    save_paths_local(mapping)
+                    self._paths = None
+            except Exception:
+                pass
         return result
 
     def session_destination(self, purpose):
@@ -861,6 +960,307 @@ class Launcher:
         with self._lock:
             value = self._session_destinations.get(purpose, "")
         return value.strip() if isinstance(value, str) else ""
+
+    # ---- comprehensive state & config ------------------------------------
+
+    def state(self) -> dict:
+        """Return the comprehensive active state of all folders, modes, and LLM."""
+        from .picker import STATUS_CONFIGURED, STATUS_UNAVAILABLE, display_for
+
+        folders = {}
+        for purpose in ("vault", "staging", "audit", "vector_db", "embedding_model", "local_llm"):
+            configured_path = self.session_destination(purpose)
+            if configured_path and Path(configured_path).exists():
+                folders[purpose] = {
+                    "status": STATUS_CONFIGURED,
+                    "display": display_for(configured_path),
+                    "configured": True,
+                }
+            else:
+                folders[purpose] = {
+                    "status": STATUS_UNAVAILABLE,
+                    "display": "",
+                    "configured": False,
+                }
+
+        llm_cfg = self.llm_config()
+        provider = llm_cfg.get("provider", "local") if isinstance(llm_cfg, dict) else "local"
+        model_name = ""
+        endpoint = ""
+        if isinstance(llm_cfg, dict):
+            provider_cfg = llm_cfg.get(provider, {})
+            if isinstance(provider_cfg, dict):
+                model_name = provider_cfg.get("model", "")
+                endpoint = provider_cfg.get("endpoint", "")
+
+        return {
+            "app": APP_NAME,
+            "version": VERSION,
+            "instance_id": self.instance_id,
+            "modes": {
+                "source_mode": self._active_source_mode,
+                "retrieval_mode": self._active_retrieval_mode,
+                "app_language": self._app_language,
+                "staging_language": self._staging_language,
+                "audit_language": self._audit_language,
+            },
+            "folders": folders,
+            "llm": {
+                "provider": provider,
+                "model": model_name,
+                "endpoint": endpoint,
+                "local_available": bool(self.session_destination("local_llm") or provider == "local"),
+                "cloud_available": bool(provider == "cloud" and endpoint),
+            },
+            "active_run_id": self._active_run_id,
+            "paused_run": self._paused_run,
+        }
+
+    def update_config(self, updates: dict) -> dict:
+        """Update and persist application configuration."""
+        if not isinstance(updates, dict):
+            raise AdapterError("validation_error", "updates must be a JSON object")
+
+        with self._lock:
+            if "source_mode" in updates and updates["source_mode"] in SOURCE_MODES:
+                self._active_source_mode = updates["source_mode"]
+            if "retrieval_mode" in updates and updates["retrieval_mode"] in ("lexical", "semantic"):
+                self._active_retrieval_mode = updates["retrieval_mode"]
+            if "app_language" in updates and updates["app_language"] in LANGUAGE_MODES:
+                self._app_language = updates["app_language"]
+            if "staging_language" in updates and updates["staging_language"] in LANGUAGE_MODES:
+                self._staging_language = updates["staging_language"]
+            if "audit_language" in updates and updates["audit_language"] in LANGUAGE_MODES:
+                self._audit_language = updates["audit_language"]
+
+        loc_updates = {}
+        if "app_language" in updates:
+            loc_updates["interface"] = updates["app_language"]
+        if "staging_language" in updates:
+            loc_updates.setdefault("content", {})["staging"] = updates["staging_language"]
+        if "audit_language" in updates:
+            loc_updates.setdefault("content", {})["audit"] = updates["audit_language"]
+        if loc_updates:
+            try:
+                from Config.settings import save_localization_local
+                save_localization_local(loc_updates)
+            except Exception:
+                pass
+
+        if "llm" in updates and isinstance(updates["llm"], dict):
+            try:
+                from Config.settings import save_llm_local
+                save_llm_local(updates["llm"])
+                self._llm_config = None
+            except Exception:
+                pass
+
+        return {"success": True, "modes": {
+            "source_mode": self._active_source_mode,
+            "retrieval_mode": self._active_retrieval_mode,
+            "app_language": self._app_language,
+            "staging_language": self._staging_language,
+            "audit_language": self._audit_language,
+        }}
+
+    def translate_text(self, text: str, target_lang: str = "en", source_lang: str = "") -> dict:
+        """Translate text between en and fa using LLM or deterministic fallback."""
+        if not isinstance(text, str) or not text.strip():
+            return {"translated_text": "", "target_lang": target_lang}
+        if target_lang not in LANGUAGE_MODES:
+            target_lang = "en" if self._app_language == "fa" else "fa"
+
+        translated = ""
+        try:
+            llm_cfg = self.llm_config()
+            from src.living_authenticity.llm.registry import build_provider
+            provider = build_provider(llm_cfg)
+            prompt = (
+                f"You are a professional translator. Translate the following text into "
+                f"{'Persian (Farsi)' if target_lang == 'fa' else 'English'}.\n"
+                f"Provide ONLY the translation, without explanation or introductory text:\n\n"
+                f"{text}"
+            )
+            resp_text = provider.complete(prompt)
+            if resp_text:
+                translated = resp_text.strip()
+        except Exception:
+            translated = ""
+
+        if not translated:
+            translations_en_to_fa = {
+                "Summary Of Recent Audits": "خلاصه بررسی‌های اخیر",
+                "Summary Of Recent Staging": "خلاصه یادداشت‌های اخیر آماده‌سازی",
+                "Processing Result": "نتیجه پردازش",
+                "Workflow": "گردش کار",
+                "Current Audit": "بررسی جاری",
+                "Database": "پایگاه داده",
+                "AI": "هوش مصنوعی",
+                "Knowledge Language": "زبان دانش",
+                "Test Mode": "حالت آزمایشی",
+                "Vault Mode": "حالت یادداشت‌دان",
+                "Approved": "تایید شده",
+                "Rejected": "رد شده",
+                "Staged": "آماده‌سازی شده",
+                "Unavailable": "در دسترس نیست",
+                "Evidence Verification": "بررسی شواهد",
+                "Synthesizing Note": "تولید یادداشت",
+                "Waiting for Human Review": "در انتظار بازبینی انسانی",
+                "Proposal Type": "نوع پیشنهاد",
+                "Confidence": "میزان اطمینان",
+                "Class": "کلاس",
+            }
+            translations_fa_to_en = {v: k for k, v in translations_en_to_fa.items()}
+
+            if target_lang == "fa":
+                translated = translations_en_to_fa.get(text.strip(), f"«{text.strip()}» (ترجمه‌شده به فارسی)")
+            else:
+                translated = translations_fa_to_en.get(text.strip(), f"{text.strip()} (translated to English)")
+
+        return {"translated_text": translated, "target_lang": target_lang}
+
+    def accept_proposal(self, run_id: str = "") -> dict:
+        """Acknowledge and accept a non-actionable proposal (NEEDS_REVIEW / DO_NOT_IMPORT)."""
+        with self._lock:
+            pending = self._pending_approval
+            if pending is not None:
+                action = pending.payload.get("proposal_action", "")
+                if action in ("NEEDS_REVIEW", "DO_NOT_IMPORT"):
+                    pending.resolve("reject")
+                    self._pending_approval = None
+                    self._sink({
+                        "kind": "status",
+                        "stage": "human_review",
+                        "message": f"proposal {action} acknowledged by human",
+                    })
+                    return {"accepted": True, "action": action, "run_id": run_id}
+            self._sink({
+                "kind": "status",
+                "stage": "human_review",
+                "message": "review findings acknowledged",
+            })
+            return {"accepted": True, "action": "acknowledged", "run_id": run_id}
+
+    def fix_paused_run(
+        self,
+        run_id: str = "",
+        input_text: str | None = None,
+        source_mode: str | None = None,
+        retrieval_mode: str | None = None,
+    ) -> dict:
+        """Fix input or config for a paused/errored run and restart it."""
+        with self._lock:
+            paused = self._paused_run
+            if not paused or (run_id and paused.get("run_id") != run_id):
+                raise AdapterError("validation_error", "no paused run matching run_id")
+            text = input_text if input_text is not None else paused.get("input_text", "")
+            src_mode = source_mode if source_mode is not None else paused.get("source_mode", self._active_source_mode)
+            ret_mode = retrieval_mode if retrieval_mode is not None else paused.get("retrieval_mode", self._active_retrieval_mode)
+            self._paused_run = None
+
+        return self.start_run(
+            input_text=text,
+            source_mode=src_mode,
+            retrieval_mode=ret_mode,
+            app_language=self._app_language,
+            staging_language=self._staging_language,
+            audit_language=self._audit_language,
+        )
+
+    def stop_paused_run(self, run_id: str = "") -> dict:
+        """Stop and cleanly terminate a paused/errored run."""
+        with self._lock:
+            paused = self._paused_run
+            if paused and (not run_id or paused.get("run_id") == run_id):
+                self._paused_run = None
+                self._sink({
+                    "kind": "stopped",
+                    "stage": "",
+                    "message": "paused run stopped by user",
+                })
+                return {"stopped": True, "run_id": run_id or paused.get("run_id", "")}
+        return {"stopped": True, "run_id": run_id}
+
+    def reveal_folder(self, purpose: str) -> dict:
+        """List files in the synced directory for the given purpose without leaking secrets."""
+        from .picker import display_for, normalize_purpose
+        canonical = normalize_purpose(purpose)
+        folder = self.session_destination(canonical)
+        if not folder or not Path(folder).is_dir():
+            return {"purpose": canonical, "display": "", "items": []}
+
+        items = []
+        try:
+            for child in Path(folder).iterdir():
+                if child.name.startswith("."):
+                    continue
+                try:
+                    stat = child.stat()
+                    items.append({
+                        "name": child.name,
+                        "is_dir": child.is_dir(),
+                        "size": stat.st_size if child.is_file() else 0,
+                        "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                    })
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
+        items.sort(key=lambda x: x["name"])
+        return {
+            "purpose": canonical,
+            "display": display_for(folder),
+            "items": items[:100],
+        }
+
+    def index_vault(self) -> dict:
+        """Run initial vector index on configured Vault notes into isolated vector DB."""
+        from src.living_authenticity.knowledge.integration.vector import (
+            build_vector_components,
+            check_vector_store_eligible,
+            resolve_production_vector_db,
+        )
+        from src.living_authenticity.knowledge.integration import index_units
+        from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+        from src.living_authenticity.knowledge.vault.context import read_vault_units
+
+        paths = self.paths()
+        vault_root = self.session_destination("vault")
+        if not vault_root:
+            raise AdapterError("validation_error", "No Vault folder is configured.")
+        vector_db = self.session_destination("vector_db")
+        if not vector_db:
+            raise AdapterError("validation_error", "No Database folder is configured for the vector index.")
+        model_path = self.session_destination("embedding_model")
+        if not model_path:
+            raise AdapterError("validation_error", "No embedding model (BGE-M3) configured.")
+
+        eligible, reason, _ = check_vector_store_eligible(
+            vector_db, resolve_production_vector_db(paths), vault_root=vault_root)
+        if not eligible:
+            raise AdapterError("validation_error", f"Vector database is not eligible: {reason}")
+
+        pipe = EvidenceFirstPipeline(stage_observer=self._sink)
+        vault_units, vault_files, vault_skipped = read_vault_units(vault_root, pipe)
+        if not vault_units:
+            return {
+                "indexed": False,
+                "reason": f"No valid vault notes discovered ({vault_skipped} skipped).",
+                "files_discovered": vault_files,
+                "notes_indexed": 0,
+                "files_skipped": vault_skipped,
+            }
+
+        service, store, _retriever = build_vector_components(vector_db, model_path=model_path)
+        figures = index_units(vault_units, service, store)
+        stored = figures[1] if len(figures) > 1 else len(vault_units)
+        return {
+            "indexed": True,
+            "files_discovered": vault_files,
+            "notes_indexed": stored,
+            "files_skipped": vault_skipped,
+        }
 
     # ---- health ---------------------------------------------------------
 

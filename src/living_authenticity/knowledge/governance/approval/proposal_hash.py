@@ -44,6 +44,7 @@ def proposal_payload(proposal, confidence=None, note=None) -> dict:
         if not isinstance(confidence, ConfidenceAssessment):
             raise TypeError("confidence must be a ConfidenceAssessment")
         payload["confidence_level"] = confidence.level
+        payload["confidence_score"] = confidence.score
     if note is not None:
         from src.living_authenticity.knowledge.output.outcome import GeneratedNote
 

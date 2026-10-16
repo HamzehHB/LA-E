@@ -30,17 +30,19 @@ Correlation: run_id / record_id chain.
 | 17 | Audit persistence failure | in-memory only | run aborts | attempted+failed | no | no | NO | audit unavailable: stopped |
 
 Rules: rejected/held paths persist under the `failed` storage category
-with `artifact: none`; ONLY the successful CREATE terminal record (an
-approved CREATE that actually created its staging artifact) persists
-under `passed` and links `artifact_path` / `artifact_sha256` /
+with `artifact: none`; unhandled runtime execution faults persist under `errors`;
+ONLY the successful CREATE terminal record (an approved CREATE that actually created its
+staging artifact) persists under `passed` and links `artifact_path` / `artifact_sha256` /
 `artifact_created_at` plus `proposal_hash` and `run_id`/`record_id`.
 Approved + revalidated pre-execution checkpoints are a safety
 prerequisite persisted BEFORE execution and always belong under
 `failed` — approval and revalidation are not successful execution. If
 execution fails, the terminal outcome is failed with no staging
 artifact claimed. Audit never holds credentials.
-`passed`/`failed` are storage partitions, not a flattened boolean
+`passed`/`failed`/`errors` are storage partitions, not a flattened boolean
 success field — richer lifecycle outcomes remain on the record.
 When `audit.root` is configured, pre-execution audit persistence must
 succeed before ControlledExecutor may create a staging artifact
 (row 17).
+The UI Recent Audits journal strictly filters out records from the `errors/`
+directory, displaying only `passed` and `failed` operational records.

@@ -110,15 +110,25 @@ Implemented foundations include:
   [examples/bounded_local_integration/](examples/bounded_local_integration/README.md)
 - A local loopback launcher (`living_authenticity/adapter/`): binds
   127.0.0.1 only, per-launch in-memory token, typed bounded errors, no
-  direct filesystem writes, and the only application subpath permitted
-  to import stdlib network modules. It serves the React/TypeScript
-  presentation layer (`frontend/`) together with a JSON/SSE transport
-  API (health, run, explicit approval, per-call cloud consent, journals,
-  event stream). The browser-based launcher is the interim delivery
-  method; a dedicated application window is a separate future packaging
-  decision. React components and all presentation logic stay in
-  `frontend/`; the Python side is launcher, transport, request
-  validation, and integration with existing backend contracts only
+  direct filesystem writes outside authorized surfaces, and the only
+  application subpath permitted to import stdlib network modules. It
+  serves the React/TypeScript presentation layer (`frontend/`) together
+  with a full-stack REST/SSE transport API:
+  - Interactive top navigation with `TEST` / `VAULT` mode switching,
+    native folder selection and validation (`staging`, `audit`, `vector_db`),
+    and model configuration dropdowns (`Database`, `AI`, `Knowledge Language`).
+  - First-time onboarding flows for initial vault vector indexing, LanceDB setup,
+    and audit directory provisioning (`passed/`, `failed/`, `errors/`).
+  - 17-node chronological workflow timeline tracking live pipeline stage states.
+  - Upper constellation band with 13 connected stars and DeepThink `Current Audit`
+    overlay streaming sanitized operational events during active runs.
+  - Processing Result view with numeric confidence score (`0.00`–`1.00`),
+    confidence band, proposal type, human review actions (`Approve`,
+    `Edit proposal`, `Reject`, `Accept`), pause/fix/stop error recovery,
+    and bilingual translation (English ↔ Persian).
+  - 1:1 paired newspaper journals for Audits (excluding `errors/`) and Staging
+    with 5s synchronized rotation, digests, and scrollable "View All" historical modal.
+  - Run the full environment via: `python -m src.living_authenticity.adapter`.
 
 Advanced components such as knowledge evolution and agent systems belong to later development phases and are not represented as completed features.
 

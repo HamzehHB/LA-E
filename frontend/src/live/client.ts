@@ -6,6 +6,7 @@
  * UI keeps fixture/demo behavior.
  */
 import type {
+  AcceptProposalResponse,
   ApproveRequest,
   ApproveResponse,
   CancelRequest,
@@ -18,9 +19,14 @@ import type {
   FolderPurpose,
   HealthResponse,
   JournalsResponse,
+  RevealFolderResponse,
   RunEvent,
   RunRequest,
   RunResponse,
+  StateResponse,
+  TranslateRequest,
+  TranslateResponse,
+  VaultIndexResponse,
 } from "../contracts/transport";
 
 export const TOKEN_HEADER = "X-LAE-Token";
@@ -47,12 +53,20 @@ export interface LiveClient {
   instanceId: string;
   version: string;
   health(): Promise<HealthResponse>;
+  state(): Promise<StateResponse>;
+  updateConfig(updates: Record<string, unknown>): Promise<{ success: boolean; modes: unknown }>;
   pickFolder(purpose: FolderPurpose): Promise<FolderPickResponse>;
+  revealFolder(purpose: FolderPurpose): Promise<RevealFolderResponse>;
+  indexVault(): Promise<VaultIndexResponse>;
   startRun(req: RunRequest): Promise<RunResponse>;
   approve(req: ApproveRequest): Promise<ApproveResponse>;
+  acceptProposal(run_id?: string): Promise<AcceptProposalResponse>;
   editProposal(req: EditProposalRequest): Promise<EditProposalResponse>;
   consent(req: ConsentRequest): Promise<ConsentResponse>;
   cancel(req: CancelRequest): Promise<CancelResponse>;
+  fixPausedRun(req: { run_id?: string; input_text?: string; source_mode?: string; retrieval_mode?: string }): Promise<RunResponse>;
+  stopPausedRun(run_id?: string): Promise<{ stopped: boolean; run_id: string }>;
+  translate(req: TranslateRequest): Promise<TranslateResponse>;
   journals(): Promise<JournalsResponse>;
   streamEvents(
     onEvent: (event: RunEvent) => void,
@@ -129,8 +143,33 @@ class FetchLiveClient implements LiveClient {
     return (await resp.json()) as HealthResponse;
   }
 
+  async state(): Promise<StateResponse> {
+    let resp: Response;
+    try {
+      resp = await fetch("/api/state", {
+        headers: this.authHeader(),
+      });
+    } catch {
+      throw new Error("connection_unavailable");
+    }
+    if (!resp.ok) throw new Error(await this.errorKind(resp));
+    return (await resp.json()) as StateResponse;
+  }
+
+  updateConfig(updates: Record<string, unknown>): Promise<{ success: boolean; modes: unknown }> {
+    return this.post<{ success: boolean; modes: unknown }>("/api/config", updates);
+  }
+
   pickFolder(purpose: FolderPurpose): Promise<FolderPickResponse> {
     return this.post<FolderPickResponse>("/api/folders/pick", { purpose });
+  }
+
+  revealFolder(purpose: FolderPurpose): Promise<RevealFolderResponse> {
+    return this.post<RevealFolderResponse>("/api/folders/reveal", { purpose });
+  }
+
+  indexVault(): Promise<VaultIndexResponse> {
+    return this.post<VaultIndexResponse>("/api/vault/index", {});
   }
 
   startRun(req: RunRequest): Promise<RunResponse> {
@@ -139,6 +178,10 @@ class FetchLiveClient implements LiveClient {
 
   approve(req: ApproveRequest): Promise<ApproveResponse> {
     return this.post<ApproveResponse>("/api/approve", req);
+  }
+
+  acceptProposal(run_id?: string): Promise<AcceptProposalResponse> {
+    return this.post<AcceptProposalResponse>("/api/run/accept", { run_id });
   }
 
   editProposal(req: EditProposalRequest): Promise<EditProposalResponse> {
@@ -151,6 +194,18 @@ class FetchLiveClient implements LiveClient {
 
   cancel(req: CancelRequest): Promise<CancelResponse> {
     return this.post<CancelResponse>("/api/cancel", req);
+  }
+
+  fixPausedRun(req: { run_id?: string; input_text?: string; source_mode?: string; retrieval_mode?: string }): Promise<RunResponse> {
+    return this.post<RunResponse>("/api/run/fix", req);
+  }
+
+  stopPausedRun(run_id?: string): Promise<{ stopped: boolean; run_id: string }> {
+    return this.post<{ stopped: boolean; run_id: string }>("/api/run/stop", { run_id });
+  }
+
+  translate(req: TranslateRequest): Promise<TranslateResponse> {
+    return this.post<TranslateResponse>("/api/translate", req);
   }
 
   async journals(): Promise<JournalsResponse> {
@@ -228,12 +283,20 @@ const unavailable: LiveClient = {
   instanceId: "",
   version: "",
   health: () => Promise.reject(new Error("connection_unavailable")),
+  state: () => Promise.reject(new Error("connection_unavailable")),
+  updateConfig: () => Promise.reject(new Error("connection_unavailable")),
   pickFolder: () => Promise.reject(new Error("connection_unavailable")),
+  revealFolder: () => Promise.reject(new Error("connection_unavailable")),
+  indexVault: () => Promise.reject(new Error("connection_unavailable")),
   startRun: () => Promise.reject(new Error("connection_unavailable")),
   approve: () => Promise.reject(new Error("connection_unavailable")),
+  acceptProposal: () => Promise.reject(new Error("connection_unavailable")),
   editProposal: () => Promise.reject(new Error("connection_unavailable")),
   consent: () => Promise.reject(new Error("connection_unavailable")),
   cancel: () => Promise.reject(new Error("connection_unavailable")),
+  fixPausedRun: () => Promise.reject(new Error("connection_unavailable")),
+  stopPausedRun: () => Promise.reject(new Error("connection_unavailable")),
+  translate: () => Promise.reject(new Error("connection_unavailable")),
   journals: () => Promise.reject(new Error("connection_unavailable")),
   streamEvents: (_onEvent, onError) => {
     queueMicrotask(() => onError("connection_unavailable"));

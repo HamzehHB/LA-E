@@ -112,6 +112,8 @@ export interface CurrentRunView {
   proposal_title: string;
   proposal_body: string;
   confidence_level: ConfidenceLevel;
+  confidence_score?: number;
+  confidence_score_band?: string;
   filter_verdict: FilterVerdict;
   proposal_hash: string;
   review_state: HumanReviewState;
@@ -119,6 +121,7 @@ export interface CurrentRunView {
   error: AppError | null;
   stopped: boolean;
   stop_reason: string;
+  accepted?: boolean;
 }
 
 /** @category ui-model — journal row (rendered from fixture) */
@@ -132,6 +135,11 @@ export interface JournalRow {
   runId?: string;
   proposalHash?: string;
   artifactReference?: string;
+  digest?: string;
+  title?: string;
+  summary?: string;
+  excerpt?: string;
+  staging_available?: boolean;
 }
 
 /** @category ui-model */

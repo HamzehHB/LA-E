@@ -333,6 +333,58 @@ def load_languages(config_dir: Path | str = CONFIG_DIR) -> dict:
     return {"language": result}
 
 
+def save_paths_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
+    """Save updates to paths.local.yaml and reload PATHS."""
+    config_dir = Path(config_dir)
+    target = config_dir / PATHS_LOCAL_FILE
+    existing = _load_yaml(target) if target.is_file() else {}
+    merged = _deep_merge(existing, updates)
+    with target.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(merged, f, sort_keys=False, allow_unicode=True)
+    global PATHS
+    PATHS = load_paths(config_dir)
+    return PATHS
+
+
+def save_llm_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
+    """Save updates to llm.local.yaml and reload."""
+    config_dir = Path(config_dir)
+    target = config_dir / LLM_LOCAL_FILE
+    existing = _load_yaml(target) if target.is_file() else {}
+    if "llm" in updates and isinstance(updates["llm"], dict):
+        merged = _deep_merge(existing, updates)
+    else:
+        merged = _deep_merge(existing, {"llm": updates})
+    with target.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(merged, f, sort_keys=False, allow_unicode=True)
+    return load_llm(config_dir)
+
+
+def save_localization_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
+    """Save updates to localization.local.yaml and reload LANGUAGES."""
+    config_dir = Path(config_dir)
+    target = config_dir / LOCALIZATION_LOCAL_FILE
+    existing = _load_yaml(target) if target.is_file() else {}
+    if "language" in updates and isinstance(updates["language"], dict):
+        merged = _deep_merge(existing, updates)
+    else:
+        merged = _deep_merge(existing, {"language": updates})
+    with target.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(merged, f, sort_keys=False, allow_unicode=True)
+    global LANGUAGES
+    LANGUAGES = load_languages(config_dir)
+    return LANGUAGES
+
+
+def reload_settings(config_dir: Path | str = CONFIG_DIR) -> tuple:
+    """Reload PATHS, MODELS, and LANGUAGES from disk."""
+    global PATHS, MODELS, LANGUAGES
+    PATHS = load_paths(config_dir)
+    MODELS = load_models(config_dir)
+    LANGUAGES = load_languages(config_dir)
+    return (PATHS, MODELS, LANGUAGES)
+
+
 PATHS = load_paths()
 MODELS = load_models()
 LANGUAGES = load_languages()

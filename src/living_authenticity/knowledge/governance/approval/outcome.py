@@ -24,6 +24,7 @@ class ApprovalRequest:
     destination: str = ""
     reason: str = ""
     confidence_level: str = ""
+    confidence_score: float = 0.0
     proposal_hash: str = ""
     strategy: str = ""
     note: str = ""
@@ -37,8 +38,14 @@ class ApprovalRequest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "note_bound", bool(self.note_bound))
+        try:
+            s = float(self.confidence_score)
+        except (TypeError, ValueError):
+            s = 0.0
+        object.__setattr__(self, "confidence_score", max(0.0, min(1.0, round(s, 2))))
         object.__setattr__(self, "is_authoritative", False)
         object.__setattr__(self, "requires_human_review", True)
+
 
 
 @dataclass(frozen=True)

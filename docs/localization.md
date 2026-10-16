@@ -48,8 +48,10 @@ fields are copied verbatim; translation never authorizes execution and
 never creates a new proposal. Failures return UNAVAILABLE records that
 preserve the source text.
 
-## UI contract
+## UI implementation
 
-The future UI exposes three independent controls (Application / Staging
-Journal / Audit Journal language), each updating only its own domain.
-Validation, resource parity, and translation lifecycle stay in the backend.
+The UI exposes independent controls backed by the launcher API:
+1. **App Presentation Language:** Configured via the Settings gear popover (`⚙`), toggling between English and Persian. Updates `dir="rtl"` / `dir="ltr"` and `lang` on `document.documentElement` and persists to `Config/localization.local.yaml`.
+2. **Knowledge Language:** Configured via the top-header `Knowledge Language` dropdown menu, with separate selections for `Staging Language` and `Audit Language`. Persists via `POST /api/config`.
+3. **Live Translation Actions:** Inline `TranslateAction` controls on proposals, notes, and journal excerpts send requests to `POST /api/translate`, querying the active LLM provider or using the deterministic offline bilingual mapping table.
+Validation, resource parity, and translation lifecycle stay strictly in the backend.

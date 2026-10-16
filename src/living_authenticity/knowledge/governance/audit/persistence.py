@@ -196,6 +196,14 @@ class AuditWriter:
     def errors_dir(self) -> str:
         return str(self._errors)
 
+    def ensure_directories(self) -> None:
+        """Ensure passed, failed, and errors subdirectories exist."""
+        for directory in (self._passed, self._failed, self._errors):
+            try:
+                os.makedirs(str(directory), exist_ok=True)
+            except OSError as exc:
+                raise OSError("audit root unavailable") from exc
+
     def _target(self, category: str) -> Path:
         if category == "passed":
             directory = self._passed

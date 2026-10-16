@@ -441,21 +441,28 @@ opens the system browser. If `frontend/dist` is missing, a placeholder
 page explains that the frontend must be built first.
 
 Transport surface (JSON + SSE, token header on every non-health route):
-`GET /api/health`, `GET /api/journals`, `GET /api/events`,
-`POST /api/folders/pick`, `POST /api/run`, `POST /api/approve`,
-`POST /api/consent`. Without a launcher token (for example plain
-`npm run dev`), the UI stays in fixture/demo mode and performs no
-backend calls.
+- `GET /api/health`: Discovery and instance check.
+- `GET /api/state`: Snapshot configuration, folder validity, active models, and paused runs.
+- `GET /api/journals`: 1:1 paired recent audits and staging records (excluding `errors/`).
+- `GET /api/events`: SSE stream for sanitized operational run events, numeric confidence scores, and stage states.
+- `POST /api/config`: Persist paths, LLM settings, and localization to `Config/*.local.yaml`.
+- `POST /api/folders/pick`: Open native OS folder dialog server-side with guard validation.
+- `POST /api/folders/reveal`: Safe file listing of configured directories.
+- `POST /api/vault/index`: Execute initial vault vector baseline indexing via BGE-M3 and LanceDB.
+- `POST /api/run`: Submit query input for processing through the 10 backend stages.
+- `POST /api/approve`: Submit explicit human approval or rejection for CREATE proposals.
+- `POST /api/proposal/edit`: Server-side authoritative edit of pending proposal with hash recomputation.
+- `POST /api/run/accept`: Human acknowledgment for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`).
+- `POST /api/run/fix`: Error recovery / paused run resumption with corrected input/parameters.
+- `POST /api/run/stop`: Cleanly terminate a paused or safe-stopped run.
+- `POST /api/translate`: Live bilingual translation (English ↔ Persian) via LLM or deterministic table.
+- `POST /api/consent`: Record explicit user consent for cloud provider interactions.
 
-Portable directory selection: the Staging, Audit, and Vault buttons
-open the launcher's native folder dialog (`POST /api/folders/pick`)
-on the user's own computer; the backend validates the choice through
-the existing PathBoundary/destination guards and remembers a
-validated Staging/Audit selection for that launch only (memory,
-never written to configuration files). Later runs prefer the
-validated session choice and fall back to the config-declared
-location. No source file edits or machine-specific paths are needed
-to use the application on another computer.
+Without a launcher token (for example plain `npm run dev`), the UI stays in fixture/demo mode and performs no backend calls. Run the launcher with:
+
+```bash
+python -m src.living_authenticity.adapter
+```
 
 ---
 

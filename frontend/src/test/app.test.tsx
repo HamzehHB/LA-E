@@ -1,7 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { deriveWorkflow, isTerminalSuccess } from "../components/workflowStages";
 import type { RunEvent } from "../contracts/transport";
+
+beforeEach(() => {
+  localStorage.setItem("lae-welcomed", "1");
+});
 
 function ev(kind: RunEvent["kind"], stage = "", message = ""): RunEvent {
   return { kind, run_id: "run-1", stage, message, timestamp: "" };
@@ -144,9 +148,8 @@ describe("app shell", () => {
   it("theme toggle + RTL switch update document attributes", async () => {
     const user = userEvent.setup();
     render(<App />);
-    // Dismiss the first-launch Welcome so underlying controls are reachable.
-    const enter = screen.queryByRole("button", { name: "Enter LA-E" });
-    if (enter) await user.click(enter);
+    // Open settings gear
+    await user.click(screen.getByRole("button", { name: /Settings/i }));
     await user.click(screen.getByRole("radio", { name: "Dark" }));
     expect(document.documentElement.dataset.theme).toBe("dark");
     expect(localStorage.getItem("lae-theme")).toBe("dark");
@@ -171,8 +174,8 @@ describe("app shell", () => {
     const user = userEvent.setup();
     render(<App />);
     // Last fixture row is shown first in rotation; paging moves it.
-    await user.click(screen.getByRole("button", { name: "Next record" }));
-    await user.click(screen.getByRole("button", { name: "Previous record" }));
+    await user.click(screen.getAllByRole("button", { name: "Next record" })[0]);
+    await user.click(screen.getAllByRole("button", { name: "Previous record" })[0]);
     const viewAll = screen.getAllByRole("button", { name: "View All" });
     expect(viewAll.length).toBeGreaterThan(0);
     expect(viewAll[0].title).toMatch(/Test mode|not supported/);
@@ -278,9 +281,7 @@ describe("gap-closure behaviors (§§1-4)", () => {
   it("Journals show a multi-row window in Test Mode", () => {
     localStorage.setItem("lae-welcomed", "1");
     const { container } = render(<App />);
-    const auditRows = container.querySelectorAll('section[aria-label="Recent Audit journal"] tbody tr');
-    // Up to a 3-row visible window from the 10 synthetic records.
-    expect(auditRows.length).toBeGreaterThanOrEqual(1);
-    expect(auditRows.length).toBeLessThanOrEqual(3);
+    const auditCards = container.querySelectorAll('section[aria-label="Recent Audit journal"] .journal-newspaper-card');
+    expect(auditCards.length).toBeGreaterThanOrEqual(1);
   });
 });

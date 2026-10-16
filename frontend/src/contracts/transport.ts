@@ -136,13 +136,94 @@ export interface JournalItem {
   storage_category: AuditStorageCategory;
   outcome: string;
   artifact_reference: string;
+  artifact_path?: string;
   staging_available: boolean;
+  digest?: string;
+  title?: string;
+  summary?: string;
+  excerpt?: string;
 }
 
 /** @category transport — GET /api/journals response */
 export interface JournalsResponse {
   audits: JournalItem[];
   staging: JournalItem[];
+}
+
+/** @category transport — GET /api/state response */
+export interface StateResponse {
+  app: string;
+  version: string;
+  instance_id: string;
+  modes: {
+    source_mode: "personal_vault" | "examples";
+    retrieval_mode: "lexical" | "semantic";
+    app_language: "en" | "fa";
+    staging_language: "en" | "fa";
+    audit_language: "en" | "fa";
+  };
+  folders: Record<FolderPurpose, {
+    status: FolderPickStatus;
+    display: string;
+    configured: boolean;
+  }>;
+  llm: {
+    provider: string;
+    model: string;
+    endpoint: string;
+    local_available: boolean;
+    cloud_available: boolean;
+  };
+  active_run_id: string;
+  paused_run: {
+    run_id: string;
+    input_text: string;
+    source_mode: string;
+    retrieval_mode: string;
+    error: string;
+    error_message: string;
+    timestamp: string;
+  } | null;
+}
+
+/** @category transport — POST /api/translate */
+export interface TranslateRequest {
+  text: string;
+  target_lang?: "en" | "fa";
+  source_lang?: string;
+}
+
+export interface TranslateResponse {
+  translated_text: string;
+  target_lang: string;
+}
+
+/** @category transport — POST /api/folders/reveal */
+export interface RevealFolderResponse {
+  purpose: FolderPurpose;
+  display: string;
+  items: Array<{
+    name: string;
+    is_dir: boolean;
+    size: number;
+    modified: string;
+  }>;
+}
+
+/** @category transport — POST /api/vault/index */
+export interface VaultIndexResponse {
+  indexed: boolean;
+  files_discovered: number;
+  notes_indexed: number;
+  files_skipped: number;
+  reason?: string;
+}
+
+/** @category transport — POST /api/run/accept */
+export interface AcceptProposalResponse {
+  accepted: boolean;
+  action: string;
+  run_id: string;
 }
 
 /**
@@ -176,4 +257,14 @@ export interface RunEvent {
   stage: string;
   message: string;
   timestamp: string;
+  proposal_hash?: string;
+  query_unit_id?: string;
+  proposal_action?: ProposalAction;
+  title?: string;
+  body?: string;
+  confidence_level?: string;
+  confidence_score?: number;
+  confidence_score_band?: string;
+  classification_type?: string;
+  consent_id?: string;
 }

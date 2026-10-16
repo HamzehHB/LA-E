@@ -169,6 +169,11 @@ def _make_handler(launcher: Launcher):
                     return
                 self._send_json(200, launcher.journals())
                 return
+            if path == "/api/state":
+                if not self._authenticated():
+                    return
+                self._send_json(200, launcher.state())
+                return
             if path == "/api/events":
                 if not self._authenticated():
                     return
@@ -281,6 +286,27 @@ def _make_handler(launcher: Launcher):
             if path == "/api/consent":
                 self._handle_consent()
                 return
+            if path == "/api/config":
+                self._handle_config()
+                return
+            if path == "/api/translate":
+                self._handle_translate()
+                return
+            if path == "/api/folders/reveal":
+                self._handle_reveal()
+                return
+            if path == "/api/vault/index":
+                self._handle_index_vault()
+                return
+            if path == "/api/run/accept":
+                self._handle_accept()
+                return
+            if path == "/api/run/fix":
+                self._handle_fix()
+                return
+            if path == "/api/run/stop":
+                self._handle_stop()
+                return
             self._error(404, "validation_error", "unknown route")
 
         def _handle_pick(self):
@@ -368,6 +394,94 @@ def _make_handler(launcher: Launcher):
                     body=data.get("body"),
                     reason=data.get("reason"),
                     client_hash=data.get("proposal_hash"))
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_config(self):
+            data = self._read_json()
+            if data is None:
+                return
+            try:
+                result = launcher.update_config(data)
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_translate(self):
+            data = self._read_json()
+            if data is None:
+                return
+            text = data.get("text", "")
+            target_lang = data.get("target_lang", "en")
+            source_lang = data.get("source_lang", "")
+            try:
+                result = launcher.translate_text(text, target_lang=target_lang, source_lang=source_lang)
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_reveal(self):
+            data = self._read_json()
+            if data is None:
+                return
+            purpose = data.get("purpose", "")
+            try:
+                result = launcher.reveal_folder(purpose)
+            except Exception as exc:
+                self._error(400, "validation_error", str(exc))
+                return
+            self._send_json(200, result)
+
+        def _handle_index_vault(self):
+            try:
+                result = launcher.index_vault()
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_accept(self):
+            data = self._read_json()
+            if data is None:
+                data = {}
+            run_id = data.get("run_id", "")
+            try:
+                result = launcher.accept_proposal(run_id=run_id)
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_fix(self):
+            data = self._read_json()
+            if data is None:
+                return
+            try:
+                run_id = str(data.get("run_id") or "")
+                raw_input = data.get("input_text")
+                raw_source = data.get("source_mode")
+                raw_retrieval = data.get("retrieval_mode")
+                result = launcher.fix_paused_run(
+                    run_id=run_id,
+                    input_text=str(raw_input) if raw_input is not None else None,
+                    source_mode=str(raw_source) if raw_source is not None else None,
+                    retrieval_mode=str(raw_retrieval) if raw_retrieval is not None else None,
+                )
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(202, result)
+
+        def _handle_stop(self):
+            data = self._read_json()
+            if data is None:
+                data = {}
+            try:
+                result = launcher.stop_paused_run(run_id=data.get("run_id", ""))
             except AdapterError as exc:
                 self._error(400, exc.kind, exc.message)
                 return

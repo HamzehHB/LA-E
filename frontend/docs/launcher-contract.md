@@ -85,20 +85,86 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 - Errors: validation errors for unknown/inactive run.
 - Auth: token required.
 
+## GET /api/state
+
+- Purpose: snapshot all backend configurations, folder validity states, active LLM provider/model, and any paused runs on initial page load or reconnect.
+- Request: none (token header required).
+- Response: `{ app, version, instance_id, source_mode, retrieval_mode, app_language, staging_language, audit_language, folders: { vault, staging, audit, vector_db, local_llm, embedding_model }, llm: { provider, active_model, available_models }, paused_run: { run_id, stage, reason, input_text } | null }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/config
+
+- Purpose: update and persist application settings (paths, LLM parameters, localization) into local YAML configuration files.
+- Request: `{ vault_path?, staging_path?, audit_path?, vector_db_path?, local_llm_path?, embedding_model_path?, llm_provider?, local_model?, temperature?, context_window?, app_language?, staging_language?, audit_language? }`.
+- Response: `{ status: "ok", updated: string[] }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/translate
+
+- Purpose: live translation between English and Persian for notes, proposals, and journal excerpts. Invokes the active LLM provider if available; falls back to deterministic bilingual translation table.
+- Request: `{ text: string, target_lang: "en" | "fa", source_lang?: "en" | "fa" }`.
+- Response: `{ original_text: string, translated_text: string, target_lang: string, provider: string }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/folders/reveal
+
+- Purpose: safe file listing of a configured destination directory (staging, audit, etc.) for UI inspection without executing or executing outside files.
+- Request: `{ purpose: "staging" | "audit" | "vault" | "vector_db" }`.
+- Response: `{ purpose: string, path: string, files: Array<{ name: string, is_dir: boolean, size: number, modified: string }> }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/vault/index
+
+- Purpose: execute vault vector baseline indexing using BGE-M3 and LanceDB in the isolated vector store folder.
+- Request: none (uses configured vault and database paths).
+- Response: `{ indexed: boolean, reason?: string }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/run/accept
+
+- Purpose: explicit human review acknowledgment for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`). Acknowledges the proposal without triggering file creation.
+- Request: `{ run_id: string }`.
+- Response: `{ status: "acknowledged", run_id: string }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/run/fix
+
+- Purpose: error recovery / paused run resumption. Submits corrected input or parameters for a paused/safe-stopped run.
+- Request: `{ run_id: string, input_text?: string, source_mode?: string, retrieval_mode?: string }`.
+- Response: `{ status: "resumed", run_id: string }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/run/stop
+
+- Purpose: cleanly terminates a paused or safe-stopped run without performing writes.
+- Request: `{ run_id: string }`.
+- Response: `{ status: "stopped", run_id: string }`.
+- Auth: token required.
+- Sync: synchronous.
+
 ## GET /api/journals
 
-- Purpose: observe recent audit/staging records with correlation (max 10 each).
+- Purpose: observe recent audit/staging records with correlation (up to 10 records).
+- Features: strictly excludes `errors/` directory from the journal list; computes record digests; formats human-readable titles and summaries; pairs each audit record 1:1 with its staging artifact (or marks it `staging_available: false`).
 - Request: none (token header only).
-- Response: `{ audits: JournalItem[], staging: JournalItem[] }` where `JournalItem = { record_id, run_id, proposal_hash, timestamp, storage_category: "passed"|"failed", outcome, artifact_reference, staging_available }`
+- Response: `{ audits: JournalItem[], staging: JournalItem[] }` where `JournalItem = { record_id, run_id, proposal_hash, digest, title, summary, excerpt, timestamp, storage_category: "passed"|"failed", outcome, artifact_reference, staging_available }`
 - Errors: `connection_unavailable` when launcher is down.
-- Auth: token required (vault-derived content).
-- Sync: synchronous snapshot; UI refreshes explicitly (no blind polling contract yet).
+- Auth: token required.
+- Sync: synchronous snapshot.
 
 ## GET /api/events (SSE)
 
-- Purpose: stream run-scoped operational events for the Current Audit view.
-- Envelope: `{ kind, run_id, stage, message, timestamp }`; `kind` in `run_started|stage_started|stage_completed|status|warning|error|stopped|human_review_required|completed`.
-- Content: user-safe operational info only. NEVER: private LLM reasoning, credentials, raw tracebacks, hidden deliberation.
-- Auth: token required (query param or header per future integration decision).
+- Purpose: stream run-scoped operational events for the Current Audit view and workflow timeline.
+- Envelope: `{ kind, run_id, stage, message, timestamp, confidence_score?, confidence_score_band?, classification_type?, proposal_hash? }`.
+- Kinds: `run_started|stage_started|stage_completed|status|warning|error|stopped|human_review_required|approval_decided|revalidation_result|execution_result|run_completed|run_rejected`.
+- Content: user-safe operational info only with numeric confidence score (0.00–1.00) and confidence band (`high`, `moderate`, `low`). NEVER: private LLM reasoning, credentials, raw tracebacks, hidden deliberation.
+- Auth: token required.
 - Correlation: every run event carries stable `run_id`; stage names use backend `STAGE_ORDER` keys.
 - Sync: asynchronous stream; cancellable client-side; no timers leaked.

@@ -49,6 +49,7 @@ class ExplicitApprovalGate(ApprovalGate):
             destination=proposal.destination,
             reason=proposal.reason,
             confidence_level=payload.get("confidence_level", ""),
+            confidence_score=payload.get("confidence_score", 0.0),
             proposal_hash=digest,
             strategy=self._strategy,
             note_bound=note is not None,

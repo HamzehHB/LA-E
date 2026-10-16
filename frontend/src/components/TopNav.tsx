@@ -33,129 +33,525 @@ function validityClass(v: string): string {
 }
 
 export function TopNav() {
-  const { state, setSourceMode, setRetrievalType, setLlmMode, setStagingLanguage, setAuditLanguage, liveAvailable, pickLiveFolder } = useStore();
+  const {
+    state,
+    setTheme,
+    setAppLanguage,
+    setSourceMode,
+    setRetrievalType,
+    setLlmMode,
+    setStagingLanguage,
+    setAuditLanguage,
+    liveAvailable,
+    liveConnected,
+    pickLiveFolder,
+    liveIndexVault,
+  } = useStore();
+
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
   const [open, setOpen] = useState<string | null>(null);
   const toggle = (k: string) => setOpen((v) => (v === k ? null : k));
 
-  const onSourceClick = () => {
-    const next = state.sourceMode === "test" ? "vault" : "test";
-    setSourceMode(next);
-    // Selecting Vault validates a vault path through the picker; it does
-    // NOT scan, ingest, or index. Test never touches the vault.
-    if (next === "vault" && liveAvailable) void pickLiveFolder("vault");
-  };
-  // Semantic retrieval is only genuinely available when both an isolated
-  // vector database and an embedding model have been backend-validated
-  // this session. Otherwise the UI says so and never claims it is active.
+  // Contextual first-click onboarding states
+  const [vaultModalOpen, setVaultModalOpen] = useState(false);
+  const [stagingModalOpen, setStagingModalOpen] = useState(false);
+  const [auditModalOpen, setAuditModalOpen] = useState(false);
+  const [dbModalOpen, setDbModalOpen] = useState(false);
+  const [indexingMsg, setIndexingMsg] = useState("");
+
   const semanticReady =
     state.resources.vector_db.validity === "configured_valid" &&
     state.resources.embedding_model.validity === "configured_valid";
-  // §3 mode tab treatment: Test is red; Vault is green only when valid.
+
   const vaultValid = state.resources.vault.validity === "configured_valid";
-  const modeClass = state.sourceMode === "test" ? "mode-test" : vaultValid ? "mode-vault mode-ready" : "mode-vault";
+  const stagingValid = state.resources.staging.validity === "configured_valid";
+  const auditValid = state.resources.audit.validity === "configured_valid";
+
+  // Vault / Test Mode Click Handler
+  const handleSourceTabClick = () => {
+    if (state.sourceMode === "test") {
+      // Transition from Test -> Vault
+      setSourceMode("vault");
+      const hasSeenVault = localStorage.getItem("lae-first-vault");
+      if (!hasSeenVault) {
+        localStorage.setItem("lae-first-vault", "1");
+        setVaultModalOpen(true);
+      } else if (!vaultValid && liveAvailable) {
+        void pickLiveFolder("vault");
+      }
+    } else {
+      // Transition from Vault -> Test
+      setSourceMode("test");
+    }
+  };
+
+  // Staging Click Handler
+  const handleStagingClick = () => {
+    const hasSeen = localStorage.getItem("lae-first-staging");
+    if (!hasSeen) {
+      localStorage.setItem("lae-first-staging", "1");
+      setStagingModalOpen(true);
+    } else if (liveAvailable) {
+      void pickLiveFolder("staging");
+    }
+  };
+
+  // Audits Click Handler
+  const handleAuditsClick = () => {
+    const hasSeen = localStorage.getItem("lae-first-audit");
+    if (!hasSeen) {
+      localStorage.setItem("lae-first-audit", "1");
+      setAuditModalOpen(true);
+    } else if (liveAvailable) {
+      void pickLiveFolder("audit");
+    }
+  };
+
+  // Database Location Click Handler
+  const handleDbLocationClick = () => {
+    const hasSeen = localStorage.getItem("lae-first-db");
+    if (!hasSeen) {
+      localStorage.setItem("lae-first-db", "1");
+      setDbModalOpen(true);
+    } else if (liveAvailable) {
+      void pickLiveFolder("vector_db");
+    }
+  };
+
+  const runInitialIndex = async () => {
+    setIndexingMsg("Running initial vector indexing…");
+    const res = await liveIndexVault();
+    if (res.indexed) {
+      setIndexingMsg("Initial index complete!");
+      setTimeout(() => {
+        setVaultModalOpen(false);
+        setIndexingMsg("");
+      }, 1500);
+    } else {
+      setIndexingMsg(res.reason || "Indexing failed. Verify Database and Embedding model settings.");
+    }
+  };
 
   return (
-    <nav aria-label="top" className="topnav">
-      <button
-        type="button"
-        className={modeClass}
-        aria-pressed={state.sourceMode === "vault"}
-        onClick={onSourceClick}
-        title={state.sourceMode === "vault" ? t("ui.nav.vaultWarning") : t("ui.nav.testHint")}
-      >
-        {state.sourceMode === "test" ? t("ui.nav.sourceTest") : t("ui.nav.sourceVault")} ▾
-        <span className={`badge ${validityClass(state.resources.vault.validity)}`} aria-label={t(validityKey(state.resources.vault.validity) as Parameters<typeof translate>[1])}>
-          {t(validityKey(state.resources.vault.validity) as Parameters<typeof translate>[1])}
-        </span>
-      </button>
-      <button type="button" onClick={() => { if (liveAvailable) void pickLiveFolder("staging"); }} title={state.resources.staging.reason || undefined}>
-        {t("ui.nav.staging")} <span className={`badge ${validityClass(state.resources.staging.validity)}`}>{t(validityKey(state.resources.staging.validity) as Parameters<typeof translate>[1])}</span>
-      </button>
-      <button type="button" onClick={() => { if (liveAvailable) void pickLiveFolder("audit"); }} title={state.resources.audit.reason || undefined}>
-        {t("ui.nav.audit")} <span className={`badge ${validityClass(state.resources.audit.validity)}`}>{t(validityKey(state.resources.audit.validity) as Parameters<typeof translate>[1])}</span>
-      </button>
-      <div className="menu">
-        <button type="button" aria-expanded={open === "db"} onClick={() => toggle("db")}>
-          {t("ui.nav.database")} ▾
+    <nav aria-label="top" className="topnav-bar">
+      {/* 1. Left Cluster: Brand + Settings Gear + Live Status */}
+      <div className="brand-cluster">
+        <div className="brand">
+          <span className="logo" aria-label="LA-E">
+            <span className="logo-l" aria-hidden="true">L</span>
+            <span className="logo-a" aria-hidden="true">A</span>
+            <span className="logo-sep" aria-hidden="true">-</span>
+            <span className="logo-e" aria-hidden="true">E</span>
+          </span>
+          <span className="ver">v0.1</span>
+        </div>
+
+        <button
+          type="button"
+          className="gear-btn"
+          aria-label={t("ui.nav.settings")}
+          aria-expanded={open === "settings"}
+          onClick={() => toggle("settings")}
+        >
+          ⚙
         </button>
-        {open === "db" && (
-          <div role="menu" className="dropdown">
-            <span className="note">{t("ui.db.location")}</span>
-            <button type="button" role="menuitem" onClick={() => { if (liveAvailable) void pickLiveFolder("vector_db"); }}>
-              {t("ui.nav.databaseLocation")} · <span className={`badge ${validityClass(state.resources.vector_db.validity)}`}>{t(validityKey(state.resources.vector_db.validity) as Parameters<typeof translate>[1])}</span>
-            </button>
+
+        {open === "settings" && (
+          <div role="menu" className="dropdown settings-popover">
+            <span className="dropdown-title">{t("ui.settings.title")}</span>
+            <div className="dropdown-section">
+              <span className="note">{t("ui.settings.display")}</span>
+              <div role="radiogroup" aria-label={t("ui.settings.display")} className="review">
+                <button
+                  type="button"
+                  role="radio"
+                  className={state.theme === "light" ? "active" : ""}
+                  aria-checked={state.theme === "light"}
+                  aria-label={t("ui.settings.light")}
+                  onClick={() => setTheme("light")}
+                >
+                  ☀ {t("ui.settings.light")}
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  className={state.theme === "dark" ? "active" : ""}
+                  aria-checked={state.theme === "dark"}
+                  aria-label={t("ui.settings.dark")}
+                  onClick={() => setTheme("dark")}
+                >
+                  🌙 {t("ui.settings.dark")}
+                </button>
+              </div>
+            </div>
             <hr />
-            <span className="note">{t("ui.db.retrievalType")}</span>
-            <button type="button" role="menuitemradio" aria-checked={state.retrievalType === "lexical"} onClick={() => setRetrievalType("lexical")}>
-              Lexical Retrieval
-            </button>
-            <button
-              type="button"
-              role="menuitemradio"
-              aria-checked={state.retrievalType === "semantic"}
-              onClick={() => setRetrievalType("semantic")}
-              title={semanticReady ? undefined : t("ui.nav.semanticNeedsSetup")}
-            >
-              Semantic Retrieval{semanticReady ? "" : " ⚠"}
-            </button>
-            {!semanticReady && (
-              <span className="note">{t("ui.nav.semanticNeedsSetup")}</span>
-            )}
+            <div className="dropdown-section">
+              <span className="note">{t("ui.settings.appLanguage")}</span>
+              <div role="radiogroup" aria-label={t("ui.settings.appLanguage")} className="review">
+                <button
+                  type="button"
+                  role="radio"
+                  className={state.appLanguage === "en" ? "active" : ""}
+                  aria-checked={state.appLanguage === "en"}
+                  aria-label="English"
+                  onClick={() => setAppLanguage("en")}
+                >
+                  English
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  className={state.appLanguage === "fa" ? "active" : ""}
+                  aria-checked={state.appLanguage === "fa"}
+                  aria-label="فارسی"
+                  onClick={() => setAppLanguage("fa")}
+                >
+                  فارسی
+                </button>
+              </div>
+            </div>
           </div>
         )}
+
+        <div className="live-status-pill" title={liveAvailable ? (liveConnected ? "Live loopback connected" : "Connecting to loopback…") : "Fixture demo mode"}>
+          <span className={`live-dot ${liveAvailable ? (liveConnected ? "on" : "off") : ""}`} aria-hidden="true" />
+          <span className="live-text">
+            {liveAvailable
+              ? (liveConnected ? t("ui.live.connected") : "reconnecting…")
+              : t("ui.live.demo")}
+          </span>
+        </div>
       </div>
-      <div className="menu">
-        <button type="button" aria-expanded={open === "ai"} onClick={() => toggle("ai")}>
-          {t("ui.nav.ai")} ▾
+
+      {/* 2. Center-Left Cluster: The 3 Status Pill Tabs */}
+      <div className="status-tabs-cluster">
+        {/* TEST / VAULT Tab */}
+        <button
+          type="button"
+          className={`pill-tab ${state.sourceMode === "test" ? "tab-test" : (vaultValid ? "tab-vault ok" : "tab-vault bad")}`}
+          aria-pressed={state.sourceMode === "vault"}
+          onClick={handleSourceTabClick}
+          title={state.sourceMode === "vault" ? t("ui.nav.vaultWarning") : t("ui.nav.testHint")}
+        >
+          <span className="tab-label">{state.sourceMode === "test" ? t("ui.nav.sourceTest") : t("ui.nav.sourceVault")}</span>
+          {state.sourceMode === "vault" && (
+            <span className={`badge ${validityClass(state.resources.vault.validity)}`}>
+              {state.resources.vault.display || t(validityKey(state.resources.vault.validity) as Parameters<typeof translate>[1])}
+            </span>
+          )}
         </button>
-        {open === "ai" && (
-          <div role="menu" className="dropdown">
-            <span className="note">LLM</span>
-            <button type="button" role="menuitemradio" aria-checked={state.llmMode === "local"} onClick={() => setLlmMode("local")}>
-              {t("ui.ai.localLlm")}
-            </button>
-            <button type="button" role="menuitemradio" aria-checked={state.llmMode === "cloud"} onClick={() => setLlmMode("cloud")}>
-              {t("ui.ai.cloudLlm")}
-            </button>
-            {state.llmMode === "local" ? (
-              <>
-                <hr />
-                <span className="note">{t("ui.ai.modelLocation")}</span>
-                <button type="button" role="menuitem" onClick={() => { if (liveAvailable) void pickLiveFolder("local_llm"); }}>
-                  {t("ui.ai.modelLocation")} · <span className={`badge ${validityClass(state.resources.local_llm.validity)}`}>{t(validityKey(state.resources.local_llm.validity) as Parameters<typeof translate>[1])}</span>
-                </button>
-                <button type="button" role="menuitem" onClick={() => { if (liveAvailable) void pickLiveFolder("embedding_model"); }}>
-                  {t("ui.ai.embeddingLocation")} · <span className={`badge ${validityClass(state.resources.embedding_model.validity)}`}>{t(validityKey(state.resources.embedding_model.validity) as Parameters<typeof translate>[1])}</span>
-                </button>
-                <span role="note" className="note">{t("ui.ai.localLaunch")}</span>
-              </>
-            ) : (
-              <>
-                <hr />
+
+        {/* STAGING Tab */}
+        <button
+          type="button"
+          className={`pill-tab ${stagingValid ? "tab-staging ok" : "tab-staging bad"}`}
+          onClick={handleStagingClick}
+          title={state.resources.staging.reason || undefined}
+        >
+          <span className="tab-label">{t("ui.nav.staging")}</span>
+          <span className={`badge ${validityClass(state.resources.staging.validity)}`}>
+            {state.resources.staging.display || t(validityKey(state.resources.staging.validity) as Parameters<typeof translate>[1])}
+          </span>
+        </button>
+
+        {/* AUDITS Tab */}
+        <button
+          type="button"
+          className={`pill-tab ${auditValid ? "tab-audits ok" : "tab-audits bad"}`}
+          onClick={handleAuditsClick}
+          title={state.resources.audit.reason || undefined}
+        >
+          <span className="tab-label">{t("ui.nav.audit")}</span>
+          <span className={`badge ${validityClass(state.resources.audit.validity)}`}>
+            {state.resources.audit.display || t(validityKey(state.resources.audit.validity) as Parameters<typeof translate>[1])}
+          </span>
+        </button>
+      </div>
+
+      {/* 3. Right Cluster: The 3 Compact Dropdown Menus */}
+      <div className="dropdowns-cluster">
+        {/* Database Menu */}
+        <div className="menu">
+          <button type="button" className="menu-btn" aria-expanded={open === "db"} onClick={() => toggle("db")}>
+            {t("ui.nav.database")} ▾
+          </button>
+          {open === "db" && (
+            <div role="menu" className="dropdown">
+              <span className="dropdown-title">{t("ui.db.location")}</span>
+              <button type="button" role="menuitem" onClick={handleDbLocationClick}>
+                {t("ui.nav.databaseLocation")} ·{" "}
+                <span className={`badge ${validityClass(state.resources.vector_db.validity)}`}>
+                  {state.resources.vector_db.display || t(validityKey(state.resources.vector_db.validity) as Parameters<typeof translate>[1])}
+                </span>
+              </button>
+              <hr />
+              <span className="dropdown-title">{t("ui.db.retrievalType")}</span>
+              <button
+                type="button"
+                role="menuitemradio"
+                className={state.retrievalType === "lexical" ? "selected" : ""}
+                aria-checked={state.retrievalType === "lexical"}
+                onClick={() => setRetrievalType("lexical")}
+              >
+                ● Lexical Retrieval
+              </button>
+              <button
+                type="button"
+                role="menuitemradio"
+                className={state.retrievalType === "semantic" ? "selected" : ""}
+                aria-checked={state.retrievalType === "semantic"}
+                onClick={() => setRetrievalType("semantic")}
+                title={semanticReady ? undefined : t("ui.nav.semanticNeedsSetup")}
+              >
+                ● Semantic Retrieval {semanticReady ? "" : "⚠"}
+              </button>
+              {!semanticReady && (
+                <span className="note warn">{t("ui.nav.semanticNeedsSetup")}</span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* AI Menu */}
+        <div className="menu">
+          <button type="button" className="menu-btn" aria-expanded={open === "ai"} onClick={() => toggle("ai")}>
+            {t("ui.nav.ai")} ▾
+          </button>
+          {open === "ai" && (
+            <div role="menu" className="dropdown">
+              <span className="dropdown-title">Embedding Model</span>
+              <button type="button" role="menuitem" onClick={() => { if (liveAvailable) void pickLiveFolder("embedding_model"); }}>
+                BGE-M3 ·{" "}
+                <span className={`badge ${validityClass(state.resources.embedding_model.validity)}`}>
+                  {state.resources.embedding_model.display || t(validityKey(state.resources.embedding_model.validity) as Parameters<typeof translate>[1])}
+                </span>
+              </button>
+              <a
+                href="https://huggingface.co/BAAI/bge-m3"
+                target="_blank"
+                rel="noreferrer"
+                className="dropdown-link"
+              >
+                Download BGE-M3 on Hugging Face ↗
+              </a>
+              <hr />
+              <span className="dropdown-title">LLM</span>
+              <button
+                type="button"
+                role="menuitemradio"
+                className={state.llmMode === "local" ? "selected" : ""}
+                aria-checked={state.llmMode === "local"}
+                onClick={() => setLlmMode("local")}
+              >
+                ● {t("ui.ai.localLlm")}
+              </button>
+              <button
+                type="button"
+                role="menuitemradio"
+                className={state.llmMode === "cloud" ? "selected" : ""}
+                aria-checked={state.llmMode === "cloud"}
+                onClick={() => setLlmMode("cloud")}
+              >
+                ● {t("ui.ai.cloudLlm")}
+              </button>
+              {state.llmMode === "local" ? (
+                <>
+                  <button type="button" role="menuitem" onClick={() => { if (liveAvailable) void pickLiveFolder("local_llm"); }}>
+                    {t("ui.ai.modelLocation")} ·{" "}
+                    <span className={`badge ${validityClass(state.resources.local_llm.validity)}`}>
+                      {state.resources.local_llm.display || t(validityKey(state.resources.local_llm.validity) as Parameters<typeof translate>[1])}
+                    </span>
+                  </button>
+                  <a
+                    href="https://huggingface.co/models?search=gguf"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="dropdown-link"
+                  >
+                    Download GGUF Models ↗
+                  </a>
+                </>
+              ) : (
                 <span role="note" className="note">{t("ui.ai.cloudUnsupported")}</span>
-              </>
-            )}
-          </div>
-        )}
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Knowledge Language Menu */}
+        <div className="menu">
+          <button type="button" className="menu-btn" aria-expanded={open === "lang"} onClick={() => toggle("lang")}>
+            {t("ui.nav.language")} ▾
+          </button>
+          {open === "lang" && (
+            <div role="menu" className="dropdown">
+              <span className="dropdown-title">Audit Language</span>
+              <div className="button-group">
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  className={state.auditLanguage === "en" ? "selected" : ""}
+                  aria-checked={state.auditLanguage === "en"}
+                  onClick={() => setAuditLanguage("en")}
+                >
+                  English
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  className={state.auditLanguage === "fa" ? "selected" : ""}
+                  aria-checked={state.auditLanguage === "fa"}
+                  onClick={() => setAuditLanguage("fa")}
+                >
+                  فارسی
+                </button>
+              </div>
+              <hr />
+              <span className="dropdown-title">Staging Language</span>
+              <div className="button-group">
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  className={state.stagingLanguage === "en" ? "selected" : ""}
+                  aria-checked={state.stagingLanguage === "en"}
+                  onClick={() => setStagingLanguage("en")}
+                >
+                  English
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  className={state.stagingLanguage === "fa" ? "selected" : ""}
+                  aria-checked={state.stagingLanguage === "fa"}
+                  onClick={() => setStagingLanguage("fa")}
+                >
+                  فارسی
+                </button>
+              </div>
+              <span role="note" className="note">{t("ui.lang.contentNote")}</span>
+            </div>
+          )}
+        </div>
       </div>
-      <div className="menu">
-        <button type="button" aria-expanded={open === "lang"} onClick={() => toggle("lang")}>
-          {t("ui.nav.language")} ▾
-        </button>
-        {open === "lang" && (
-          <div role="menu" className="dropdown">
-            <span className="note">Audit language</span>
-            <button type="button" role="menuitemradio" aria-checked={state.auditLanguage === "en"} onClick={() => setAuditLanguage("en")}>English</button>
-            <button type="button" role="menuitemradio" aria-checked={state.auditLanguage === "fa"} onClick={() => setAuditLanguage("fa")}>فارسی</button>
-            <span className="note">Staging language</span>
-            <button type="button" role="menuitemradio" aria-checked={state.stagingLanguage === "en"} onClick={() => setStagingLanguage("en")}>English</button>
-            <button type="button" role="menuitemradio" aria-checked={state.stagingLanguage === "fa"} onClick={() => setStagingLanguage("fa")}>فارسی</button>
-            <span role="note">Content languages for generated Audit and Staging text; independent of App language.</span>
-            <span role="note" className="note">{t("ui.lang.contentNote")}</span>
+
+      {/* Contextual Modal: First-Time Vault Onboarding */}
+      {vaultModalOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="vault-modal-title">
+          <div className="modal-card">
+            <h3 id="vault-modal-title">Initial Vault Vector Indexing</h3>
+            <p>For a more personalized experience with your data, an initial vector index is needed. Would you like to create the first one?</p>
+            <div className="modal-checks">
+              <div className="check-item">
+                <span>Database Location:</span>
+                <span className={`badge ${validityClass(state.resources.vector_db.validity)}`}>
+                  {state.resources.vector_db.display || "Not configured"}
+                </span>
+                {state.resources.vector_db.validity !== "configured_valid" && (
+                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("vector_db")}>Select Folder</button>
+                )}
+              </div>
+              <div className="check-item">
+                <span>Embedding Model (BGE-M3):</span>
+                <span className={`badge ${validityClass(state.resources.embedding_model.validity)}`}>
+                  {state.resources.embedding_model.display || "Not configured"}
+                </span>
+                {state.resources.embedding_model.validity !== "configured_valid" && (
+                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("embedding_model")}>Choose Model</button>
+                )}
+              </div>
+            </div>
+            {indexingMsg && <p className="status-msg">{indexingMsg}</p>}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn approve"
+                disabled={!semanticReady}
+                onClick={() => void runInitialIndex()}
+              >
+                Create Initial Index
+              </button>
+              <a
+                href="https://huggingface.co/BAAI/bge-m3"
+                target="_blank"
+                rel="noreferrer"
+                className="btn ghost"
+              >
+                Download BGE-M3 ↗
+              </a>
+              <button type="button" className="btn ghost" onClick={() => setVaultModalOpen(false)}>Not now</button>
+            </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
+
+      {/* Contextual Modal: First-Time Staging */}
+      {stagingModalOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="staging-modal-title">
+          <div className="modal-card">
+            <h3 id="staging-modal-title">Staging Destination</h3>
+            <p>Selecting a Staging folder provides a safe, isolated, and controlled destination for approved note outputs before they ever touch your authoritative vault.</p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn approve"
+                onClick={() => {
+                  setStagingModalOpen(false);
+                  if (liveAvailable) void pickLiveFolder("staging");
+                }}
+              >
+                Select Staging Folder
+              </button>
+              <button type="button" className="btn ghost" onClick={() => setStagingModalOpen(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Contextual Modal: First-Time Audits */}
+      {auditModalOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="audit-modal-title">
+          <div className="modal-card">
+            <h3 id="audit-modal-title">Audit Trail Destination</h3>
+            <p>Audits store append-only, tamper-evident traceability records. Configuring an Audit folder ensures <strong>passed</strong>, <strong>failed</strong>, and <strong>errors</strong> subdirectories are created and kept strictly disjoint from your knowledge vault.</p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn approve"
+                onClick={() => {
+                  setAuditModalOpen(false);
+                  if (liveAvailable) void pickLiveFolder("audit");
+                }}
+              >
+                Select Audit Folder
+              </button>
+              <button type="button" className="btn ghost" onClick={() => setAuditModalOpen(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Contextual Modal: First-Time Database */}
+      {dbModalOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="db-modal-title">
+          <div className="modal-card">
+            <h3 id="db-modal-title">Vector Database Engine</h3>
+            <p>This feature requires a local vector database engine. LanceDB is the recommended isolated engine for high-efficiency semantic retrieval.</p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn approve"
+                onClick={() => {
+                  setDbModalOpen(false);
+                  if (liveAvailable) void pickLiveFolder("vector_db");
+                }}
+              >
+                Configure LanceDB Folder
+              </button>
+              <button type="button" className="btn ghost" onClick={() => setDbModalOpen(false)}>Not now</button>
+            </div>
+          </div>
+        </div>
+      )}
     </nav>
   );
 }

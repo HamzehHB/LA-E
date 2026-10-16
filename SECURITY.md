@@ -37,12 +37,12 @@ Facts verified against the repository at this checkpoint:
      overwrite and no authoritative-vault placement;
   2. **AuditWriter** (`knowledge/governance/audit/persistence.py`) appends
      append-only JSONL records under the config-declared `audit.root`,
-     partitioned into configurable `passed` / `failed` subroots (defaults
-     `<audit.root>/passed` and `<audit.root>/failed`; `passed/` holds
-      ONLY the executed-CREATE terminal record, `failed/` holds every
-      other terminal record including pre-execution checkpoints).
-      It never overwrites,
-     deletes, or renames existing records and never writes to vault, staging,
+     partitioned into configurable `passed` / `failed` / `errors` subroots (defaults
+     `<audit.root>/passed`, `<audit.root>/failed`, `<audit.root>/errors`; `passed/` holds
+     ONLY the executed-CREATE terminal record, `failed/` holds every
+     other terminal record including pre-execution checkpoints; `errors/` holds execution faults).
+     Directory creation (`ensure_directories`) uses `os.makedirs(..., exist_ok=True)` strictly inside `persistence.py`.
+     It never overwrites, deletes, or renames existing records and never writes to vault, staging,
      index, or any other root. Credential-like keys are stripped recursively
      before persistence. When an audit root is configured, the required
      pre-execution audit append must succeed before staging execution;
@@ -50,8 +50,10 @@ Facts verified against the repository at this checkpoint:
      under an explicitly supplied, isolated vector root (never the production
      vector database, never vault/staging/audit). Indexing is explicit
      operator action only — no watcher and no background reindex.
-  Current executable action scope is
-  `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` — everything else is future work.
+  Local YAML configuration persistence (`Config/*.local.yaml`) is executed strictly
+  in `Config/settings.py` (outside the `src/` tree), preserving the static AST invariant
+  that no filesystem mutation operations exist in application logic outside `executor.py` and `persistence.py`.
+  Current executable action scope is `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` — everything else is future work.
 * Private configuration and private documents are physically outside the
   tracked tree: `Config/paths.local.yaml`, `Config/llm.local.yaml`,
   `.project/`, `.clinerules/`,

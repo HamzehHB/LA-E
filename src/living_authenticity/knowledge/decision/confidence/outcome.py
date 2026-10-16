@@ -44,6 +44,7 @@ class ConfidenceAssessment:
     query_position: int
     proposal_action: str = ""
     level: str = "insufficient_evidence"
+    score: float = 0.0
     strategy: str = ""
     basis: str = ""
     uncertainties: tuple = field(default_factory=tuple)
@@ -56,6 +57,15 @@ class ConfidenceAssessment:
         """True only for the conservative sufficiently_supported level."""
         return self.level == "sufficiently_supported"
 
+    @property
+    def score_band(self) -> str:
+        """Mapping per Knowledge-Schema.yaml §16: low, moderate, high."""
+        if self.score >= 0.80:
+            return "high"
+        if self.score >= 0.60:
+            return "moderate"
+        return "low"
+
     def __post_init__(self) -> None:
         """Enforce conservative invariants on direct construction.
 
@@ -66,5 +76,11 @@ class ConfidenceAssessment:
         """
         if self.level not in CONFIDENCE_LEVELS:
             object.__setattr__(self, "level", "insufficient_evidence")
+        try:
+            s = float(self.score)
+        except (TypeError, ValueError):
+            s = 0.0
+        s = max(0.0, min(1.0, round(s, 2)))
+        object.__setattr__(self, "score", s)
         object.__setattr__(self, "is_authoritative", False)
         object.__setattr__(self, "requires_human_review", True)
