@@ -237,6 +237,19 @@ class Launcher:
             candidate = Path(bge_m3.strip())
             if candidate.exists() and not candidate.is_symlink():
                 self._session_destinations["embedding_model"] = str(candidate)
+        try:
+            from Config.settings import load_languages
+            langs = load_languages()
+            lang_sec = langs.get("language", {})
+            if isinstance(lang_sec, dict):
+                if lang_sec.get("app") in LANGUAGE_MODES:
+                    self._app_language = lang_sec["app"]
+                if lang_sec.get("staging") in LANGUAGE_MODES:
+                    self._staging_language = lang_sec["staging"]
+                if lang_sec.get("audit") in LANGUAGE_MODES:
+                    self._audit_language = lang_sec["audit"]
+        except Exception:
+            pass
 
     # ---- token / auth -------------------------------------------------
 
@@ -520,10 +533,14 @@ class Launcher:
                                        retrieval_mode=retrieval_mode,
                                        staging_language=staging_language,
                                        audit_language=audit_language)
+            summary = self._report_summary(report)
             with self._lock:
-                self._reports[run_id] = self._report_summary(report)
+                self._reports[run_id] = summary
+            if summary.get("audit_warning"):
+                self._sink({"kind": "warning", "stage": "audit",
+                            "message": summary["audit_warning"]})
             self._sink({"kind": "run_completed", "stage": "",
-                        "message": "run finished"})
+                        "message": "run finished" + (" (with audit warnings)" if summary.get("audit_warning") else "")})
         except Exception as exc:  # bounded; never leaks a raw traceback
             with self._lock:
                 self._reports[run_id] = {"run_id": run_id,
@@ -576,6 +593,14 @@ class Launcher:
     @staticmethod
     def _report_summary(report):
         units = list(getattr(report, "units", ()))
+        receipts = list(getattr(report, "audit_receipts", ()))
+        failed_receipts = [r for r in receipts if not r.get("persisted", True)]
+        audit_warning = ""
+        if failed_receipts:
+            audit_warning = (
+                f"Staging artifact created, but {len(failed_receipts)} audit record(s) "
+                f"failed to persist to disk: {failed_receipts[0].get('reason', 'persistence error')}"
+            )
         return {
             "run_id": "",
             "accepted": bool(getattr(report, "accepted", False)),
@@ -586,6 +611,8 @@ class Launcher:
             "held": sum(
                 1 for u in units
                 if not getattr(u, "execution_executed", False)),
+            "audit_persisted": len(failed_receipts) == 0,
+            "audit_warning": audit_warning,
         }
 
     def run_status(self, run_id):
@@ -855,6 +882,89 @@ class Launcher:
             paired_audits.append(audit_slot)
             paired_staging.append(staging_slot)
 
+        # Check for unreconciled staging artifacts (e.g. terminal audit write failure)
+        if staging_root and Path(staging_root).is_dir():
+            referenced = {item.get("artifact_reference") for item in selected_audits if item.get("artifact_reference")}
+            try:
+                for sf in sorted(Path(staging_root).glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+                    if sf.name not in referenced:
+                        try:
+                            with sf.open("r", encoding="utf-8") as h:
+                                lines = [h.readline() for _ in range(5)]
+                                orphan_excerpt = "".join(lines).strip()[:300]
+                        except OSError:
+                            orphan_excerpt = ""
+                        stat = sf.stat()
+                        from datetime import datetime, timezone
+                        ts = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
+                        stem = sf.stem.strip()
+                        is_proposal_hash = len(stem) == 64 and all(c in "0123456789abcdefABCDEF" for c in stem)
+                        if is_proposal_hash:
+                            orphan_id = f"staged-{stem[:12]}"
+                            paired_staging.append({
+                                "record_id": orphan_id,
+                                "run_id": "",
+                                "proposal_hash": stem,
+                                "timestamp": ts,
+                                "storage_category": "staging_unreconciled",
+                                "outcome": "staged_audit_pending",
+                                "artifact_reference": sf.name,
+                                "artifact_path": str(sf),
+                                "staging_available": True,
+                                "title": f"Staged Artifact (Audit Pending Persistence): {sf.name}",
+                                "excerpt": orphan_excerpt or "Staging artifact exists on disk; terminal audit record is pending persistence.",
+                            })
+                            paired_audits.append({
+                                "record_id": orphan_id,
+                                "run_id": "",
+                                "proposal_hash": stem,
+                                "timestamp": ts,
+                                "storage_category": "audit_pending",
+                                "outcome": "staged_audit_pending",
+                                "artifact_reference": sf.name,
+                                "artifact_path": str(sf),
+                                "staging_available": True,
+                                "proposal_action": "CREATE",
+                                "record_digest": stem[:16],
+                                "digest": stem[:16],
+                                "title": f"Staged Artifact (Audit Pending Persistence): {sf.name}",
+                                "summary": "Staging artifact was created on disk, but terminal audit record persistence did not complete.",
+                            })
+                        else:
+                            unlinked_id = f"unlinked-{stem[:12]}"
+                            file_digest = hashlib.sha256(sf.name.encode("utf-8")).hexdigest()[:16]
+                            paired_staging.append({
+                                "record_id": unlinked_id,
+                                "run_id": "",
+                                "proposal_hash": "",
+                                "timestamp": ts,
+                                "storage_category": "staging_unlinked",
+                                "outcome": "staging_unlinked",
+                                "artifact_reference": sf.name,
+                                "artifact_path": str(sf),
+                                "staging_available": True,
+                                "title": f"Unlinked Staging File: {sf.name}",
+                                "excerpt": orphan_excerpt or f"Unlinked file in staging root: {sf.name}",
+                            })
+                            paired_audits.append({
+                                "record_id": unlinked_id,
+                                "run_id": "",
+                                "proposal_hash": "",
+                                "timestamp": ts,
+                                "storage_category": "staging_unlinked",
+                                "outcome": "staging_unlinked",
+                                "artifact_reference": sf.name,
+                                "artifact_path": str(sf),
+                                "staging_available": True,
+                                "proposal_action": "UNKNOWN",
+                                "record_digest": file_digest,
+                                "digest": file_digest,
+                                "title": f"Unlinked Staging File: {sf.name}",
+                                "summary": f"File {sf.name} was found in the staging directory without a corresponding audit trail record or proposal hash.",
+                            })
+            except Exception:
+                pass
+
         return {"audits": paired_audits,
                 "staging": paired_staging}
 
@@ -1034,16 +1144,16 @@ class Launcher:
                 self._audit_language = updates["audit_language"]
 
         loc_updates = {}
-        if "app_language" in updates:
-            loc_updates["interface"] = updates["app_language"]
-        if "staging_language" in updates:
-            loc_updates.setdefault("content", {})["staging"] = updates["staging_language"]
-        if "audit_language" in updates:
-            loc_updates.setdefault("content", {})["audit"] = updates["audit_language"]
+        if "app_language" in updates and updates["app_language"] in LANGUAGE_MODES:
+            loc_updates["app"] = updates["app_language"]
+        if "staging_language" in updates and updates["staging_language"] in LANGUAGE_MODES:
+            loc_updates["staging"] = updates["staging_language"]
+        if "audit_language" in updates and updates["audit_language"] in LANGUAGE_MODES:
+            loc_updates["audit"] = updates["audit_language"]
         if loc_updates:
             try:
                 from Config.settings import save_localization_local
-                save_localization_local(loc_updates)
+                save_localization_local({"language": loc_updates})
             except Exception:
                 pass
 
@@ -1113,9 +1223,15 @@ class Launcher:
             translations_fa_to_en = {v: k for k, v in translations_en_to_fa.items()}
 
             if target_lang == "fa":
-                translated = translations_en_to_fa.get(text.strip(), f"«{text.strip()}» (ترجمه‌شده به فارسی)")
+                translated = translations_en_to_fa.get(
+                    text.strip(),
+                    f"«{text.strip()}» (ترجمه خودکار در دسترس نیست — مدل زبانی متصل نیست)",
+                )
             else:
-                translated = translations_fa_to_en.get(text.strip(), f"{text.strip()} (translated to English)")
+                translated = translations_fa_to_en.get(
+                    text.strip(),
+                    f"{text.strip()} (translation unavailable — LLM not connected)",
+                )
 
         return {"translated_text": translated, "target_lang": target_lang}
 

@@ -105,8 +105,10 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                             authorized_audit_passed="",
                             authorized_audit_failed="",
                             run_id: str = "",
-                             should_cancel=None,
-                            event_sink=None) -> IntegrationRunReport:
+                            should_cancel=None,
+                            event_sink=None,
+                            staging_language: str = "en",
+                            audit_language: str = "en") -> IntegrationRunReport:
     """Run one bounded local-integration pass; return an in-memory report.
 
     Three explicit input shapes, one governance path:
@@ -203,6 +205,10 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
             pass
     emit({"kind": "run_started", "stage": "",
           "message": "bounded integration run started"})
+    if staging_language != "en" or audit_language != "en":
+        emit({"kind": "status", "stage": "localization",
+              "message": f"requested languages: staging={staging_language} audit={audit_language}; "
+                         "content language follows source knowledge"})
     mode_value = operating_mode if isinstance(operating_mode, str) else ""
     audit_receipts: list = []
     pipe = pipeline if pipeline is not None else EvidenceFirstPipeline()
@@ -292,6 +298,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
             files_processed=processed, files_skipped=0,
             accepted=True, units=tuple(entries), audits=tuple(audits),
             details=tuple(details), audit_receipts=tuple(audit_receipts),
+            staging_language=staging_language,
+            audit_language=audit_language,
         )
 
     # Default: scan source_root
@@ -342,4 +350,6 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
         files_processed=processed, files_skipped=skipped,
         accepted=True, units=tuple(entries), audits=tuple(audits),
         details=tuple(details), audit_receipts=tuple(audit_receipts),
+        staging_language=staging_language,
+        audit_language=audit_language,
     )

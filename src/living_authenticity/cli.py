@@ -158,6 +158,16 @@ def main(argv=None) -> int:
     _configure_unicode_output()
     parser = build_parser()
     args = parser.parse_args(argv)
+    valid_langs = ("", "en", "fa")
+    if args.app_language.strip().lower() not in valid_langs:
+        print(f"error: --app-language must be 'en' or 'fa', got {args.app_language!r}")
+        return 2
+    if args.staging_language.strip().lower() not in valid_langs:
+        print(f"error: --staging-language must be 'en' or 'fa', got {args.staging_language!r}")
+        return 2
+    if args.audit_language.strip().lower() not in valid_langs:
+        print(f"error: --audit-language must be 'en' or 'fa', got {args.audit_language!r}")
+        return 2
     if not isinstance(args.max_files, int) or isinstance(
             args.max_files, bool) or args.max_files < 1:
         print("error: --max-files must be a positive integer")
@@ -177,6 +187,15 @@ def main(argv=None) -> int:
     if args.input_file.strip() and args.text.strip():
         print("error: --input-file and --text are mutually exclusive")
         return 2
+
+    try:
+        from Config.settings import load_languages
+        configured_langs = load_languages().get("language", {})
+    except Exception:
+        configured_langs = {}
+    app_lang = args.app_language.strip().lower() or configured_langs.get("app", "en")
+    staging_lang = args.staging_language.strip().lower() or configured_langs.get("staging", "en")
+    audit_lang = args.audit_language.strip().lower() or configured_langs.get("audit", "en")
 
     paths = load_paths()
     try:
@@ -232,6 +251,8 @@ def main(argv=None) -> int:
         "" if not core_source else " (" + core_origin + ")"))
     print("retrieval: " + ("bge-m3 + isolated lancedb" if args.embed
                            else "token overlap"))
+    print("languages: app=" + app_lang + ", staging=" + staging_lang
+          + ", audit=" + audit_lang)
     if args.embed:
         print("vector store: " + args.vector_db)
         print("authorized staging: " + (authorized or "(none declared)"))
@@ -454,6 +475,8 @@ def main(argv=None) -> int:
             authorized_audit_root=authorized_audit,
             authorized_audit_passed=audit_passed_arg,
             authorized_audit_failed=audit_failed_arg,
+            staging_language=staging_lang,
+            audit_language=audit_lang,
         )
     elif args.input_file.strip():
         from pathlib import Path as _Path
@@ -481,6 +504,8 @@ def main(argv=None) -> int:
             authorized_audit_root=authorized_audit,
             authorized_audit_passed=audit_passed_arg,
             authorized_audit_failed=audit_failed_arg,
+            staging_language=staging_lang,
+            audit_language=audit_lang,
         )
     else:
         authorized_audit = resolve_authorized_audit_root(paths)
@@ -499,6 +524,8 @@ def main(argv=None) -> int:
             authorized_audit_root=authorized_audit,
             authorized_audit_passed=audit_passed_arg,
             authorized_audit_failed=audit_failed_arg,
+            staging_language=staging_lang,
+            audit_language=audit_lang,
         )
     if not report.accepted:
         print("run rejected: " + report.rejection_reason)

@@ -297,7 +297,7 @@ _LANGUAGES_SUPPORTED = ("en", "fa")
 _LANGUAGES_DEFAULTS = {"app": "en", "staging": "en", "audit": "en"}
 
 
-def load_languages(config_dir: Path | str = CONFIG_DIR) -> dict:
+def load_languages(config_dir: Path | str | None = None) -> dict:
     """Load and validate the three independent language domains.
 
     Follows the same contract as :func:`load_llm`: the committed
@@ -306,6 +306,8 @@ def load_languages(config_dir: Path | str = CONFIG_DIR) -> dict:
     independently. Only ``en``/``fa`` are accepted; anything else raises
     ``ConfigError``. The three domains never collapse to one value.
     """
+    if config_dir is None:
+        config_dir = CONFIG_DIR
     config_dir = Path(config_dir)
     source = config_dir / LOCALIZATION_EXAMPLE_FILE
     data = _load_yaml(source)
@@ -333,8 +335,10 @@ def load_languages(config_dir: Path | str = CONFIG_DIR) -> dict:
     return {"language": result}
 
 
-def save_paths_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
+def save_paths_local(updates: dict, config_dir: Path | str | None = None) -> dict:
     """Save updates to paths.local.yaml and reload PATHS."""
+    if config_dir is None:
+        config_dir = CONFIG_DIR
     config_dir = Path(config_dir)
     target = config_dir / PATHS_LOCAL_FILE
     existing = _load_yaml(target) if target.is_file() else {}
@@ -346,8 +350,10 @@ def save_paths_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict
     return PATHS
 
 
-def save_llm_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
+def save_llm_local(updates: dict, config_dir: Path | str | None = None) -> dict:
     """Save updates to llm.local.yaml and reload."""
+    if config_dir is None:
+        config_dir = CONFIG_DIR
     config_dir = Path(config_dir)
     target = config_dir / LLM_LOCAL_FILE
     existing = _load_yaml(target) if target.is_file() else {}
@@ -360,8 +366,10 @@ def save_llm_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
     return load_llm(config_dir)
 
 
-def save_localization_local(updates: dict, config_dir: Path | str = CONFIG_DIR) -> dict:
+def save_localization_local(updates: dict, config_dir: Path | str | None = None) -> dict:
     """Save updates to localization.local.yaml and reload LANGUAGES."""
+    if config_dir is None:
+        config_dir = CONFIG_DIR
     config_dir = Path(config_dir)
     target = config_dir / LOCALIZATION_LOCAL_FILE
     existing = _load_yaml(target) if target.is_file() else {}

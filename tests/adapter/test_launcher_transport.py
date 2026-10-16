@@ -31,6 +31,7 @@ def _request(server, method, path, body=None, token=None,
              headers=None, origin=None, raw_length=None):
     conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=15)
     hdrs = dict(headers or {})
+    hdrs.setdefault("Connection", "close")
     if token is not None:
         hdrs[TOKEN_HEADER] = token
     if origin is not None:
@@ -454,6 +455,7 @@ def test_cancelled_run_does_not_execute(tmp_path):
     assert any(r.get("storage_category") == "errors" for r in records)
 
 
+def test_run_scoped_events_attribution():
     """Run-scoped kinds inherit the active run_id; unknown kinds never do.
 
     Prevents SSE attribution of events that do not describe the current
@@ -544,3 +546,216 @@ def test_execute_run_records_requested_languages_without_translation(tmp_path):
     msg = loc[-1]["message"]
     assert "staging=fa" in msg and "audit=en" in msg
     assert "no translation provider" in msg
+
+
+def test_post_config_updates_localization_and_loads(tmp_path, monkeypatch):
+    """POST /api/config persists language schema correctly and updates settings."""
+    import Config.settings as settings
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    example = config_dir / "localization.example.yaml"
+    example.write_text(
+        "language:\n  app: en\n  staging: en\n  audit: en\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(settings, "LOCALIZATION_EXAMPLE_FILE", "localization.example.yaml")
+    monkeypatch.setattr(settings, "LOCALIZATION_LOCAL_FILE", "localization.local.yaml")
+
+    launcher, server = _server()
+    try:
+        status, data = _request(
+            server, "POST", "/api/config",
+            body={"app_language": "fa", "staging_language": "fa", "audit_language": "en"},
+            token=launcher.token,
+        )
+        assert status == 200
+        res = json.loads(data)
+        assert res["success"] is True
+        assert res["modes"]["app_language"] == "fa"
+        assert res["modes"]["staging_language"] == "fa"
+        assert res["modes"]["audit_language"] == "en"
+
+        # Verify that settings.load_languages() successfully loads the persisted updates
+        loaded = settings.load_languages(config_dir)
+        assert loaded["language"]["app"] == "fa"
+        assert loaded["language"]["staging"] == "fa"
+        assert loaded["language"]["audit"] == "en"
+    finally:
+        server.shutdown()
+
+
+def test_run_thread_handles_terminal_audit_persistence_failure():
+    """When staging succeeds but terminal audit fails, audit_persisted is False and warning is emitted."""
+    from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+
+    launcher = _launcher()
+    failed_receipt = {
+        "record_id": "rec-01",
+        "persisted": False,
+        "storage_path": "",
+        "reason": "Disk full during audit write",
+    }
+    fake_report = IntegrationRunReport(
+        accepted=True,
+        files_seen=1,
+        files_processed=1,
+        audit_receipts=(failed_receipt,),
+    )
+
+    summary = launcher._report_summary(fake_report)
+    assert summary["audit_persisted"] is False
+    assert "Disk full" in summary["audit_warning"]
+
+    # Verify _run_thread emits warning event
+    import src.living_authenticity.knowledge.integration as integration
+    old_run = integration.run_bounded_integration
+    integration.run_bounded_integration = lambda *a, **kw: fake_report
+    try:
+        launcher._run_thread("run-partial-01", "some text", "examples")
+    finally:
+        integration.run_bounded_integration = old_run
+
+    warnings = [e for e in launcher.events.since(0) if e.get("kind") == "warning"]
+    assert len(warnings) >= 1
+    assert "failed to persist to disk" in warnings[0]["message"].lower()
+
+
+def test_journals_reconciles_orphaned_staging_file(tmp_path):
+    """Distinguish genuine proposal hash orphans from unlinked pre-existing markdown files."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    (audit / "passed").mkdir()
+    (audit / "failed").mkdir()
+
+    # 1. Genuine proposal hash artifact (64-hex chars)
+    prop_hash = "a" * 64
+    staged_artifact = staging / f"{prop_hash}.md"
+    staged_artifact.write_text("# Proposal Note\nContent", encoding="utf-8")
+
+    # 2. Unlinked pre-existing or manual file
+    unlinked_file = staging / "manual_notes.md"
+    unlinked_file.write_text("# Manual Notes\nPre-existing content", encoding="utf-8")
+
+    launcher = _launcher(paths={
+        "staging": {"root": str(staging)},
+        "audit": {"root": str(audit), "passed": str(audit / "passed"), "failed": str(audit / "failed")},
+    })
+
+    j = launcher.journals()
+    audits = j["audits"]
+    staging_items = j["staging"]
+
+    pending = [a for a in audits if a["outcome"] == "staged_audit_pending"]
+    assert len(pending) == 1
+    assert f"{prop_hash}.md" in pending[0]["title"]
+    assert pending[0]["staging_available"] is True
+    assert pending[0]["proposal_action"] == "CREATE"
+
+    unlinked = [a for a in audits if a["outcome"] == "staging_unlinked"]
+    assert len(unlinked) == 1
+    assert "manual_notes.md" in unlinked[0]["title"]
+    assert unlinked[0]["proposal_action"] == "UNKNOWN"
+
+    staged_pending = [s for s in staging_items if s["outcome"] == "staged_audit_pending"]
+    assert len(staged_pending) == 1
+    assert staged_pending[0]["proposal_hash"] == prop_hash
+
+    staged_unlinked = [s for s in staging_items if s["outcome"] == "staging_unlinked"]
+    assert len(staged_unlinked) == 1
+    assert staged_unlinked[0]["artifact_reference"] == "manual_notes.md"
+
+    # Confirm neither file was deleted or altered
+    assert staged_artifact.exists()
+    assert unlinked_file.exists()
+
+
+def test_translate_text_honest_offline_fallback():
+    """Untranslated text when offline must honestly say model is not connected."""
+    launcher = _launcher()
+    result = launcher.translate_text("Unique unmapped term", target_lang="fa")
+    assert isinstance(result, dict)
+    translated = result.get("translated_text", "")
+    assert "مدل زبانی متصل نیست" in translated
+    assert "ترجمه خودکار در دسترس نیست" in translated
+    assert "Unique unmapped term" in translated
+
+
+def test_cancellation_validation_and_terminal_behavior(running):
+    """Cancellation validates run_id, handles active/completed states, and protects boundaries."""
+    launcher, server = running
+    from src.living_authenticity.adapter.app import AdapterError
+
+    # 1. Empty or invalid run_id raises validation_error
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.request_cancel("")
+    assert exc_info.value.kind == "validation_error"
+
+    # 2. Unknown or inactive run_id raises validation_error
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.request_cancel("unknown-run-999")
+    assert exc_info.value.kind == "validation_error"
+    assert "unknown or inactive" in exc_info.value.message
+
+    # 3. HTTP endpoint rejects invalid/unknown run_id with 400
+    status, data = _request(server, "POST", "/api/cancel", body={"run_id": "nonexistent"}, token=launcher.token)
+    assert status == 400
+    payload = json.loads(data)
+    assert payload["error"]["kind"] == "validation_error"
+
+    # 4. Active run cancellation sets flag
+    launcher._active_run_id = "test-active-run"
+    try:
+        res = launcher.request_cancel("test-active-run")
+        assert res["status"] == "cancel_requested"
+        assert launcher._cancelled("test-active-run") is True
+    finally:
+        launcher._active_run_id = ""
+        launcher._cancel_flags.clear()
+
+    # 5. Already completed run reports already_completed
+    launcher._reports["completed-run-1"] = {"run_id": "completed-run-1", "accepted": True}
+    res_completed = launcher.request_cancel("completed-run-1")
+    assert res_completed["status"] == "already_completed"
+    assert res_completed["run_id"] == "completed-run-1"
+
+
+def test_reveal_folder_security_and_exclusion(running, tmp_path):
+    """Folder inspection rejects directory traversal and excludes hidden files."""
+    launcher, server = running
+
+    # 1. Invalid purpose or traversal is rejected by /api/folders/reveal
+    status, data = _request(
+        server, "POST", "/api/folders/reveal",
+        body={"purpose": "../../etc"},
+        token=launcher.token,
+    )
+    assert status == 400
+    payload = json.loads(data)
+    assert payload["error"]["kind"] == "validation_error"
+
+    # 2. Configured staging folder lists files while excluding hidden files
+    test_staging = tmp_path / "test_staging"
+    test_staging.mkdir()
+    (test_staging / "note1.md").write_text("# Note 1", encoding="utf-8")
+    (test_staging / ".hidden_secret").write_text("secret", encoding="utf-8")
+    (test_staging / "subfolder").mkdir()
+
+    launcher._session_destinations["staging"] = str(test_staging)
+
+    status, data = _request(
+        server, "POST", "/api/folders/reveal",
+        body={"purpose": "staging"},
+        token=launcher.token,
+    )
+    assert status == 200
+    res = json.loads(data)
+    assert res["purpose"] == "staging"
+    names = [item["name"] for item in res["items"]]
+    assert "note1.md" in names
+    assert "subfolder" in names
+    assert ".hidden_secret" not in names
+

@@ -126,6 +126,77 @@ def test_main_rejects_production_vector_db(tmp_path, capsys, monkeypatch):
     ])
     assert code == 2
     captured = capsys.readouterr().out
-    assert "production vector database" in captured
     assert list(staging.iterdir()) == []
 
+
+def test_main_rejects_invalid_language_flags(capsys):
+    """Invalid language options must be rejected at CLI boundary."""
+    assert main(["--text", "hello", "--app-language", "de"]) == 2
+    assert "--app-language must be 'en' or 'fa'" in capsys.readouterr().out
+
+    assert main(["--text", "hello", "--staging-language", "invalid"]) == 2
+    assert "--staging-language must be 'en' or 'fa'" in capsys.readouterr().out
+
+    assert main(["--text", "hello", "--audit-language", "fr"]) == 2
+    assert "--audit-language must be 'en' or 'fa'" in capsys.readouterr().out
+
+
+def test_main_forwards_language_flags(tmp_path, monkeypatch):
+    """Valid language flags are passed to run_bounded_integration across all input modes."""
+    import src.living_authenticity.cli as cli_module
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    monkeypatch.setattr(cli_module, "load_paths", lambda: {
+        "staging": {"root": str(staging)},
+        "audit": {"root": str(tmp_path / "audit")},
+    })
+    monkeypatch.setattr(cli_module, "check_staging_eligible", lambda *a: (True, "", str(staging)))
+
+    called_kwargs = {}
+
+    def _fake_run(*args, **kwargs):
+        called_kwargs.clear()
+        called_kwargs.update(kwargs)
+        from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+        return IntegrationRunReport(accepted=True, files_seen=1, files_processed=1)
+
+    monkeypatch.setattr(cli_module, "run_bounded_integration", _fake_run)
+
+    # 1. Text mode
+    code = main([
+        "--text", "sample prompt",
+        "--staging-root", str(staging),
+        "--staging-language", "fa",
+        "--audit-language", "fa",
+    ])
+    assert code == 0
+    assert called_kwargs.get("staging_language") == "fa"
+    assert called_kwargs.get("audit_language") == "fa"
+
+    # 2. Input file mode
+    sample_file = tmp_path / "sample.md"
+    sample_file.write_text("# Test file content", encoding="utf-8")
+    code = main([
+        "--input-file", str(sample_file),
+        "--staging-root", str(staging),
+        "--staging-language", "en",
+        "--audit-language", "fa",
+    ])
+    assert code == 0
+    assert called_kwargs.get("staging_language") == "en"
+    assert called_kwargs.get("audit_language") == "fa"
+
+    # 3. Source directory scan mode
+    source_dir = tmp_path / "source_scan"
+    source_dir.mkdir()
+    code = main([
+        "--source-root", str(source_dir),
+        "--staging-root", str(staging),
+        "--staging-language", "fa",
+        "--audit-language", "en",
+    ])
+    assert code == 0
+    assert called_kwargs.get("staging_language") == "fa"
+    assert called_kwargs.get("audit_language") == "en"

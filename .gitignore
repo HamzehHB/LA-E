@@ -16,6 +16,7 @@ Venv/
 
 # ---------- Local machine configuration ----------
 Config/paths.local.yaml
+Config/localization.local.yaml
 
 # ---------- Local LLM provider configuration (may hold credentials) ----------
 Config/llm.local.yaml

@@ -284,4 +284,11 @@ describe("gap-closure behaviors (§§1-4)", () => {
     const auditCards = container.querySelectorAll('section[aria-label="Recent Audit journal"] .journal-newspaper-card');
     expect(auditCards.length).toBeGreaterThanOrEqual(1);
   });
+
+  it("Cancel button renders in TopNav when run is active", () => {
+    localStorage.setItem("lae-welcomed", "1");
+    render(<App />);
+    // In idle fixture state, run is not active, so cancel button is not shown.
+    expect(screen.queryByRole("button", { name: /Cancel Run/ })).not.toBeInTheDocument();
+  });
 });

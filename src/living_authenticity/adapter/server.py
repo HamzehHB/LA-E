@@ -61,7 +61,11 @@ def _make_handler(launcher: Launcher):
         server_version = "LAE-Launcher/0.1"
         protocol_version = "HTTP/1.1"
 
-        # -- plumbing ---------------------------------------------------
+        def handle(self):
+            try:
+                super().handle()
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                pass
 
         def log_message(self, format, *args):  # never log tokens/requests
             return

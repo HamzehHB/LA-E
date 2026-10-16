@@ -9,12 +9,23 @@ function eventLine(kind: string, stage: string, message: string): string {
 }
 
 export function CurrentAudit() {
-  const { state } = useStore();
+  const { state, liveCancel, liveAvailable } = useStore();
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
   const [collapsed, setCollapsed] = useState(false);
   const [enlarged, setEnlarged] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const events = state.runEvents;
+
+  const runActive =
+    liveAvailable &&
+    Boolean(state.run.run_id) &&
+    !state.run.stopped &&
+    Boolean(state.run.status) &&
+    !state.run.status.toLowerCase().includes("finished") &&
+    !state.run.status.toLowerCase().includes("terminal") &&
+    !state.run.status.toLowerCase().includes("completed") &&
+    !state.run.status.toLowerCase().includes("already completed") &&
+    state.run.current_stage !== "completed";
 
   useEffect(() => {
     const el = logRef.current;
@@ -37,6 +48,16 @@ export function CurrentAudit() {
           <span className="badge ok">{state.run.current_stage || "active"}</span>
         </div>
         <div className="head-controls">
+          {runActive && (
+            <button
+              type="button"
+              className="btn small danger cancel-run-btn"
+              title={t("ui.run.cancelTitle")}
+              onClick={() => void liveCancel()}
+            >
+              ⏹ {t("ui.run.cancel")}
+            </button>
+          )}
           <button
             type="button"
             className="btn ghost small"

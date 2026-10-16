@@ -276,7 +276,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           id: a.record_id,
           timestamp: a.timestamp,
           statusKey:
-            a.outcome === "passed" ? "journal.passed" : "journal.failed",
+            a.outcome === "passed"
+              ? "journal.passed"
+              : a.outcome === "staged_audit_pending"
+                ? "journal.auditPending"
+                : a.outcome === "staging_unlinked"
+                  ? "journal.stagingOrphan"
+                  : "journal.failed",
           stagingNoteKey: a.staging_available
             ? "journal.stagingAvailable"
             : "journal.stagingNotCreated",
@@ -291,7 +297,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         recentStaging: data.staging.map((r) => ({
           id: r.record_id,
           timestamp: r.timestamp,
-          statusKey: r.staging_available ? "journal.staged" : "journal.failed",
+          statusKey:
+            r.outcome === "staged_audit_pending"
+              ? "journal.auditPending"
+              : r.outcome === "staging_unlinked"
+                ? "journal.stagingOrphan"
+                : r.staging_available
+                  ? "journal.staged"
+                  : "journal.failed",
           stagingNoteKey: null,
           runId: r.run_id || undefined,
           proposalHash: r.proposal_hash || undefined,
@@ -318,13 +331,36 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         setState((s) => ({ ...s, theme }));
       },
-      setAppLanguage: (appLanguage) => setState((s) => ({ ...s, appLanguage })),
-      setStagingLanguage: (stagingLanguage) =>
-        setState((s) => ({ ...s, stagingLanguage })),
-      setAuditLanguage: (auditLanguage) =>
-        setState((s) => ({ ...s, auditLanguage })),
-      setSourceMode: (sourceMode) => setState((s) => ({ ...s, sourceMode })),
-      setRetrievalType: (retrievalType) => setState((s) => ({ ...s, retrievalType })),
+      setAppLanguage: (appLanguage) => {
+        setState((s) => ({ ...s, appLanguage }));
+        if (live.available) {
+          void live.updateConfig({ app_language: appLanguage }).catch(() => {});
+        }
+      },
+      setStagingLanguage: (stagingLanguage) => {
+        setState((s) => ({ ...s, stagingLanguage }));
+        if (live.available) {
+          void live.updateConfig({ staging_language: stagingLanguage }).catch(() => {});
+        }
+      },
+      setAuditLanguage: (auditLanguage) => {
+        setState((s) => ({ ...s, auditLanguage }));
+        if (live.available) {
+          void live.updateConfig({ audit_language: auditLanguage }).catch(() => {});
+        }
+      },
+      setSourceMode: (sourceMode) => {
+        setState((s) => ({ ...s, sourceMode }));
+        if (live.available) {
+          void live.updateConfig({ source_mode: sourceMode === "vault" ? "personal_vault" : "examples" }).catch(() => {});
+        }
+      },
+      setRetrievalType: (retrievalType) => {
+        setState((s) => ({ ...s, retrievalType }));
+        if (live.available) {
+          void live.updateConfig({ retrieval_mode: retrievalType }).catch(() => {});
+        }
+      },
       setLlmMode: (llmMode) => setState((s) => ({ ...s, llmMode })),
       // Mock-only transitions, clearly prefixed.
       mockApprove: () =>

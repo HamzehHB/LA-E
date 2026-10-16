@@ -111,6 +111,8 @@ class IntegrationRunReport:
     audits: tuple = field(default_factory=tuple)
     details: tuple = field(default_factory=tuple)
     audit_receipts: tuple = field(default_factory=tuple)
+    staging_language: str = "en"
+    audit_language: str = "en"
     is_authoritative: bool = False
     requires_human_review: bool = True
 

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useStore } from "../state/store";
 import { translate } from "../i18n/resources";
+import type { FolderPurpose } from "../contracts/transport";
 
 function validityKey(v: string): string {
   switch (v) {
@@ -46,6 +47,8 @@ export function TopNav() {
     liveConnected,
     pickLiveFolder,
     liveIndexVault,
+    liveCancel,
+    liveRevealFolder,
   } = useStore();
 
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
@@ -58,6 +61,11 @@ export function TopNav() {
   const [auditModalOpen, setAuditModalOpen] = useState(false);
   const [dbModalOpen, setDbModalOpen] = useState(false);
   const [indexingMsg, setIndexingMsg] = useState("");
+  const [inspectModal, setInspectModal] = useState<{
+    purpose: FolderPurpose;
+    title: string;
+    items: Array<{ name: string; is_dir: boolean; size: number; modified: string }>;
+  } | null>(null);
 
   const semanticReady =
     state.resources.vector_db.validity === "configured_valid" &&
@@ -66,6 +74,23 @@ export function TopNav() {
   const vaultValid = state.resources.vault.validity === "configured_valid";
   const stagingValid = state.resources.staging.validity === "configured_valid";
   const auditValid = state.resources.audit.validity === "configured_valid";
+
+  const runActive =
+    liveAvailable &&
+    Boolean(state.run.run_id) &&
+    !state.run.stopped &&
+    Boolean(state.run.status) &&
+    !state.run.status.toLowerCase().includes("finished") &&
+    !state.run.status.toLowerCase().includes("terminal") &&
+    !state.run.status.toLowerCase().includes("completed") &&
+    !state.run.status.toLowerCase().includes("already completed") &&
+    state.run.current_stage !== "completed";
+
+  const inspectFolder = async (purpose: FolderPurpose, title: string) => {
+    if (!liveAvailable) return;
+    const items = await liveRevealFolder(purpose);
+    setInspectModal({ purpose, title, items });
+  };
 
   // Vault / Test Mode Click Handler
   const handleSourceTabClick = () => {
@@ -91,6 +116,8 @@ export function TopNav() {
     if (!hasSeen) {
       localStorage.setItem("lae-first-staging", "1");
       setStagingModalOpen(true);
+    } else if (stagingValid && liveAvailable) {
+      void inspectFolder("staging", t("ui.nav.staging"));
     } else if (liveAvailable) {
       void pickLiveFolder("staging");
     }
@@ -102,6 +129,8 @@ export function TopNav() {
     if (!hasSeen) {
       localStorage.setItem("lae-first-audit", "1");
       setAuditModalOpen(true);
+    } else if (auditValid && liveAvailable) {
+      void inspectFolder("audit", t("ui.nav.audit"));
     } else if (liveAvailable) {
       void pickLiveFolder("audit");
     }
@@ -221,6 +250,17 @@ export function TopNav() {
               : t("ui.live.demo")}
           </span>
         </div>
+
+        {runActive && (
+          <button
+            type="button"
+            className="btn small danger cancel-run-btn"
+            title={t("ui.run.cancelTitle")}
+            onClick={() => void liveCancel()}
+          >
+            ⏹ {t("ui.run.cancel")}
+          </button>
+        )}
       </div>
 
       {/* 2. Center-Left Cluster: The 3 Status Pill Tabs */}
@@ -491,6 +531,18 @@ export function TopNav() {
             <h3 id="staging-modal-title">Staging Destination</h3>
             <p>Selecting a Staging folder provides a safe, isolated, and controlled destination for approved note outputs before they ever touch your authoritative vault.</p>
             <div className="modal-actions">
+              {stagingValid && liveAvailable && (
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => {
+                    setStagingModalOpen(false);
+                    void inspectFolder("staging", t("ui.nav.staging"));
+                  }}
+                >
+                  {t("ui.nav.inspectFolder")}
+                </button>
+              )}
               <button
                 type="button"
                 className="btn approve"
@@ -514,6 +566,18 @@ export function TopNav() {
             <h3 id="audit-modal-title">Audit Trail Destination</h3>
             <p>Audits store append-only, tamper-evident traceability records. Configuring an Audit folder ensures <strong>passed</strong>, <strong>failed</strong>, and <strong>errors</strong> subdirectories are created and kept strictly disjoint from your knowledge vault.</p>
             <div className="modal-actions">
+              {auditValid && liveAvailable && (
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => {
+                    setAuditModalOpen(false);
+                    void inspectFolder("audit", t("ui.nav.audit"));
+                  }}
+                >
+                  {t("ui.nav.inspectFolder")}
+                </button>
+              )}
               <button
                 type="button"
                 className="btn approve"
@@ -548,6 +612,45 @@ export function TopNav() {
                 Configure LanceDB Folder
               </button>
               <button type="button" className="btn ghost" onClick={() => setDbModalOpen(false)}>Not now</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Inspect Folder Modal */}
+      {inspectModal && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="inspect-modal-title">
+          <div className="modal-card" style={{ maxWidth: "600px" }}>
+            <h3 id="inspect-modal-title">{inspectModal.title} — {t("ui.nav.folderItems")}</h3>
+            <div style={{ maxHeight: "300px", overflowY: "auto", margin: "1rem 0", textAlign: "left" }}>
+              {inspectModal.items.length === 0 ? (
+                <p>{t("ui.nav.noItems")}</p>
+              ) : (
+                <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                  {inspectModal.items.map((item, idx) => (
+                    <li key={idx} style={{ padding: "0.25rem 0", borderBottom: "1px solid var(--border, #eee)", display: "flex", justifyContent: "space-between" }}>
+                      <span>{item.is_dir ? "📁 " : "📄 "}{item.name}</span>
+                      <span style={{ fontSize: "0.85em", opacity: 0.7 }}>
+                        {item.is_dir ? "" : `${item.size} B`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn approve"
+                onClick={() => {
+                  const p = inspectModal.purpose;
+                  setInspectModal(null);
+                  if (liveAvailable) void pickLiveFolder(p);
+                }}
+              >
+                Change Folder
+              </button>
+              <button type="button" className="btn ghost" onClick={() => setInspectModal(null)}>Close</button>
             </div>
           </div>
         </div>
