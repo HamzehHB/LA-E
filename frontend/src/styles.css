@@ -1198,7 +1198,8 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
 
 .welcome-card {
   width: 100%;
-  max-width: 620px;
+  max-width: 760px;
+  max-height: 90vh;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -1211,7 +1212,8 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
 
 .welcome-intro {
   color: var(--muted);
-  font-size: 0.88rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
   margin: 0;
 }
 
@@ -1219,6 +1221,61 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+}
+
+.welcome-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding-inline-end: 0.25rem;
+}
+
+.welcome-group {
+  background: var(--bg-subtle);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.welcome-group-title {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--ink);
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--line);
+  letter-spacing: 0.02em;
+}
+
+.welcome-group-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.65rem 1rem;
+  margin: 0;
+}
+
+.welcome-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.welcome-item dt {
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--accent);
+}
+
+.welcome-item dd {
+  margin: 0;
+  font-size: 0.77rem;
+  color: var(--muted);
+  line-height: 1.4;
 }
 
 .welcome-list {
@@ -1233,23 +1290,20 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
   border-radius: var(--radius-md);
 }
 
-.welcome-item dt {
-  font-weight: 700;
-  font-size: 0.82rem;
-  color: var(--ink);
-}
-
-.welcome-item dd {
-  margin: 0;
-  font-size: 0.76rem;
-  color: var(--muted);
-  line-height: 1.35;
-}
-
 .enter-btn {
   align-self: flex-end;
   padding: 0.5rem 1.25rem;
   font-size: 0.9rem;
+}
+
+@media (max-width: 640px) {
+  .welcome-card {
+    padding: 1rem;
+    max-height: 94vh;
+  }
+  .welcome-group-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Translate Affordance */

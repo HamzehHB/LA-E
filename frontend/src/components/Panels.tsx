@@ -554,19 +554,38 @@ export function Welcome() {
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
   if (state.welcomed) return null;
 
-  const sections: Array<[string, string]> = [
-    ["Vault / Test", t("ui.welcome.vaultTest")],
-    ["Staging", t("ui.welcome.staging")],
-    ["Audit", t("ui.welcome.audit")],
-    ["Database", t("ui.welcome.database")],
-    ["AI", t("ui.welcome.ai")],
-    ["Knowledge Language", t("ui.welcome.knowledgeLanguage")],
-    ["Current Audit", t("ui.welcome.currentAudit")],
-    ["Workflow", t("ui.welcome.workflow")],
-    ["Processing Result", t("ui.welcome.processingResult")],
-    ["Audit Journal", t("ui.welcome.auditJournal")],
-    ["Staging Journal", t("ui.welcome.stagingJournal")],
-    ["Composer", t("ui.welcome.composer")],
+  interface GuideItem {
+    id: string;
+    titleKey: Parameters<typeof translate>[1];
+    descKey: Parameters<typeof translate>[1];
+  }
+
+  interface GuideGroup {
+    id: string;
+    titleKey: Parameters<typeof translate>[1];
+    items: GuideItem[];
+  }
+
+  const groups: GuideGroup[] = [
+    {
+      id: "modes",
+      titleKey: "ui.welcome.group.modes",
+      items: [
+        { id: "test", titleKey: "ui.welcome.modeTest.title", descKey: "ui.welcome.modeTest.desc" },
+        { id: "vault", titleKey: "ui.welcome.modeVault.title", descKey: "ui.welcome.modeVault.desc" },
+      ],
+    },
+    {
+      id: "config",
+      titleKey: "ui.welcome.group.config",
+      items: [
+        { id: "staging", titleKey: "ui.welcome.staging.title", descKey: "ui.welcome.staging.desc" },
+        { id: "audit", titleKey: "ui.welcome.audit.title", descKey: "ui.welcome.audit.desc" },
+        { id: "database", titleKey: "ui.welcome.database.title", descKey: "ui.welcome.database.desc" },
+        { id: "ai", titleKey: "ui.welcome.ai.title", descKey: "ui.welcome.ai.desc" },
+        { id: "knowledgeLanguage", titleKey: "ui.welcome.knowledgeLanguage.title", descKey: "ui.welcome.knowledgeLanguage.desc" },
+      ],
+    },
   ];
 
   return (
@@ -610,14 +629,24 @@ export function Welcome() {
           </div>
         </div>
 
-        <dl className="welcome-list">
-          {sections.map(([name, desc]) => (
-            <div key={name} className="welcome-item">
-              <dt>{name}</dt>
-              <dd>{desc}</dd>
-            </div>
+        <div className="welcome-sections" tabIndex={0} role="region" aria-label={t("ui.welcome.title")}>
+          {groups.map((grp) => (
+            <section key={grp.id} className="welcome-group" aria-labelledby={`welcome-grp-${grp.id}`}>
+              <h3 id={`welcome-grp-${grp.id}`} className="welcome-group-title">
+                {t(grp.titleKey)}
+              </h3>
+              <dl className="welcome-group-grid">
+                {grp.items.map((item) => (
+                  <div key={item.id} className="welcome-item">
+                    <dt>{t(item.titleKey)}</dt>
+                    <dd>{t(item.descKey)}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
           ))}
-        </dl>
+        </div>
+
         <button type="button" className="btn approve enter-btn" onClick={setWelcomed}>
           {t("ui.welcome.enter")}
         </button>

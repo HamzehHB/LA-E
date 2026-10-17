@@ -163,10 +163,100 @@ describe("app shell", () => {
     const user = userEvent.setup();
     render(<App />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByText(/A local-first, human-controlled knowledge workspace/)).toBeInTheDocument();
+    expect(screen.getByText("A secure, private, researcher-controlled environment for advancing research.")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Enter LA-E" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(localStorage.getItem("lae-welcomed")).toBe("1");
+  });
+
+  it("Welcome guide renders retained groups (Environment Modes and Workspace Configuration) with vendor-neutral explanations", () => {
+    localStorage.removeItem("lae-welcomed");
+    render(<App />);
+    // Retained group headings
+    expect(screen.getByRole("heading", { level: 3, name: "Environment Modes" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: "Workspace Configuration" })).toBeInTheDocument();
+
+    // Removed non-essential sections are NOT present in the Welcome guide
+    expect(screen.queryByRole("heading", { level: 3, name: "Input & Governance Lifecycle" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { level: 3, name: "Historical Journals" })).not.toBeInTheDocument();
+
+    // Environment Modes: Test Mode & Vault Mode
+    expect(screen.getByText("Test Mode")).toBeInTheDocument();
+    expect(screen.getByText(/Operates exclusively on built-in synthetic examples/)).toBeInTheDocument();
+    expect(screen.getByText("Vault Mode")).toBeInTheDocument();
+    expect(screen.getByText(/Connects to your authentic personal knowledge repository/)).toBeInTheDocument();
+
+    // Workspace Configuration items
+    expect(screen.getByText("Staging Destination")).toBeInTheDocument();
+    expect(screen.getByText(/Isolated, controlled directory where approved proposal artifacts are safely staged/)).toBeInTheDocument();
+    expect(screen.getByText("Audit Storage")).toBeInTheDocument();
+    expect(screen.getByText(/Authoritative storage recording permanent, tamper-evident logs/)).toBeInTheDocument();
+    expect(screen.getByText("Vector Database")).toBeInTheDocument();
+    expect(screen.getByText("Local embedded vector store enabling semantic retrieval and similarity analysis over indexed knowledge.")).toBeInTheDocument();
+    // Verify vendor name LanceDB is NOT in the guide description
+    expect(screen.queryByText(/LanceDB/)).not.toBeInTheDocument();
+    expect(screen.getByText("AI Models")).toBeInTheDocument();
+    expect(screen.getByText("Local runtimes or configured cloud LLMs and embedding models.")).toBeInTheDocument();
+    expect(screen.queryByText(/always subject to human approval/)).not.toBeInTheDocument();
+    expect(screen.getByText("Knowledge Language")).toBeInTheDocument();
+    expect(screen.getByText(/Designated language for generated Audit and Staging content/)).toBeInTheDocument();
+  });
+
+  it("Welcome guide fully localizes to Persian without hardcoded English remaining, and restores on switch back", async () => {
+    localStorage.removeItem("lae-welcomed");
+    const user = userEvent.setup();
+    render(<App />);
+
+    // Switch language to Persian via Welcome language selector
+    await user.click(screen.getByRole("radio", { name: "فارسی" }));
+
+    // Persian tagline
+    expect(screen.getByText("محیطی امن، خصوصی و کاملاً تحت کنترل پژوهشگر برای توسعه و پیشبرد پژوهش.")).toBeInTheDocument();
+
+    // Persian group headings
+    expect(screen.getByRole("heading", { level: 3, name: "حالت‌های محیط پژوهش" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: "پیکربندی محیط کار" })).toBeInTheDocument();
+
+    // Persian item titles and explanations
+    expect(screen.getByText("حالت آزمون")).toBeInTheDocument();
+    expect(screen.getByText(/صرفاً با نمونه‌های ساختگی داخلی برای آزمایش کار می‌کند/)).toBeInTheDocument();
+    expect(screen.getByText("حالت مخزن")).toBeInTheDocument();
+    expect(screen.getByText(/برای تحلیل و نمایه‌سازی زنده، تحت محافظت دقیق مرزهای امنیتی/)).toBeInTheDocument();
+
+    expect(screen.getByText("مقصد بایگانی")).toBeInTheDocument();
+    expect(screen.getByText(/پوشه‌ای ایزوله و کنترل‌شده/)).toBeInTheDocument();
+    expect(screen.getByText("فضای نگهداری حسابرسی")).toBeInTheDocument();
+    expect(screen.getByText(/مخزن معتبر نگه‌دارنده گزارش‌های دائمی/)).toBeInTheDocument();
+    expect(screen.getByText("پایگاه داده برداری")).toBeInTheDocument();
+    expect(screen.getByText("پایگاه داده برداری تعبیه‌شده محلی برای بازیابی معنایی و تحلیل تشابه روی دانش نمایه‌شده.")).toBeInTheDocument();
+    expect(screen.getByText("مدل‌های هوش مصنوعی")).toBeInTheDocument();
+    expect(screen.getByText("محیط‌های اجرای محلی یا مدل‌های ابری پیکربندی‌شده و مدل‌های بردارساز.")).toBeInTheDocument();
+    expect(screen.getByText("زبان دانش")).toBeInTheDocument();
+
+    // Enter button localized
+    expect(screen.getByRole("button", { name: "ورود به LA-E" })).toBeInTheDocument();
+
+    // Ensure no hardcoded English headings or obsolete strings remain in the guide
+    expect(screen.queryByText("Environment Modes")).not.toBeInTheDocument();
+    expect(screen.queryByText("Vault / Test")).not.toBeInTheDocument();
+    expect(screen.queryByText("Workspace Configuration")).not.toBeInTheDocument();
+    expect(screen.queryByText("A secure, private, researcher-controlled environment for advancing research.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/گاوصندوق/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/آماده‌سازی/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/جاسازی/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/مشروط به تأیید نهایی انسان/)).not.toBeInTheDocument();
+
+    // Switch back to English
+    await user.click(screen.getByRole("radio", { name: "English" }));
+
+    // English restored
+    expect(screen.getByText("A secure, private, researcher-controlled environment for advancing research.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: "Environment Modes" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: "Workspace Configuration" })).toBeInTheDocument();
+    expect(screen.getByText("Test Mode")).toBeInTheDocument();
+    expect(screen.getByText("Vault Mode")).toBeInTheDocument();
+    expect(screen.getByText("Vector Database")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enter LA-E" })).toBeInTheDocument();
   });
 
   it("journals page forward/backward and View All is honest", async () => {
