@@ -477,7 +477,8 @@ class Launcher:
 
     def start_run(self, input_text, source_mode="personal_vault",
                   retrieval_mode="lexical", app_language="en",
-                  staging_language="en", audit_language="en"):
+                  staging_language="en", audit_language="en",
+                  source_type="chat_input", input_id=None):
         """Begin one bounded text-input run; returns immediately.
 
         Language fields are validated at the boundary and never silently
@@ -487,10 +488,14 @@ class Launcher:
         not translate generated content (no translation provider exists), so
         the effective output language is reported honestly on the run.
         """
-        if not isinstance(input_text, str) or not input_text.strip():
-            raise AdapterError("validation_error", "input text is required")
-        if len(input_text.encode("utf-8")) > MAX_TEXT_BYTES:
-            raise AdapterError("validation_error", "input text too large")
+        if not isinstance(input_text, str):
+            raise AdapterError(
+                "validation_error",
+                f"input_text must be a string, got {type(input_text).__name__}")
+        if not isinstance(source_type, str) or source_type not in ("chat_input",):
+            raise AdapterError(
+                "validation_error",
+                f"unsupported source_type '{source_type}': only 'chat_input' is currently accepted")
         if source_mode not in SOURCE_MODES:
             raise AdapterError(
                 "validation_error",
@@ -516,23 +521,223 @@ class Launcher:
         worker = threading.Thread(
             target=self._run_thread,
             args=(run_id, input_text, source_mode, retrieval_mode,
-                  staging_language, audit_language),
+                  staging_language, audit_language, source_type, input_id),
             daemon=True)
         worker.start()
         return {"run_id": run_id, "accepted": True, "reason": "",
                 "retrieval_mode": retrieval_mode,
                 "app_language": app_language,
                 "staging_language": staging_language,
-                "audit_language": audit_language}
+                "audit_language": audit_language,
+                "source_type": source_type}
 
     def _run_thread(self, run_id, input_text, mode_value,
                     retrieval_mode="lexical", staging_language="en",
-                    audit_language="en"):
+                    audit_language="en", source_type="chat_input",
+                    input_id=None):
+        from src.living_authenticity.knowledge.input.processor import (
+            process_input,
+            record_input_failure_audit,
+            InputEvaluationResult,
+            InputOutcome,
+        )
+        from src.living_authenticity.knowledge.governance.audit import AuditWriter
+        from src.living_authenticity.knowledge.integration.guard import (
+            resolve_authorized_audit_root,
+        )
+
         try:
-            report = self._execute_run(run_id, input_text, mode_value,
-                                       retrieval_mode=retrieval_mode,
-                                       staging_language=staging_language,
-                                       audit_language=audit_language)
+            self._sink({"kind": "run_started", "stage": "input",
+                        "message": "run initiated", "run_id": run_id})
+
+            if self._cancelled(run_id):
+                self._sink({"kind": "stopped", "stage": "input",
+                            "message": "run cancelled by user request",
+                            "run_id": run_id, "outcome": "STOPPED"})
+                self._sink({"kind": "run_rejected", "stage": "input",
+                            "message": "run cancelled before downstream processing",
+                            "run_id": run_id, "outcome": "STOPPED",
+                            "recovery_options": ["fix_input", "stop"]})
+                cancelled_result = InputEvaluationResult(
+                    outcome=InputOutcome.STOPPED,
+                    valid=False,
+                    can_proceed=False,
+                    input_id=input_id or "inp-cancelled",
+                    run_id=run_id,
+                    source_type=source_type,
+                    operating_mode=mode_value,
+                    validation_status="stopped",
+                    classification_category="cancellation",
+                    reason="run cancelled by user request",
+                    error_code="stopped_by_user",
+                    message_key="ui.recovery.stoppedTitle",
+                    recovery_options=("fix_input", "stop"),
+                )
+                session_audit = self._session_destinations.get("audit", "")
+                authorized_audit = (session_audit.strip() if isinstance(session_audit, str) else "")
+                if not authorized_audit:
+                    authorized_audit = resolve_authorized_audit_root(self.paths())
+                if authorized_audit and Path(authorized_audit).is_dir():
+                    writer = AuditWriter(authorized_audit)
+                    record_input_failure_audit(
+                        writer,
+                        run_id=run_id,
+                        validation_result=cancelled_result,
+                        operating_mode=mode_value,
+                        input_text=input_text,
+                    )
+                with self._lock:
+                    self._reports[run_id] = {
+                        "run_id": run_id,
+                        "accepted": False,
+                        "outcome": "STOPPED",
+                        "reason": "run cancelled by user",
+                        "processed": 0,
+                        "executed": 0,
+                        "held": 0,
+                        "terminal_outcome": "stopped_by_user",
+                    }
+                return
+
+            self._sink({"kind": "stage_started", "stage": "input",
+                        "message": "validating input and establishing provenance",
+                        "run_id": run_id})
+
+            input_result = process_input(
+                input_text,
+                source_type=source_type,
+                source_mode=mode_value,
+                input_id=input_id,
+                run_id=run_id,
+            )
+
+            prov = input_result.provenance
+            if not input_result.valid or prov is None:
+                reason = input_result.reason or "input validation failed"
+                outcome_str = input_result.outcome.value
+                terminal_outcome = (
+                    "input_clarification_required"
+                    if input_result.outcome == InputOutcome.NEEDS_CLARIFICATION
+                    else "input_validation_failed"
+                )
+
+                self._sink({
+                    "kind": "stopped",
+                    "stage": "input",
+                    "message": f"input validation failed: {reason}",
+                    "run_id": run_id,
+                    "error_code": input_result.error_code,
+                    "outcome": outcome_str,
+                })
+                self._sink({
+                    "kind": "run_rejected",
+                    "stage": "input",
+                    "message": f"input rejected: {reason}",
+                    "run_id": run_id,
+                    "error_code": input_result.error_code,
+                    "outcome": outcome_str,
+                    "recovery_options": list(input_result.recovery_options),
+                })
+
+                session_audit = self._session_destinations.get("audit", "")
+                authorized_audit = (session_audit.strip()
+                                    if isinstance(session_audit, str) else "")
+                if not authorized_audit:
+                    authorized_audit = resolve_authorized_audit_root(self.paths())
+                if authorized_audit:
+                    try:
+                        writer = AuditWriter(authorized_audit)
+                        record_input_failure_audit(
+                            writer,
+                            run_id=run_id,
+                            validation_result=input_result,
+                            operating_mode=mode_value,
+                            input_text=input_text,
+                        )
+                    except Exception:
+                        pass
+
+                with self._lock:
+                    self._reports[run_id] = {
+                        "run_id": run_id,
+                        "accepted": False,
+                        "outcome": outcome_str,
+                        "reason": reason,
+                        "error_code": input_result.error_code,
+                        "message_key": input_result.message_key,
+                        "recovery_options": list(input_result.recovery_options),
+                        "processed": 0,
+                        "executed": 0,
+                        "held": 0,
+                        "audit_persisted": True,
+                        "terminal_outcome": terminal_outcome,
+                    }
+                return
+
+            if self._cancelled(run_id):
+                self._sink({"kind": "stopped", "stage": "input",
+                            "message": "run cancelled by user after validation",
+                            "run_id": run_id, "outcome": "STOPPED"})
+                self._sink({"kind": "run_rejected", "stage": "input",
+                            "message": "run stopped by user",
+                            "run_id": run_id, "outcome": "STOPPED",
+                            "recovery_options": ["fix_input", "stop"]})
+                cancelled_result = InputEvaluationResult(
+                    outcome=InputOutcome.STOPPED,
+                    valid=False,
+                    can_proceed=False,
+                    input_id=prov.input_id,
+                    run_id=run_id,
+                    source_type=source_type,
+                    operating_mode=mode_value,
+                    content_hash=prov.input_hash,
+                    validation_status="stopped",
+                    classification_category="cancellation",
+                    reason="run cancelled by user after validation",
+                    error_code="stopped_by_user",
+                    message_key="ui.recovery.stoppedTitle",
+                    recovery_options=("fix_input", "stop"),
+                )
+                session_audit = self._session_destinations.get("audit", "")
+                authorized_audit = (session_audit.strip() if isinstance(session_audit, str) else "")
+                if not authorized_audit:
+                    authorized_audit = resolve_authorized_audit_root(self.paths())
+                if authorized_audit and Path(authorized_audit).is_dir():
+                    writer = AuditWriter(authorized_audit)
+                    record_input_failure_audit(
+                        writer,
+                        run_id=run_id,
+                        validation_result=cancelled_result,
+                        operating_mode=mode_value,
+                        input_text=input_text,
+                    )
+                with self._lock:
+                    self._reports[run_id] = {
+                        "run_id": run_id,
+                        "accepted": False,
+                        "outcome": "STOPPED",
+                        "reason": "run cancelled by user",
+                        "processed": 0,
+                        "executed": 0,
+                        "held": 0,
+                        "terminal_outcome": "stopped_by_user",
+                    }
+                return
+
+            self._sink({"kind": "stage_completed", "stage": "input",
+                        "message": f"input accepted (id={prov.input_id}, type={prov.resolved_type}, bytes={prov.byte_length})",
+                        "run_id": run_id,
+                        "input_id": prov.input_id,
+                        "input_hash": prov.input_hash,
+                        "outcome": "ACCEPTED"})
+
+            report = self._execute_run(
+                run_id, input_text, mode_value,
+                retrieval_mode=retrieval_mode,
+                staging_language=staging_language,
+                audit_language=audit_language,
+                input_provenance=prov,
+            )
             summary = self._report_summary(report)
             with self._lock:
                 self._reports[run_id] = summary
@@ -622,9 +827,117 @@ class Launcher:
             summary["active"] = run_id == self._active_run_id
         return summary
 
+    def _load_knowledge_corpus(self, mode_value, pipeline, paths, run_id=""):
+        """Load corpus units, core units, and optional vault context according to mode.
+
+        Test Mode ("examples"):
+        - Evaluates strictly against built-in synthetic examples:
+          `examples/bounded_local_integration/corpus` and `core`.
+        - NEVER reads, discovers, indexes, or touches the personal Vault.
+        - vault_context is None.
+
+        Vault Mode ("personal_vault"):
+        - Evaluates against the researcher's configured personal Obsidian Vault
+          (`session_destination("vault")` or `paths["obsidian"]["vault"]`).
+        - Ingests notes via `read_vault_units(vault_root, pipeline)`.
+        - Ingests Core notes via `resolve_vault_core_root(vault_root)` and `read_vault_units`.
+        - Provides informational bounded context via `read_vault_context(vault_root)`.
+        - If unconfigured or empty, reports honest status and runs against empty baseline.
+        """
+        from Config.settings import ROOT as REPOSITORY_ROOT
+        from src.living_authenticity.knowledge.integration.indexing import ingest_units
+
+        if mode_value == "examples":
+            examples_root = Path(REPOSITORY_ROOT) / "examples" / "bounded_local_integration"
+            corpus_dir = examples_root / "corpus"
+            core_dir = examples_root / "core"
+            corpus_units = []
+            core_units = []
+            if corpus_dir.is_dir():
+                try:
+                    corpus_units = ingest_units(str(corpus_dir), pipeline, max_files=50)
+                except Exception:
+                    corpus_units = []
+            if core_dir.is_dir():
+                try:
+                    core_units = ingest_units(str(core_dir), pipeline, max_files=50)
+                except Exception:
+                    core_units = []
+            self._sink({
+                "kind": "status",
+                "stage": "retrieval",
+                "run_id": run_id,
+                "message": (
+                    f"Test Mode: evaluated against synthetic examples "
+                    f"({len(corpus_units)} corpus unit(s), {len(core_units)} core unit(s))"
+                ),
+            })
+            return corpus_units, core_units, None
+
+        # Vault Mode ("personal_vault")
+        from src.living_authenticity.knowledge.vault.context import (
+            read_vault_units,
+            read_vault_context,
+            resolve_vault_core_root,
+        )
+        vault_root = self.session_destination("vault") or paths.get("obsidian", {}).get("vault", "")
+        if not vault_root or not Path(vault_root).is_dir():
+            self._sink({
+                "kind": "status",
+                "stage": "retrieval",
+                "run_id": run_id,
+                "message": "Vault Mode: Vault root is not configured or not a directory; evaluated against empty baseline corpus.",
+            })
+            self._sink({
+                "kind": "warning",
+                "stage": "retrieval",
+                "run_id": run_id,
+                "message": "Vault path is unconfigured or not found. Select your Vault folder via the top menu.",
+            })
+            return [], [], None
+
+        try:
+            vault_units, vault_files, vault_skipped = read_vault_units(vault_root, pipeline)
+        except Exception as exc:
+            self._sink({
+                "kind": "status",
+                "stage": "retrieval",
+                "run_id": run_id,
+                "message": f"Vault Mode: failed reading vault units ({exc}); evaluated against empty baseline.",
+            })
+            return [], [], None
+
+        core_units = []
+        core_root = resolve_vault_core_root(vault_root)
+        if core_root and Path(core_root).is_dir():
+            try:
+                core_units_list, _, _ = read_vault_units(core_root, pipeline)
+                core_units = list(core_units_list)
+            except Exception:
+                core_units = []
+
+        vault_context = None
+        try:
+            excerpts, _ = read_vault_context(vault_root)
+            if excerpts:
+                vault_context = excerpts
+        except Exception:
+            vault_context = None
+
+        self._sink({
+            "kind": "status",
+            "stage": "retrieval",
+            "run_id": run_id,
+            "message": (
+                f"Vault Mode: evaluated against authentic Vault "
+                f"({len(vault_units)} vault unit(s), {len(core_units)} core unit(s), {vault_files} file(s) discovered, {vault_skipped} skipped)"
+            ),
+        })
+        return list(vault_units), core_units, vault_context
+
     def _execute_run(self, run_id, input_text, mode_value,
                      retrieval_mode="lexical", staging_language="en",
-                     audit_language="en"):
+                     audit_language="en", input_provenance=None):
         from src.living_authenticity.knowledge import integration as _integration
         from src.living_authenticity.knowledge.integration.guard import (
             resolve_authorized_audit_failed,
@@ -734,8 +1047,17 @@ class Launcher:
                                 f"audit={audit_language}; no translation "
                                 "provider is configured, so generated "
                                 "content language is unchanged")})
+        source_label = (
+            f"{input_provenance.source_type}:{input_provenance.input_id}"
+            if input_provenance
+            else "<text-input>"
+        )
+        self._sink({"kind": "stage_started", "stage": "ingestion", "run_id": run_id,
+                    "message": "ingesting and extracting knowledge units"})
         ingestion = pipe.ingestion.ingest_text(
-            input_text, source="<text-input>", kind="text-input.md")
+            input_text, source=source_label, kind="text-input.md")
+        self._sink({"kind": "stage_completed", "stage": "ingestion", "run_id": run_id,
+                    "message": f"ingestion completed ({len(ingestion.knowledge_units)} unit(s) extracted)"})
         # Portable UI-first resolution: a UI-validated session destination
         # (set by pick_folder() this launch) takes precedence; otherwise
         # fall back to the config-declared location. The chosen value is
@@ -767,12 +1089,14 @@ class Launcher:
             synthesis = build_synthesis(
                 build_provider(llm_config), confirm=self._consent_confirm,
                 config=llm_config)
+        corpus_units, core_units, vault_ctx = self._load_knowledge_corpus(
+            mode_value, pipe, paths, run_id=run_id)
         return _integration.run_bounded_integration(
             "", staging_arg, pipeline=pipe,
-            corpus=(), core_units=(), max_files=1,
+            corpus=corpus_units, core_units=core_units, max_files=1,
             llm_config=llm_config, synthesis=synthesis,
             ingestion=ingestion,
-            vault_context=None,
+            vault_context=vault_ctx,
             approval_gate=_PublishingGate(self),
             approval_reader=self._approval_reader,
             run_id=run_id, event_sink=self._sink,

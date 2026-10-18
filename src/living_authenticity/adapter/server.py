@@ -338,12 +338,14 @@ def _make_handler(launcher: Launcher):
                 return
             try:
                 result = launcher.start_run(
-                    data.get("input_text"),
+                    data.get("input_text", ""),
                     data.get("source_mode") or "personal_vault",
                     retrieval_mode=data.get("retrieval_mode") or "lexical",
                     app_language=data.get("app_language") or "en",
                     staging_language=data.get("staging_language") or "en",
-                    audit_language=data.get("audit_language") or "en")
+                    audit_language=data.get("audit_language") or "en",
+                    source_type=data.get("source_type", "chat_input"),
+                    input_id=data.get("input_id"))
             except AdapterError as exc:
                 self._error(400, exc.kind, exc.message)
                 return

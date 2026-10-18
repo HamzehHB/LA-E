@@ -175,6 +175,10 @@ export interface AppState {
   onboarding: OnboardingState;
   /** @category ui-model — §§15–16, 19–21 safe-stop/fix/resume (fixtures only) */
   safeStop: SafeStopState | null;
+  lastSubmittedText?: string;
+  inputOutcome?: "ACCEPTED" | "REJECTED" | "NEEDS_CLARIFICATION" | "STOPPED" | "ERROR" | null;
+  inputErrorCode?: string | null;
+  inputRecoveryOptions?: string[];
 }
 
 /**

@@ -75,9 +75,11 @@ export function TopNav() {
   const stagingValid = state.resources.staging.validity === "configured_valid";
   const auditValid = state.resources.audit.validity === "configured_valid";
 
+  const isFixtureRun = Boolean(state.run.run_id && state.run.run_id.startsWith("run-fixture"));
   const runActive =
     liveAvailable &&
     Boolean(state.run.run_id) &&
+    !isFixtureRun &&
     !state.run.stopped &&
     Boolean(state.run.status) &&
     !state.run.status.toLowerCase().includes("finished") &&

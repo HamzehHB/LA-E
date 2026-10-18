@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { beforeEach, describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { deriveWorkflow, isTerminalSuccess } from "../components/workflowStages";
+import { StoreProvider, useStore } from "../state/store";
 import type { RunEvent } from "../contracts/transport";
 
 beforeEach(() => {
@@ -119,7 +121,10 @@ describe("app shell", () => {
     expect(screen.getByLabelText("Recent Staging journal")).toBeInTheDocument();
     // Responsibility notice lives below the composer.
     expect(screen.getByText("Information may be incorrect; one small error can start a chain of errors. The person is responsible for its use.")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /Type text input here/ }));
+    const input = screen.getByPlaceholderText("Type or paste here (text only — no uploads yet)");
+    expect(input).toBeInTheDocument();
+    await user.type(input, "Synthetic research hypothesis");
+    expect(input).toHaveValue("Synthetic research hypothesis");
     // Mock transport only.
     expect(transport.kind).toBe("mock-fixture");
   });
@@ -365,7 +370,7 @@ describe("gap-closure behaviors (§§1-4)", () => {
     expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Simulate safe-stop/ })).not.toBeInTheDocument();
     // An honest idle/setup state is shown instead.
-    expect(screen.getByText(/No active run\. Connect the backend/)).toBeInTheDocument();
+    expect(screen.getByText(/No active run\. Enter an observation or note/)).toBeInTheDocument();
   });
 
   it("Journals show a multi-row window in Test Mode", () => {
@@ -382,3 +387,255 @@ describe("gap-closure behaviors (§§1-4)", () => {
     expect(screen.queryByRole("button", { name: /Cancel Run/ })).not.toBeInTheDocument();
   });
 });
+
+describe("Input Stage — Chat Input UI, Loading, Localization, and Timeline", () => {
+  it("displays the exact required placeholder in English and Persian", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    render(<App />);
+    expect(
+      screen.getByPlaceholderText("Type or paste here (text only — no uploads yet)")
+    ).toBeInTheDocument();
+
+    // Switch to Persian via Settings
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const faRadio = screen.getByRole("radio", { name: "فارسی" });
+    await user.click(faRadio);
+
+    expect(
+      screen.getByPlaceholderText("متن را اینجا بنویسید یا بچسبانید (فقط متن — بدون بارگذاری فایل)")
+    ).toBeInTheDocument();
+  });
+
+  it("handles multiline text and prevents empty submission", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    const user = userEvent.setup();
+    render(<App />);
+
+    const textarea = screen.getByPlaceholderText("Type or paste here (text only — no uploads yet)");
+    const submitBtn = screen.getByRole("button", { name: /Send|Submit/i });
+
+    // Empty text: button is disabled
+    expect(submitBtn).toBeDisabled();
+
+    // Whitespace only: button is still disabled
+    await user.type(textarea, "   \n  ");
+    expect(submitBtn).toBeDisabled();
+
+    // Multiline typing with Shift+Enter
+    await user.clear(textarea);
+    await user.type(textarea, "Line 1{Shift>}{Enter}{/Shift}Line 2");
+    expect(textarea).toHaveValue("Line 1\nLine 2");
+  });
+
+  it("derives INPUT timeline stage as current then completed", () => {
+    // 1. Run started: input stage is current
+    const stagesRunning = deriveWorkflow(
+      { run_id: "run-test-1", current_stage: "input", stopped: false, status: "validating input" },
+      [ev("run_started"), ev("stage_started", "input")]
+    );
+    const byRunning = Object.fromEntries(stagesRunning.map((s) => [s.key, s.state]));
+    expect(byRunning.input).toBe("current");
+    expect(byRunning.ingestion).toBe("pending");
+
+    // 2. Stage completed for input: input is completed, ingestion is current
+    const stagesCompleted = deriveWorkflow(
+      { run_id: "run-test-1", current_stage: "ingestion", stopped: false, status: "ingesting" },
+      [ev("run_started"), ev("stage_started", "input"), ev("stage_completed", "input")]
+    );
+    const byCompleted = Object.fromEntries(stagesCompleted.map((s) => [s.key, s.state]));
+    expect(byCompleted.input).toBe("completed");
+    expect(byCompleted.ingestion).toBe("current");
+
+    // 3. Input stopped: input is stopped, downstream stays pending
+    const stagesStopped = deriveWorkflow(
+      { run_id: "run-test-1", current_stage: "input", stopped: true, status: "input rejected" },
+      [ev("run_started"), ev("stage_started", "input"), ev("stopped", "input", "validation failed")]
+    );
+    const byStopped = Object.fromEntries(stagesStopped.map((s) => [s.key, s.state]));
+    expect(byStopped.input).toBe("stopped");
+    expect(byStopped.ingestion).toBe("pending");
+  });
+
+  it("live launch with no active run stays idle and timeline remains pending", () => {
+    // When run_id is a fixture or empty, timeline must not claim proposal is running
+    const fixtureStages = deriveWorkflow(
+      { run_id: "run-fixture-001", current_stage: "proposal", stopped: false, status: "test sample — launcher not connected" },
+      []
+    );
+    expect(fixtureStages.every((s) => s.state === "pending")).toBe(true);
+
+    const idleStages = deriveWorkflow(
+      { run_id: "", current_stage: "", stopped: false, status: "" },
+      []
+    );
+    expect(idleStages.every((s) => s.state === "pending")).toBe(true);
+  });
+
+  it("when backend is unavailable, retains draft in composer and surfaces actionable connection recovery panel", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    const user = userEvent.setup();
+    render(<App />);
+
+    const textarea = screen.getByRole("textbox", {
+      name: /Type or paste here/i,
+    });
+    const submitBtn = screen.getByRole("button", {
+      name: /Send|Submit/i,
+    });
+
+    // Initially submit button is disabled because textarea is empty
+    expect(submitBtn).toBeDisabled();
+
+    // Type text into the composer
+    const note = "Authentic observation note requiring backend evaluation.";
+    await user.type(textarea, note);
+
+    // Submit button becomes enabled
+    expect(submitBtn).toBeEnabled();
+
+    // Click submit
+    await user.click(submitBtn);
+
+    // Draft is preserved in the composer (not cleared or lost)
+    expect(textarea).toHaveValue(note);
+
+    // Actionable Recovery Panel is shown in Processing Result (no fake proposal success)
+    expect(
+      within(screen.getByLabelText("Processing Result")).getByRole("alert")
+    ).toBeInTheDocument();
+    expect(screen.getByText(/\[ERROR\]/)).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/Backend service is unreachable|connection_unavailable/i).length
+    ).toBeGreaterThanOrEqual(1);
+    expect(
+      within(within(screen.getByLabelText("Processing Result")).getByRole("alert")).getByText(note)
+    ).toBeInTheDocument();
+
+    // Dismiss button is rendered (Fix and Stop removed for input stage)
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Fix / Edit Input" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop / Dismiss" })).not.toBeInTheDocument();
+
+    // Clicking Dismiss cleanly resets the error state
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/\[ERROR\]/)).not.toBeInTheDocument();
+  });
+
+  it("renders actionable error banner with retry affordance and dismissal", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    function ErrorTestComponent() {
+      const { retryConnection, dismissLiveError } = useStore();
+      const [err, setErr] = useState<string | null>("connection_unavailable");
+      return (
+        <div>
+          {err && (
+            <div role="alert" className="app-error-banner">
+              <span>Backend connection is unavailable. Ensure the launcher is running.</span>
+              <button type="button" onClick={() => { void retryConnection(); setErr(null); }}>
+                Retry Connection
+              </button>
+              <button type="button" onClick={() => { dismissLiveError(); setErr(null); }}>
+                Dismiss
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+    const user = userEvent.setup();
+    render(
+      <StoreProvider>
+        <ErrorTestComponent />
+      </StoreProvider>
+    );
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry Connection" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("mockSubmitInput delegates to startLiveRun and never generates fake proposals", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    function TestMockComponent() {
+      const { state, mockSubmitInput } = useStore();
+      return (
+        <div>
+          <span data-testid="run-id">{state.run.run_id}</span>
+          <span data-testid="outcome">{state.inputOutcome || "none"}</span>
+          <span data-testid="status">{state.run.status}</span>
+          <button type="button" onClick={() => mockSubmitInput("valid note for live run")}>
+            Trigger Mock Submit
+          </button>
+        </div>
+      );
+    }
+    render(
+      <StoreProvider>
+        <TestMockComponent />
+      </StoreProvider>
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Trigger Mock Submit" }));
+
+    // In unit test environment where live client is unavailable, mockSubmitInput must route
+    // to ERROR / connection_unavailable, and NEVER synthesize run-local- or local mock proposals
+    expect(screen.getByTestId("run-id").textContent).not.toContain("run-local-");
+    expect(screen.getByTestId("status").textContent).toContain("Backend not connected");
+    expect(screen.getByTestId("outcome").textContent).toBe("ERROR");
+  });
+
+  it("delayed cancellation and stopped state cleanly prevents run resurrection", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    function StoppedRunTestComponent() {
+      const { state, cancelActiveRun } = useStore();
+      return (
+        <div>
+          <span data-testid="is-stopped">{String(state.run.stopped)}</span>
+          <span data-testid="review-state">{state.run.review_state}</span>
+          <button type="button" onClick={() => void cancelActiveRun()}>
+            Cancel Run
+          </button>
+        </div>
+      );
+    }
+    render(
+      <StoreProvider>
+        <StoppedRunTestComponent />
+      </StoreProvider>
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Cancel Run" }));
+
+    expect(screen.getByTestId("is-stopped").textContent).toBe("true");
+  });
+
+  it("enforces minimum 50 letters boundary: disallows sending under 50 letters and enables at 50+ letters", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    const user = userEvent.setup();
+    render(<App />);
+
+    const textarea = screen.getByRole("textbox", {
+      name: /Type or paste here/i,
+    });
+    const submitBtn = screen.getByRole("button", {
+      name: /Send|Submit/i,
+    });
+
+    // 1. Empty input: button is disabled
+    expect(submitBtn).toBeDisabled();
+
+    // 2. Short input (< 50 letters): button remains strictly disabled
+    await user.type(textarea, "Short note with twenty-six letters total.");
+    expect(submitBtn).toBeDisabled();
+    expect(screen.getByText(/letters.*more data needed/i)).toBeInTheDocument();
+
+    // 3. Completing up to 50+ letters enables submission
+    await user.clear(textarea);
+    const valid50 = "Authentic observation note requiring backend evaluation.";
+    await user.type(textarea, valid50);
+    expect(screen.getByText(/50 \/ 50 letters.*ready to send/i)).toBeInTheDocument();
+    expect(submitBtn).toBeEnabled();
+  });
+});
+

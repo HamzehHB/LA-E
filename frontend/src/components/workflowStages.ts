@@ -67,6 +67,7 @@ const ORDER: TimelineStageKey[] = [
 
 // Backend analytical stage key -> timeline key.
 const STAGE_TO_TIMELINE: Record<string, TimelineStageKey> = {
+  input: "input",
   ingestion: "ingestion",
   retrieval: "retrieval",
   comparison: "comparison",
@@ -103,7 +104,6 @@ export function deriveWorkflow(
     switch (e.kind) {
       case "run_started":
         sawRun = true;
-        completed.add("input");
         break;
       case "stage_completed": {
         const key = STAGE_TO_TIMELINE[e.stage];
@@ -145,29 +145,54 @@ export function deriveWorkflow(
   if (revalidationValid) completed.add("revalidation");
   if (executionExecuted) completed.add("controlled_execution");
   if (reviewRequired) completed.add("human_review");
+  if (completed.size > 0) completed.add("input");
 
   // Furthest reached index = last completed stage (in canonical order).
   let reached = -1;
   ORDER.forEach((k, i) => {
     if (completed.has(k)) reached = i;
   });
-  // If a run started but nothing completed yet, INPUT is current.
-  if (sawRun && reached < 0) reached = 0;
+
+  // Stop boundary index: precisely where the run halted
+  let stopStageIndex = -1;
+  if (stopped) {
+    if (run.current_stage && STAGE_TO_TIMELINE[run.current_stage]) {
+      stopStageIndex = ORDER.indexOf(STAGE_TO_TIMELINE[run.current_stage]);
+    } else if (reached >= 0) {
+      stopStageIndex = reached + 1;
+    } else {
+      stopStageIndex = 0; // Stopped at input
+    }
+  }
+
+  // Active frontier index for an active run (sawRun / real run_id, not terminal, not stopped)
+  let activeIndex = -1;
+  const isRealRun = Boolean(run.run_id && !run.run_id.startsWith("run-fixture"));
+  if (!stopped && !terminal && (sawRun || isRealRun)) {
+    if (run.current_stage && STAGE_TO_TIMELINE[run.current_stage]) {
+      const explicitKey = STAGE_TO_TIMELINE[run.current_stage];
+      activeIndex = ORDER.indexOf(explicitKey);
+    }
+    if (activeIndex < 0) {
+      activeIndex = reached + 1;
+    }
+  }
 
   return ORDER.map((key, i) => {
     let state: TimelineState;
     if (completed.has(key)) {
       state = "completed";
-    } else if (i <= reached && !terminal) {
-      // reached-but-not-completed (or the next pending frontier) is current
-      state = stopped ? "stopped" : "current";
-    } else if (stopped && i === reached + 1) {
-      state = "stopped";
+    } else if (stopped) {
+      if (i === stopStageIndex) {
+        state = "stopped";
+      } else {
+        state = "pending";
+      }
+    } else if (i === activeIndex) {
+      state = "current";
     } else {
       state = "pending";
     }
-    // A stopped run must not leave later stages looking current.
-    if (stopped && !completed.has(key) && i > reached) state = "pending";
     return { key, label: TIMELINE_LABELS[key], state };
   });
 }

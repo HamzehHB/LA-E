@@ -54,6 +54,8 @@ export interface RunRequest {
   app_language: "en" | "fa";
   staging_language: "en" | "fa";
   audit_language: "en" | "fa";
+  source_type?: string;
+  input_id?: string;
 }
 
 /** @category transport — POST /api/run response */
@@ -63,6 +65,8 @@ export interface RunResponse {
   reason: string;
   /** Effective retrieval actually used for this run. */
   retrieval_mode?: "lexical" | "semantic";
+  source_type?: string;
+  input_id?: string;
 }
 
 /** @category transport — POST /api/approve */
@@ -267,4 +271,9 @@ export interface RunEvent {
   confidence_score_band?: string;
   classification_type?: string;
   consent_id?: string;
+  outcome?: "ACCEPTED" | "REJECTED" | "NEEDS_CLARIFICATION" | "STOPPED" | "ERROR";
+  error_code?: string;
+  recovery_options?: string[];
+  input_id?: string;
+  input_hash?: string;
 }

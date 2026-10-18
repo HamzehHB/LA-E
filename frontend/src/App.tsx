@@ -3,7 +3,53 @@ import { StoreProvider, useStore } from "./state/store";
 import { TopNav } from "./components/TopNav";
 import { CurrentAudit, Workflow } from "./components/Workflow";
 import { Composer, Journals, ProcessingResult, Welcome } from "./components/Panels";
-import { translate } from "./i18n/resources";
+import type { FolderPurpose } from "./contracts/transport";
+
+function formatLiveError(err: string, lang: string): string {
+  if (err.includes("connection_unavailable") || err.includes("Failed to fetch") || err.includes("NetworkError")) {
+    return lang === "fa"
+      ? "ارتباط با پس‌اند برقرار نیست. لطفاً از اجرای لانچر مطمئن شوید."
+      : "Backend connection is unavailable. Ensure the launcher is running.";
+  }
+  if (err.includes("authentication_error")) {
+    return lang === "fa"
+      ? "نشست امنیتی منقضی شده است. لطفاً برنامه را مجدداً از لانچر باز کنید."
+      : "Session authentication expired. Please relaunch the application.";
+  }
+  if (err.includes("validation_error")) {
+    return lang === "fa"
+      ? `خطای اعتبارسنجی: ${err}`
+      : `Validation error: ${err}`;
+  }
+  return err;
+}
+
+function isConnectionError(err: string): boolean {
+  return (
+    err.includes("connection_unavailable") ||
+    err.includes("Failed to fetch") ||
+    err.includes("NetworkError") ||
+    err.includes("reconnecting")
+  );
+}
+
+function isFolderError(err: string): boolean {
+  const lower = err.toLowerCase();
+  return (
+    lower.includes("vault") ||
+    lower.includes("staging") ||
+    lower.includes("audit") ||
+    lower.includes("vector")
+  );
+}
+
+function folderPurposeFromError(err: string): FolderPurpose {
+  const lower = err.toLowerCase();
+  if (lower.includes("staging")) return "staging";
+  if (lower.includes("audit")) return "audit";
+  if (lower.includes("vector") || lower.includes("db") || lower.includes("database")) return "vector_db";
+  return "vault";
+}
 
 /**
  * Exactly 13 decorative stars connected by a subtle constellation web:
@@ -27,7 +73,15 @@ const STAR_POSITIONS: { x: number; y: number; s: number }[] = [
 ];
 
 function Shell() {
-  const { state, liveConsentRequest, liveConsent, liveError } = useStore();
+  const {
+    state,
+    liveConsentRequest,
+    liveConsent,
+    liveError,
+    retryConnection,
+    dismissLiveError,
+    pickLiveFolder,
+  } = useStore();
   const rtl = state.appLanguage === "fa";
 
   useEffect(() => {
@@ -55,7 +109,43 @@ function Shell() {
           </div>
         </div>
       )}
-      {liveError && <p role="alert" className="err-banner">{liveError}</p>}
+      {/* Actionable Error Banner with Remediation Affordance */}
+      {liveError && (
+        <div role="alert" className="app-error-banner">
+          <div className="error-message">
+            <span className="error-icon" aria-hidden="true">⚠️</span>
+            <span>{formatLiveError(liveError, state.appLanguage)}</span>
+          </div>
+          <div className="error-actions">
+            {isConnectionError(liveError) && (
+              <button
+                type="button"
+                className="btn small approve"
+                onClick={() => void retryConnection()}
+              >
+                {state.appLanguage === "fa" ? "تلاش مجدد برای اتصال" : "Retry Connection"}
+              </button>
+            )}
+            {isFolderError(liveError) && (
+              <button
+                type="button"
+                className="btn small approve"
+                onClick={() => void pickLiveFolder(folderPurposeFromError(liveError))}
+              >
+                {state.appLanguage === "fa" ? "انتخاب و تصحیح پوشه" : "Configure Folder"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn small ghost dismiss-btn"
+              onClick={dismissLiveError}
+              aria-label="Dismiss error"
+            >
+              {state.appLanguage === "fa" ? "بستن" : "Dismiss"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Upper Band: 13-Star Constellation & DeepThink Current Audit Overlay */}
       <div className="constellation-stage">
@@ -93,12 +183,9 @@ function Shell() {
         </aside>
       </main>
 
-      {/* Bottom Composer Dock + Centered Responsibility Disclaimer */}
+      {/* Bottom Composer Dock */}
       <footer className="composer-dock">
         <Composer />
-        {!state.composerOpen && (
-          <p className="responsibility">{translate(state.appLanguage, "ui.responsibility")}</p>
-        )}
       </footer>
     </div>
   );

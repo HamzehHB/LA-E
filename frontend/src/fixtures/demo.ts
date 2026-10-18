@@ -10,6 +10,24 @@ export const SYNTH_VAULT = "<TEST_VAULT>";
 export const SYNTH_STAGING = "<TEST_STAGING>";
 export const SYNTH_AUDIT = "<TEST_AUDIT>";
 
+export const IDLE_RUN: CurrentRunView = {
+  run_id: "",
+  current_stage: "",
+  status: "",
+  proposal_action: "CREATE",
+  classification_type: "Observation",
+  proposal_title: "",
+  proposal_body: "",
+  confidence_level: "sufficiently_supported",
+  filter_verdict: "pass_to_review",
+  proposal_hash: "",
+  review_state: "awaiting_review",
+  edited_body: null,
+  error: null,
+  stopped: false,
+  stop_reason: "",
+};
+
 export const FIXTURE_RUN: CurrentRunView = {
   run_id: "run-fixture-001",
   current_stage: "proposal",

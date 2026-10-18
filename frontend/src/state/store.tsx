@@ -1,7 +1,7 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { AppState, ConfigResourceState, CurrentRunView } from "../contracts/ui";
 import type { FolderPurpose, RunEvent } from "../contracts/transport";
-import { FIXTURE_AUDITS, FIXTURE_RUN, FIXTURE_STAGING } from "../fixtures/demo";
+import { FIXTURE_AUDITS, FIXTURE_RUN, FIXTURE_STAGING, IDLE_RUN } from "../fixtures/demo";
 import { createLiveClient, type LiveClient } from "../live/client";
 
 
@@ -52,6 +52,10 @@ const initialState: AppState = {
     engineDismissed: false,
   },
   safeStop: null,
+  lastSubmittedText: "",
+  inputOutcome: null,
+  inputErrorCode: null,
+  inputRecoveryOptions: [],
 };
 
 interface Store {
@@ -73,6 +77,7 @@ interface Store {
   mockSafeStop: (stage: string, reason: string, fixTarget: string) => void;
   mockFix: () => void;
   mockStopProcess: () => void;
+  mockSubmitInput: (text: string) => void;
   mockOnboardingChoice: (key: "vectorBaselineAccepted", value: boolean | null) => void;
   mockDismissOnboarding: (key: "vectorBaselineDismissed" | "engineDismissed") => void;
   mockEngineChoice: (status: AppState["vectorEngine"]["status"], selected?: string) => void;
@@ -81,6 +86,10 @@ interface Store {
   liveConnected: boolean;
   liveError: string | null;
   startLiveRun: (inputText: string) => Promise<void>;
+  fixInput: () => void;
+  retryLastInput: () => Promise<void>;
+  dismissRunOutcome: () => void;
+  cancelActiveRun: () => Promise<void>;
   liveApprove: (decision: "approve" | "reject") => Promise<void>;
   liveEditProposal: (title: string, body: string, reason: string) => Promise<void>;
   liveAccept: () => Promise<void>;
@@ -94,6 +103,8 @@ interface Store {
   refreshJournals: () => Promise<void>;
   /** Open the native folder dialog for one purpose via the launcher. */
   pickLiveFolder: (purpose: FolderPurpose) => Promise<void>;
+  retryConnection: () => Promise<void>;
+  dismissLiveError: () => void;
   /** Pending live payloads surfaced from the SSE stream. */
   liveApproval: {
     proposal_hash: string;
@@ -116,6 +127,8 @@ const WELCOME_KEY = "lae-welcomed";
 const MAX_RUN_EVENTS = 200;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
+  // Live client: created once, token stays in module memory (never stored).
+  const [live] = useState<LiveClient>(() => createLiveClient());
   const [state, setState] = useState<AppState>(() => {
     let theme = initialState.theme;
     let welcomed = false;
@@ -128,16 +141,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* ignore */
     }
-    return { ...initialState, theme, welcomed };
+    const initialRun = live.available ? { ...IDLE_RUN } : { ...FIXTURE_RUN };
+    const initialAudits = live.available ? [] : [...FIXTURE_AUDITS];
+    const initialStaging = live.available ? [] : [...FIXTURE_STAGING];
+    return {
+      ...initialState,
+      theme,
+      welcomed,
+      run: initialRun,
+      recentAudits: initialAudits,
+      recentStaging: initialStaging,
+    };
   });
-  // Live client: created once, token stays in module memory (never stored).
-  const [live] = useState<LiveClient>(() => createLiveClient());
   const [liveConnected, setLiveConnected] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [liveApproval, setLiveApproval] = useState<Store["liveApproval"]>(null);
   const [liveConsentRequest, setLiveConsentRequest] = useState<
     Store["liveConsentRequest"]
   >(null);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const applyEvent = (event: RunEvent) => {
     setLiveConnected(true);
@@ -151,10 +175,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         : [...s.runEvents, event];
       return { ...s, runEvents: next };
     });
+    const runId = typeof event.run_id === "string" ? event.run_id : "";
     const stage = typeof event.stage === "string" ? event.stage : "";
     const message = typeof event.message === "string" ? event.message : "";
-    const runId = typeof event.run_id === "string" ? event.run_id : "";
     const extra = event as RunEvent & Record<string, unknown>;
+
+    // Stale event protection: If this run has been stopped or rejected,
+    // prevent any delayed SSE events from reviving it to RUNNING or AWAITING_REVIEW.
+    if (stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
+      if (
+        event.kind !== "stopped" &&
+        event.kind !== "run_rejected" &&
+        event.kind !== "error"
+      ) {
+        return;
+      }
+    }
     if (event.kind === "status" && message.startsWith("retrieval mode:")) {
       const effective = message.includes("semantic") ? "semantic" : "lexical";
       setState((s) => ({
@@ -167,6 +203,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (event.kind === "human_review_required") {
       const proposalHash = String(extra.proposal_hash ?? "");
       if (proposalHash) {
+        if (stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
+          return;
+        }
         const confScore = typeof extra.confidence_score === "number"
           ? extra.confidence_score
           : (extra.confidence_score ? Number(extra.confidence_score) : 0.89);
@@ -183,37 +222,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           confidence_score_band: confBand,
           classification_type: classType,
         });
-        setState((s) => ({
-          ...s,
-          run: {
-            ...s.run,
-            run_id: runId || s.run.run_id,
-            proposal_action:
-              (String(extra.proposal_action ?? "") as CurrentRunView["proposal_action"]) ||
-              s.run.proposal_action,
-            classification_type: classType,
-            proposal_title: String(extra.title ?? s.run.proposal_title),
-            proposal_body: String(extra.body ?? s.run.proposal_body),
-            confidence_score: confScore,
-            confidence_score_band: confBand,
-            proposal_hash: proposalHash,
-            review_state: "live_awaiting_review",
-            current_stage: "human_review",
-            status: "awaiting explicit approval",
-            error: null,
-          },
-        }));
+        setState((s) => {
+          if (s.run.stopped && (!runId || runId === s.run.run_id)) {
+            return s;
+          }
+          return {
+            ...s,
+            run: {
+              ...s.run,
+              run_id: runId || s.run.run_id,
+              proposal_action:
+                (String(extra.proposal_action ?? "") as CurrentRunView["proposal_action"]) ||
+                s.run.proposal_action,
+              classification_type: classType,
+              proposal_title: String(extra.title ?? s.run.proposal_title),
+              proposal_body: String(extra.body ?? s.run.proposal_body),
+              confidence_score: confScore,
+              confidence_score_band: confBand,
+              proposal_hash: proposalHash,
+              review_state: "live_awaiting_review",
+              current_stage: "human_review",
+              status: "awaiting explicit approval",
+              error: null,
+            },
+          };
+        });
       }
       return;
     }
     if (event.kind === "consent_required") {
       const consentId = String(extra.consent_id ?? "");
       if (consentId) {
+        if (stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
+          return;
+        }
         setLiveConsentRequest({ consent_id: consentId, message });
-        setState((s) => ({
-          ...s,
-          run: { ...s.run, review_state: "live_consent_required" },
-        }));
+        setState((s) => {
+          if (s.run.stopped && (!runId || runId === s.run.run_id)) {
+            return s;
+          }
+          return {
+            ...s,
+            run: { ...s.run, review_state: "live_consent_required" },
+          };
+        });
       }
       return;
     }
@@ -231,16 +283,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       event.kind === "status" ||
       event.kind === "completed"
     ) {
-      setState((s) => ({
-        ...s,
-        run: {
-          ...s.run,
-          run_id: runId || s.run.run_id,
-          current_stage: stage || s.run.current_stage,
-          status: message || s.run.status,
-          stopped: false,
-        },
-      }));
+      setState((s) => {
+        // Prevent stale events from reviving a run that was stopped or rejected
+        if (s.run.stopped && (!runId || runId === s.run.run_id)) {
+          return s;
+        }
+        return {
+          ...s,
+          run: {
+            ...s.run,
+            run_id: runId || s.run.run_id,
+            current_stage: stage || s.run.current_stage,
+            status: message || s.run.status,
+            stopped: false,
+          },
+        };
+      });
       if (event.kind === "completed" || event.kind === "run_completed") {
         void refreshJournalsQuiet();
       }
@@ -252,11 +310,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       event.kind === "error" ||
       event.kind === "warning"
     ) {
+      const outcome = (event.outcome as AppState["inputOutcome"]) ||
+        (event.kind === "stopped" ? "STOPPED" : "REJECTED");
       setState((s) => ({
         ...s,
+        inputOutcome: outcome,
+        inputErrorCode: event.error_code ?? null,
+        inputRecoveryOptions: event.recovery_options ?? ["fix_input", "stop"],
         run: {
           ...s.run,
           run_id: runId || s.run.run_id,
+          current_stage: stage || s.run.current_stage || "input",
           stopped: event.kind !== "warning",
           stop_reason: message,
           status: message || s.run.status,
@@ -319,6 +383,76 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const startLiveRunFn = async (inputText: string) => {
+    setState((s) => ({
+      ...s,
+      lastSubmittedText: inputText,
+      inputOutcome: null,
+      inputErrorCode: null,
+    }));
+    if (!live.available) {
+      setLiveError("connection_unavailable");
+      setState((s) => ({
+        ...s,
+        run: {
+          ...IDLE_RUN,
+          current_stage: "input",
+          stopped: true,
+          stop_reason: "Backend connection is unavailable",
+          status: "Backend not connected",
+        },
+        inputOutcome: "ERROR",
+        inputErrorCode: "connection_unavailable",
+      }));
+      return;
+    }
+    setLiveError(null);
+    setLiveApproval(null);
+    try {
+      const res = await live.startRun({
+        input_text: inputText,
+        source_mode: state.sourceMode === "vault" ? "personal_vault" : "examples",
+        retrieval_mode: state.retrievalType,
+        app_language: state.appLanguage,
+        staging_language: state.stagingLanguage,
+        audit_language: state.auditLanguage,
+        source_type: "chat_input",
+      });
+      setState((s) => ({
+        ...s,
+        runEvents: [],
+        run: {
+          ...s.run,
+          run_id: res.run_id,
+          current_stage: "input",
+          status:
+            "submitted — validating input (retrieval: " +
+            (res.retrieval_mode ?? state.retrievalType) +
+            ")",
+          stopped: false,
+          stop_reason: "",
+          review_state: "awaiting_review",
+          error: null,
+        },
+      }));
+    } catch (e) {
+      const errMsg = (e as Error)?.message ?? "backend_error";
+      setLiveError(errMsg);
+      setState((s) => ({
+        ...s,
+        inputOutcome: "REJECTED",
+        inputErrorCode: "validation_error",
+        inputRecoveryOptions: ["fix_input", "stop"],
+        run: {
+          ...s.run,
+          stopped: true,
+          stop_reason: errMsg,
+          status: errMsg,
+        },
+      }));
+    }
+  };
+
   const value = useMemo<Store>(
     () => ({
       state,
@@ -334,34 +468,51 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setAppLanguage: (appLanguage) => {
         setState((s) => ({ ...s, appLanguage }));
         if (live.available) {
-          void live.updateConfig({ app_language: appLanguage }).catch(() => {});
+          live.updateConfig({ app_language: appLanguage })
+            .then(() => setLiveError(null))
+            .catch((e) => setLiveError((e as Error)?.message || "connection_unavailable"));
         }
       },
       setStagingLanguage: (stagingLanguage) => {
         setState((s) => ({ ...s, stagingLanguage }));
         if (live.available) {
-          void live.updateConfig({ staging_language: stagingLanguage }).catch(() => {});
+          live.updateConfig({ staging_language: stagingLanguage })
+            .then(() => setLiveError(null))
+            .catch((e) => setLiveError((e as Error)?.message || "connection_unavailable"));
         }
       },
       setAuditLanguage: (auditLanguage) => {
         setState((s) => ({ ...s, auditLanguage }));
         if (live.available) {
-          void live.updateConfig({ audit_language: auditLanguage }).catch(() => {});
+          live.updateConfig({ audit_language: auditLanguage })
+            .then(() => setLiveError(null))
+            .catch((e) => setLiveError((e as Error)?.message || "connection_unavailable"));
         }
       },
       setSourceMode: (sourceMode) => {
         setState((s) => ({ ...s, sourceMode }));
         if (live.available) {
-          void live.updateConfig({ source_mode: sourceMode === "vault" ? "personal_vault" : "examples" }).catch(() => {});
+          live.updateConfig({ source_mode: sourceMode === "vault" ? "personal_vault" : "examples" })
+            .then(() => setLiveError(null))
+            .catch((e) => setLiveError((e as Error)?.message || "connection_unavailable"));
         }
       },
       setRetrievalType: (retrievalType) => {
         setState((s) => ({ ...s, retrievalType }));
         if (live.available) {
-          void live.updateConfig({ retrieval_mode: retrievalType }).catch(() => {});
+          live.updateConfig({ retrieval_mode: retrievalType })
+            .then(() => setLiveError(null))
+            .catch((e) => setLiveError((e as Error)?.message || "connection_unavailable"));
         }
       },
-      setLlmMode: (llmMode) => setState((s) => ({ ...s, llmMode })),
+      setLlmMode: (llmMode) => {
+        setState((s) => ({ ...s, llmMode }));
+        if (live.available) {
+          live.updateConfig({ llm: { provider: llmMode === "local" ? "llama_cpp" : "disabled" } })
+            .then(() => setLiveError(null))
+            .catch((e) => setLiveError((e as Error)?.message || "connection_unavailable"));
+        }
+      },
       // Mock-only transitions, clearly prefixed.
       mockApprove: () =>
         setState((s) => ({ ...s, run: { ...s.run, review_state: "mock_approved" } })),
@@ -426,6 +577,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 safeStop: { ...s.safeStop, userChoice: "stop", resumed: false },
               },
         ),
+      mockSubmitInput: (text: string) => {
+        // Truth-in-representation: never synthesize fake proposals or mock events.
+        // Delegate directly to authoritative backend execution.
+        const trimmed = text.trim();
+        if (!trimmed) return;
+        void startLiveRunFn(trimmed);
+      },
       mockOnboardingChoice: (key, value) =>
         setState((s) => ({ ...s, onboarding: { ...s.onboarding, [key]: value } })),
       mockDismissOnboarding: (key) =>
@@ -446,7 +604,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       liveError,
       liveApproval,
       liveConsentRequest,
-      startLiveRun: async (inputText) => {
+      startLiveRun: startLiveRunFn,
+      fixInput: () => {
+        setState((s) => ({
+          ...s,
+          composerOpen: true,
+          composerText: s.lastSubmittedText || s.composerText,
+          inputOutcome: null,
+          inputErrorCode: null,
+          safeStop: null,
+          run: {
+            ...IDLE_RUN,
+            run_id: "",
+            current_stage: "",
+            stopped: false,
+            stop_reason: "",
+            status: "",
+          },
+        }));
+      },
+      retryLastInput: async () => {
+        const textToRetry = state.lastSubmittedText;
+        if (!textToRetry) return;
         if (!live.available) {
           setLiveError("connection_unavailable");
           return;
@@ -455,24 +634,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setLiveApproval(null);
         try {
           const res = await live.startRun({
-            input_text: inputText,
+            input_text: textToRetry,
             source_mode: state.sourceMode === "vault" ? "personal_vault" : "examples",
             retrieval_mode: state.retrievalType,
             app_language: state.appLanguage,
             staging_language: state.stagingLanguage,
             audit_language: state.auditLanguage,
+            source_type: "chat_input",
           });
           setState((s) => ({
             ...s,
             runEvents: [],
+            inputOutcome: null,
+            inputErrorCode: null,
             run: {
               ...s.run,
               run_id: res.run_id,
-              current_stage: "ingestion",
-              status:
-                "submitted — awaiting backend events (retrieval: " +
-                (res.retrieval_mode ?? state.retrievalType) +
-                ")",
+              current_stage: "input",
+              status: "submitted retry — validating input",
               stopped: false,
               stop_reason: "",
               review_state: "awaiting_review",
@@ -480,8 +659,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             },
           }));
         } catch (e) {
-          setLiveError((e as Error)?.message ?? "backend_error");
+          const errMsg = (e as Error)?.message ?? "backend_error";
+          setLiveError(errMsg);
         }
+      },
+      dismissRunOutcome: () => {
+        setLiveError(null);
+        setState((s) => ({
+          ...s,
+          inputOutcome: null,
+          inputErrorCode: null,
+          run: {
+            ...IDLE_RUN,
+            run_id: "",
+          },
+        }));
+      },
+      cancelActiveRun: async () => {
+        if (live.available && state.run.run_id) {
+          try {
+            await live.cancel({ run_id: state.run.run_id });
+          } catch {
+            /* ignore */
+          }
+        }
+        setState((s) => ({
+          ...s,
+          run: {
+            ...s.run,
+            stopped: true,
+            stop_reason: "Operation cancelled by user",
+            status: "stopped by user",
+          },
+          inputOutcome: "STOPPED",
+        }));
       },
       liveApprove: async (decision) => {
         if (!live.available || !liveApproval) return;
@@ -740,6 +951,49 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }));
         }
       },
+      retryConnection: async () => {
+        setLiveError(null);
+        if (!live.available) {
+          setLiveError("connection_unavailable");
+          return;
+        }
+        try {
+          await live.health();
+          setLiveConnected(true);
+          const st = await live.state();
+          setState((s) => {
+            const res = { ...s.resources };
+            if (st && st.folders) {
+              for (const [purpose, info] of Object.entries(st.folders)) {
+                const p = purpose as FolderPurpose;
+                if (res[p]) {
+                  res[p] = {
+                    ...res[p],
+                    validity: info.configured ? "configured_valid" : "not_configured",
+                    display: info.display,
+                  };
+                }
+              }
+            }
+            return {
+              ...s,
+              resources: res,
+              sourceMode: st?.modes?.source_mode === "personal_vault" ? "vault" : "test",
+              retrievalType: st?.modes?.retrieval_mode ?? s.retrievalType,
+              appLanguage: st?.modes?.app_language ?? s.appLanguage,
+              stagingLanguage: st?.modes?.staging_language ?? s.stagingLanguage,
+              auditLanguage: st?.modes?.audit_language ?? s.auditLanguage,
+            };
+          });
+          void refreshJournalsQuiet();
+        } catch (e) {
+          setLiveConnected(false);
+          setLiveError((e as Error)?.message || "connection_unavailable");
+        }
+      },
+      dismissLiveError: () => {
+        setLiveError(null);
+      },
     }),
     [
       state,
@@ -795,7 +1049,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     stopped: true,
                     stop_reason: st.paused_run.error_message,
                   }
-                : s.run,
+                : st?.active_run_id
+                  ? {
+                      ...s.run,
+                      run_id: st.active_run_id,
+                      current_stage: s.run.current_stage || "input",
+                      stopped: false,
+                    }
+                  : !s.run.run_id || s.run.run_id.startsWith("run-fixture")
+                    ? { ...IDLE_RUN }
+                    : s.run,
             };
           });
         } catch {

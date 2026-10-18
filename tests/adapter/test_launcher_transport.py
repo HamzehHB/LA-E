@@ -613,7 +613,13 @@ def test_run_thread_handles_terminal_audit_persistence_failure():
     old_run = integration.run_bounded_integration
     integration.run_bounded_integration = lambda *a, **kw: fake_report
     try:
-        launcher._run_thread("run-partial-01", "some text", "examples")
+        valid_research_text = (
+            "Authentic qualitative research observation detailing experiential self-awareness and "
+            "ontological congruence across empirical inquiry modalities with sufficient textual depth "
+            "and conceptual rigor to comfortably satisfy minimum input requirements for testing downstream "
+            "terminal integration and audit persistence capabilities."
+        )
+        launcher._run_thread("run-partial-01", valid_research_text, "examples")
     finally:
         integration.run_bounded_integration = old_run
 
