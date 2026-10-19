@@ -35,9 +35,19 @@ class PlainTextKnowledgeExtractor(KnowledgeUnitExtractor):
         normalized_text: str,
         parsed=None,
         parser=None,
+        metadata: dict | None = None,
+        input_provenance: object | None = None,
+        **kwargs,
     ) -> list[KnowledgeUnit]:
         if not cleaned_text.strip():
             return []
+
+        input_id = getattr(input_provenance, "input_id", "") or (
+            metadata.get("input_id", "") if isinstance(metadata, dict) else ""
+        )
+        input_hash = getattr(input_provenance, "input_hash", "") or (
+            metadata.get("input_hash", "") if isinstance(metadata, dict) else ""
+        )
 
         blocks = [b for b in re.split(r"\n\s*\n", cleaned_text) if b.strip()]
         units: list[KnowledgeUnit] = []
@@ -53,11 +63,13 @@ class PlainTextKnowledgeExtractor(KnowledgeUnitExtractor):
                     units.append(self._make_unit(
                         source, item, index + sub_index,
                         "independent_list_items",
+                        input_id=input_id, input_hash=input_hash,
                     ))
                 continue
 
             units.append(self._make_unit(
                 source, block.strip(), index, "paragraph_fallback",
+                input_id=input_id, input_hash=input_hash,
             ))
 
         return units
@@ -65,6 +77,7 @@ class PlainTextKnowledgeExtractor(KnowledgeUnitExtractor):
     @staticmethod
     def _make_unit(
         source: str, body: str, position: int, basis: str,
+        input_id: str = "", input_hash: str = "",
     ) -> KnowledgeUnit:
         return KnowledgeUnit(
             id=make_unit_id(source, position, body),
@@ -77,4 +90,6 @@ class PlainTextKnowledgeExtractor(KnowledgeUnitExtractor):
             proposed_type="",
             position=position,
             boundary_basis=basis,
+            input_id=input_id,
+            input_hash=input_hash,
         )

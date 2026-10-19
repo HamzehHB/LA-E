@@ -34,6 +34,9 @@ class KnowledgeUnitExtractor(ABC):
         normalized_text: str,
         parsed=None,
         parser=None,
+        metadata: dict | None = None,
+        input_provenance: object | None = None,
+        **kwargs,
     ) -> list[KnowledgeUnit]:
         """Extract knowledge units from one input.
 

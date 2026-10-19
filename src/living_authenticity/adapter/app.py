@@ -106,12 +106,16 @@ class _PublishingGate:
         self._inner = ExplicitApprovalGate(strategy)
         self._launcher = launcher
         self._strategy = strategy
+        self.last_active_proposal = None
+        self.last_active_note = None
 
     @property
     def name(self) -> str:
         return self._strategy
 
     def build_request(self, query, proposal=None, confidence=None, note=None):
+        self.last_active_proposal = proposal
+        self.last_active_note = note
         return self._inner.build_request(query, proposal, confidence, note)
 
     def display(self, request):
@@ -149,6 +153,8 @@ class _PublishingGate:
                 note = edited.note
                 continue
             outcome = self._inner.decide(request, raw)
+            self.last_active_proposal = proposal
+            self.last_active_note = note
             return (request, text, outcome)
 
 
@@ -408,6 +414,7 @@ class Launcher:
             # approval of the new content. The old hash can no longer be
             # approved to authorize the edited version.
             self._pending_edits[pending.key] = edited
+            pending.resolve("superseded")
         self._sink({"kind": "status", "stage": "human_review",
                     "message": "proposal edited; re-approval required",
                     "proposal_hash": edited.proposal_hash})
@@ -547,6 +554,9 @@ class Launcher:
         )
 
         try:
+            with self._lock:
+                if not self._active_run_id:
+                    self._active_run_id = run_id
             self._sink({"kind": "run_started", "stage": "input",
                         "message": "run initiated", "run_id": run_id})
 
@@ -1054,8 +1064,15 @@ class Launcher:
         )
         self._sink({"kind": "stage_started", "stage": "ingestion", "run_id": run_id,
                     "message": "ingesting and extracting knowledge units"})
+        source_type = (
+            getattr(input_provenance, "source_type", "")
+            if input_provenance
+            else "chat_input"
+        )
+        kind = source_type if source_type in ("chat_input", "text") else "chat_input"
         ingestion = pipe.ingestion.ingest_text(
-            input_text, source=source_label, kind="text-input.md")
+            input_text, source=source_label, kind=kind,
+            observer=self._sink, input_provenance=input_provenance)
         self._sink({"kind": "stage_completed", "stage": "ingestion", "run_id": run_id,
                     "message": f"ingestion completed ({len(ingestion.knowledge_units)} unit(s) extracted)"})
         # Portable UI-first resolution: a UI-validated session destination

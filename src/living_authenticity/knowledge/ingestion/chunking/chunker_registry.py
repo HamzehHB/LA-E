@@ -21,24 +21,30 @@ class ChunkerRegistry:
     """
 
     def __init__(self):
-
         self._chunkers = {
             ".md": MarkdownChunker(),
             ".txt": ParagraphChunker(),
+            "chat_input": MarkdownChunker(),
+            "text": ParagraphChunker(),
         }
 
-    def register(self, extension: str, chunker):
+    def register(self, identifier: str, chunker):
+        self._chunkers[identifier.lower()] = chunker
 
-        self._chunkers[extension.lower()] = chunker
+    def get(self, file_path_or_identifier: str):
+        if not isinstance(file_path_or_identifier, str):
+            raise TypeError("file_path_or_identifier must be a string")
 
-    def get(self, file_path: str):
+        extension = Path(file_path_or_identifier).suffix.lower()
+        if extension and extension in self._chunkers:
+            return self._chunkers[extension]
 
-        extension = Path(file_path).suffix.lower()
+        lowered = file_path_or_identifier.lower()
+        if lowered in self._chunkers:
+            return self._chunkers[lowered]
 
-        if extension not in self._chunkers:
+        if f".{lowered}" in self._chunkers:
+            return self._chunkers[f".{lowered}"]
 
-            raise ValueError(
-                f"No chunker registered for '{extension}'"
-            )
-
-        return self._chunkers[extension]
+        err_key = extension if extension else file_path_or_identifier
+        raise ValueError(f"No chunker registered for '{err_key}'")

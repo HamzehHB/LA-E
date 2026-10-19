@@ -3,7 +3,7 @@ import unicodedata
 
 class Cleaner:
     """
-    Cleans raw text before chunking.
+    Cleans raw text before normalization, parsing, chunking, and extraction.
 
     Cleaning normalizes representation without altering substantive meaning:
     - Unicode NFC normalization

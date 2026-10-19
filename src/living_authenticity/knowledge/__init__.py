@@ -2,8 +2,9 @@
 
 This package groups every stage of the current backend loop:
 
-* ``ingestion`` — readers, chunking, parsing, cleaning, metadata,
-  knowledge-unit extraction (meaning-preserving, provenance-carrying);
+* ``ingestion`` — reader selection, reading, cleaning, normalization,
+  parsing, chunking, metadata extraction, knowledge-unit extraction &
+  provenance recording (meaning-preserving, provenance-carrying);
 * ``analysis`` — retrieval, comparison, relation analysis, Core
   analysis, classification (evidence-first: retrieval before
   classification; analysis never authorizes);

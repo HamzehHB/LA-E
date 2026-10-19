@@ -23,16 +23,29 @@ def _request_decision(gate, query, proposal, confidence, approval_reader,
     interruption is a rejection, never an approval.
     """
     from src.living_authenticity.knowledge.governance.approval.outcome import (
+        ApprovalOutcome,
         ApprovalRequest,
     )
+
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.output.outcome import GeneratedNote
 
     if approval_reader is not None:
         trio = gate.request_approval(
             query, proposal, confidence, reader=approval_reader, note=note)
+        if not isinstance(trio, tuple) or len(trio) < 3:
+            raise TypeError("gate.request_approval must return a 3-tuple of (request, text, outcome)")
         request = trio[0]
         if not isinstance(request, ApprovalRequest):
             raise TypeError("gate must return an ApprovalRequest")
-        return (request, trio[2])
+        outcome = trio[2]
+        if not isinstance(outcome, ApprovalOutcome):
+            raise TypeError("gate must return an ApprovalOutcome")
+        active_prop = getattr(gate, "last_active_proposal", None)
+        active_proposal = active_prop if isinstance(active_prop, Proposal) else proposal
+        active_n = getattr(gate, "last_active_note", None)
+        active_note = active_n if isinstance(active_n, GeneratedNote) else note
+        return (request, outcome, active_proposal, active_note)
     request = gate.build_request(query, proposal, confidence, note)
     if not isinstance(request, ApprovalRequest):
         raise TypeError("gate must return an ApprovalRequest")
@@ -42,7 +55,13 @@ def _request_decision(gate, query, proposal, confidence, approval_reader,
     except Exception:
         raw = ""
     outcome = gate.decide(request, raw)
-    return (request, outcome)
+    if not isinstance(outcome, ApprovalOutcome):
+        raise TypeError("gate must return an ApprovalOutcome")
+    active_prop = getattr(gate, "last_active_proposal", None)
+    active_proposal = active_prop if isinstance(active_prop, Proposal) else proposal
+    active_n = getattr(gate, "last_active_note", None)
+    active_note = active_n if isinstance(active_n, GeneratedNote) else note
+    return (request, outcome, active_proposal, active_note)
 
 
 def _llm_safe_reason(exc) -> str:
@@ -235,7 +254,7 @@ def _request_non_create_review(child, query, proposal, candidate, note,
         candidate=candidate, proposal=proposal, confidence=confidence,
         filter_outcome=filter_outcome, retrieval=(
             unit_result.retrieval_result if unit_result else None),
-        llm_result=llm_result, staged_text=note.markdown,
+        llm_result=llm_result, staged_text=getattr(note, "markdown", ""),
         destination=proposal.destination, proposal_hash="",
         query=query, classification=classification,
         relation=relation, core=core, comparisons=comparisons,
@@ -296,8 +315,19 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
                 "used_as_evidence": unit_id in evidence_ids,
             })
     query_text = _query_text(query) if query is not None else ""
-    input_hash = (hashlib.sha256(query_text.encode("utf-8")).hexdigest()
-                  if query_text else "")
+    query_input_hash = getattr(query, "input_hash", "")
+    if query_input_hash:
+        input_hash = query_input_hash
+        input_hash_source = "input_provenance"
+    elif query_text:
+        # Fallback to unit-level content hash when input provenance is missing.
+        # Explicitly marked via input_hash_source so audit records distinguish
+        # full input hash from unit content hash while keeping input_hash as a pure SHA-256 digest.
+        input_hash = hashlib.sha256(query_text.encode("utf-8")).hexdigest()
+        input_hash_source = "unit_content_fallback"
+    else:
+        input_hash = ""
+        input_hash_source = ""
     evidence_bits = [entry.get("unit_id", "") for entry in candidates
                      if entry.get("used_as_evidence")]
     # No-evidence case is explicit: an empty hash means no candidate was
@@ -340,6 +370,7 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
             if unit_result is not None else None)
     return {"record_id": record_id, "run_id": run_id,
             "operating_mode": operating_mode, "input_hash": input_hash,
+            "input_hash_source": input_hash_source,
             "retrieval_strategy": strategy,
             "retrieval_candidates": tuple(candidates),
             "retrieval_note": note, "evidence_hash": evidence_hash,
@@ -381,6 +412,12 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     from src.living_authenticity.knowledge.integration.review_display import (
         render_review_block,
     )
+    from src.living_authenticity.knowledge.output.outcome import GeneratedNote
+
+    if not isinstance(note, GeneratedNote):
+        raise TypeError("note must be a GeneratedNote for CREATE proposal governance")
+    if not isinstance(note.markdown, str) or not note.markdown.strip():
+        raise ValueError("note.markdown must not be empty for CREATE proposal governance")
 
     def _emit(kind, stage, message):
         if event_sink is None:
@@ -403,8 +440,13 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     _emit("human_review_required", "human_review",
           "one explicit decision requested for unit "
           + str(getattr(query, "id", "")))
-    request, outcome = _request_decision(
+    request, outcome, proposal, active_note = _request_decision(
         gate, query, proposal, confidence, approval_reader, note, block)
+    if not isinstance(active_note, GeneratedNote):
+        raise TypeError("active_note returned from decision gate must be a GeneratedNote")
+    if not isinstance(active_note.markdown, str) or not active_note.markdown.strip():
+        raise ValueError("active_note.markdown must not be empty")
+    note = active_note
     _emit("approval_decided", "human_review",
           "approved" if outcome.approved else "rejected")
     live_ok, live_reason, _live = check_staging_eligible(
@@ -520,8 +562,10 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
           "executed" if execution.executed
           else (execution.reason or "not executed"))
     import hashlib as _hashlib
-    artifact_digest = _hashlib.sha256(
-        note.markdown.encode("utf-8")).hexdigest() if note.markdown else ""
+    artifact_digest = (
+        _hashlib.sha256(note.markdown.encode("utf-8")).hexdigest()
+        if note.markdown else ""
+    )
     exec_ts = local_now_iso()
     full_artifact_path = ""
     if execution.executed and execution.artifact_path:
@@ -706,7 +750,7 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                 proposed_type=candidate.suggested_type,
                 proposal_reason=candidate.reason,
                 uncertainty=candidate.uncertainty,
-                note_markdown=note.markdown,
+                note_markdown=getattr(note, "markdown", ""),
                 **display,
             ))
             try:

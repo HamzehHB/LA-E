@@ -6,8 +6,9 @@ built on one principle: AI analyzes and proposes; the researcher
 remains the authority.
 
 The current backend implements the smallest reliable single-input
-loop: ingestion (readers, chunking, parsing, cleaning,
-metadata/provenance, unit extraction) -> evidence-first analysis
+loop: ingestion (reader selection, reading, cleaning, normalization,
+parsing, chunking, metadata extraction, knowledge unit extraction &
+provenance recording) -> evidence-first analysis
 (retrieval, comparison, relation analysis, Core analysis,
 classification) -> proposal, confidence, Knowledge Filter (analytical
 signals only) -> mandatory LLM synthesis (bounded, provider-replaceable,

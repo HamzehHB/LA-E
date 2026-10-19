@@ -303,3 +303,40 @@ def test_deterministic_and_immutable():
         build_audit_record("nope", outcome)  # type: ignore
     with pytest.raises(TypeError):
         build_audit_record(request, "nope")  # type: ignore
+
+
+def test_audit_record_constructor_compatibility_and_positional_stability():
+    """Verify that positional AuditRecord instantiation is not shifted by input_hash_source."""
+    # 1. Positional instantiation: position 5 is proposal_hash, NOT input_hash_source
+    record = AuditRecord("rec-1", "run-1", "vault", "a" * 64, "prop-hash-123")
+    assert record.record_id == "rec-1"
+    assert record.run_id == "run-1"
+    assert record.operating_mode == "vault"
+    assert record.input_hash == "a" * 64
+    assert record.proposal_hash == "prop-hash-123"
+    assert record.input_hash_source == ""
+
+    # 2. Keyword instantiation with input_hash_source
+    kw_record = AuditRecord(
+        record_id="rec-2",
+        run_id="run-2",
+        input_hash="b" * 64,
+        input_hash_source="input_provenance",
+        proposal_hash="prop-456",
+    )
+    assert kw_record.input_hash == "b" * 64
+    assert kw_record.input_hash_source == "input_provenance"
+    assert kw_record.proposal_hash == "prop-456"
+
+    # 3. Older record instantiation without input_hash_source
+    # When instantiated without the field, defaults cleanly to ""
+    legacy_record = AuditRecord(
+        record_id="rec-legacy",
+        run_id="run-legacy",
+        operating_mode="personal_vault",
+        input_hash="c" * 64,
+        proposal_hash="prop-legacy",
+    )
+    assert legacy_record.input_hash == "c" * 64
+    assert legacy_record.input_hash_source == ""
+    assert legacy_record.proposal_hash == "prop-legacy"

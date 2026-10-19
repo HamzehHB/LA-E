@@ -66,6 +66,7 @@ class InputProvenance:
     char_length: int
     timestamp: str
     operating_mode: str
+    run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -372,6 +373,7 @@ def process_input(
         char_length=len(input_text),
         timestamp=local_now_iso(),
         operating_mode=source_mode,
+        run_id=run_id,
     )
     return InputEvaluationResult(
         outcome=InputOutcome.ACCEPTED,

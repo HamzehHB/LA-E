@@ -73,6 +73,7 @@ class AuditRecord:
     core_basis: str = ""
     is_authoritative: bool = False
     requires_human_review: bool = True
+    input_hash_source: str = ""
 
     def __post_init__(self) -> None:
         from .clock import local_now_iso
@@ -224,6 +225,7 @@ def build_audit_record(request, outcome, revalidation=None, execution=None,
         run_id=_text("run_id"),
         operating_mode=_text("operating_mode"),
         input_hash=_text("input_hash"),
+        input_hash_source=_text("input_hash_source"),
         proposal_hash=request.proposal_hash,
         query_unit_id=request.query_unit_id,
         query_source=request.query_source,

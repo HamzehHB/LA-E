@@ -1,33 +1,45 @@
 from pathlib import Path
 
+from .base_reader import BaseReader
+from .chat_input_reader import ChatInputReader
 from .markdown_reader import MarkdownReader
 from .txt_reader import TXTReader
 
 
 class ReaderRegistry:
     """
-    Returns the correct reader based on file extension.
+    Returns the correct reader based on file extension or source type.
     """
 
     def __init__(self):
-
-        self._readers = {
+        self._readers: dict[str, BaseReader] = {
             ".txt": TXTReader(),
             ".md": MarkdownReader(),
+            "chat_input": ChatInputReader(),
+            "text": TXTReader(),
         }
 
-    def register(self, extension: str, reader):
+    def register(self, identifier: str, reader: BaseReader):
+        self._readers[identifier.lower()] = reader
 
-        self._readers[extension.lower()] = reader
+    def get(self, file_path_or_identifier: str) -> BaseReader:
+        if not isinstance(file_path_or_identifier, str):
+            raise TypeError("file_path_or_identifier must be a string")
 
-    def get(self, file_path: str):
+        extension = Path(file_path_or_identifier).suffix.lower()
+        if extension and extension in self._readers:
+            return self._readers[extension]
 
-        extension = Path(file_path).suffix.lower()
+        lowered = file_path_or_identifier.lower()
+        if lowered in self._readers:
+            return self._readers[lowered]
 
-        if extension not in self._readers:
+        if f".{lowered}" in self._readers:
+            return self._readers[f".{lowered}"]
 
-            raise ValueError(
-                f"No reader registered for '{extension}'"
-            )
+        err_key = extension if extension else file_path_or_identifier
+        raise ValueError(f"No reader registered for '{err_key}'")
 
-        return self._readers[extension]
+    @property
+    def supported_formats(self) -> tuple[str, ...]:
+        return tuple(sorted(self._readers.keys()))

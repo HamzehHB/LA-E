@@ -24,3 +24,5 @@ class KnowledgeUnit:
     position: int = 0
     boundary_basis: str = "labeled_section"
     warnings: list[str] = field(default_factory=list)
+    input_id: str = ""
+    input_hash: str = ""

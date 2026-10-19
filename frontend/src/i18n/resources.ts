@@ -217,6 +217,14 @@ const en = {
   "ui.recovery.stop": "Stop / Dismiss",
   "ui.recovery.dismiss": "Dismiss",
   "ui.recovery.previousDraft": "Submitted Draft",
+  "ui.ingestion.readerSelected": "Reader selected: {reader}",
+  "ui.ingestion.readingCompleted": "Reading completed: {count} characters read",
+  "ui.ingestion.cleaningCompleted": "Cleaning completed: line endings and whitespace normalized",
+  "ui.ingestion.normalizationCompleted": "Normalization completed: Unicode & intra-line spaces refined",
+  "ui.ingestion.chunkingCompleted": "Chunking completed: {count} chunks formed",
+  "ui.ingestion.parsingCompleted": "Parsing completed: note structure identified",
+  "ui.ingestion.metadataCompleted": "Metadata extraction completed",
+  "ui.ingestion.extractionCompleted": "Extraction completed: {count} knowledge units extracted",
 } as const;
 
 export type UiKey = keyof typeof en;
@@ -433,6 +441,14 @@ const fa: Record<UiKey, string> = {
   "ui.recovery.stop": "توقف / بستن",
   "ui.recovery.dismiss": "بستن",
   "ui.recovery.previousDraft": "متن ارسال‌شده",
+  "ui.ingestion.readerSelected": "خواننده انتخاب شد: {reader}",
+  "ui.ingestion.readingCompleted": "خواندن تکمیل شد: {count} نویسه خوانده شد",
+  "ui.ingestion.cleaningCompleted": "پاک‌سازی تکمیل شد: انتهای خطوط و فاصله‌ها استاندارد شدند",
+  "ui.ingestion.normalizationCompleted": "نرمال‌سازی تکمیل شد: نویسه‌های یونی‌کد و فاصله‌ها پالایش شدند",
+  "ui.ingestion.chunkingCompleted": "بخش‌بندی تکمیل شد: {count} قطعه ساختاری تشکیل شد",
+  "ui.ingestion.parsingCompleted": "تجزیه ساختاری تکمیل شد: ساختار یادداشت شناسایی گردید",
+  "ui.ingestion.metadataCompleted": "استخراج فرا‌داده تکمیل شد",
+  "ui.ingestion.extractionCompleted": "استخراج تکمیل شد: {count} واحد دانشی استخراج گردید",
 };
 
 export function translate(lang: AppLanguage, key: UiKey): string {

@@ -68,11 +68,19 @@ class EvidenceFirstPipeline:
         self.normalizer = normalizer if normalizer is not None else _Normalizer()
         self.parser = parser if parser is not None else ObsidianParser()
         self.metadata_extractor = metadata_extractor or _ME()
+        # Optional observational hook only (default off): receives raw dicts
+        # {"kind", "stage", "message"}. Never changes stage order, results,
+        # or authorization; sink errors are swallowed.
+        if stage_observer is not None and not callable(stage_observer):
+            raise TypeError("stage_observer must be callable or None")
+        self._stage_observer = stage_observer
+
         self.ingestion = IngestionPipeline(
             reader_registry=self.reader_registry, chunker_registry=self.chunker_registry,
             extractor_registry=self.extractor_registry, cleaner=self.cleaner,
             metadata_extractor=self.metadata_extractor, parser=self.parser,
-            normalizer=self.normalizer, classifier=None)
+            normalizer=self.normalizer, classifier=None,
+            stage_observer=None)
         self.retriever = retriever or DefaultRetriever()
         self.comparator = comparator or DefaultComparator()
         self.relation_detector = relation_detector or DefaultDetector()
@@ -85,12 +93,6 @@ class EvidenceFirstPipeline:
         if not isinstance(destination, str):
             raise TypeError("destination must be a string")
         self.destination = destination
-        # Optional observational hook only (default off): receives raw dicts
-        # {"kind", "stage", "message"}. Never changes stage order, results,
-        # or authorization; sink errors are swallowed.
-        if stage_observer is not None and not callable(stage_observer):
-            raise TypeError("stage_observer must be callable or None")
-        self._stage_observer = stage_observer
 
     def _observe(self, kind: str, stage: str, message: str = "") -> None:
         if self._stage_observer is None:
@@ -107,7 +109,7 @@ class EvidenceFirstPipeline:
         if not isinstance(file_path, str) or not file_path:
             raise TypeError("file_path must be a non-empty string")
         return self.run_ingestion(
-            self.ingestion.ingest(file_path), corpus, core_units)
+            self.ingestion.ingest(file_path, observer=self._stage_observer), corpus, core_units)
 
     def run_ingestion(self, ingestion, corpus=(), core_units=()) -> IntegratedResult:
         """Run the analytical chain over one already-ingested result.
