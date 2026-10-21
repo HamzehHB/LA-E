@@ -183,6 +183,11 @@ def _make_handler(launcher: Launcher):
                     return
                 self._serve_events()
                 return
+            if path == "/api/vault/sync/status":
+                if not self._authenticated():
+                    return
+                self._handle_vault_sync_status()
+                return
             if path.startswith("/api/"):
                 if not self._authenticated():
                     return
@@ -302,6 +307,18 @@ def _make_handler(launcher: Launcher):
             if path == "/api/vault/index":
                 self._handle_index_vault()
                 return
+            if path == "/api/vault/sync/authorize":
+                self._handle_vault_sync_authorize()
+                return
+            if path == "/api/vault/sync/revoke":
+                self._handle_vault_sync_revoke()
+                return
+            if path == "/api/vault/sync/reconcile":
+                self._handle_vault_sync_reconcile()
+                return
+            if path == "/api/vault/sync/decide":
+                self._handle_vault_sync_decide()
+                return
             if path == "/api/run/accept":
                 self._handle_accept()
                 return
@@ -345,7 +362,8 @@ def _make_handler(launcher: Launcher):
                     staging_language=data.get("staging_language") or "en",
                     audit_language=data.get("audit_language") or "en",
                     source_type=data.get("source_type", "chat_input"),
-                    input_id=data.get("input_id"))
+                    input_id=data.get("input_id"),
+                )
             except AdapterError as exc:
                 self._error(400, exc.kind, exc.message)
                 return
@@ -447,6 +465,65 @@ def _make_handler(launcher: Launcher):
                 result = launcher.index_vault()
             except AdapterError as exc:
                 self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_vault_sync_status(self):
+            status = launcher.get_vault_sync_status()
+            self._send_json(200, status)
+
+        def _handle_vault_sync_authorize(self):
+            data = self._read_json()
+            if data is None:
+                data = {}
+            vault_root = data.get("vault_root")
+            try:
+                result = launcher.authorize_vault_sync(vault_root=vault_root)
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_vault_sync_revoke(self):
+            result = launcher.revoke_vault_sync()
+            self._send_json(200, result)
+
+        def _handle_vault_sync_reconcile(self):
+            try:
+                result = launcher.reconcile_vault_sync()
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(200, result)
+
+        def _handle_vault_sync_decide(self):
+            data = self._read_json()
+            if data is None:
+                return
+            run_id = data.get("run_id")
+            vault_id = data.get("vault_id")
+            decision = data.get("decision")
+            if not isinstance(run_id, str) or not run_id.strip():
+                self._error(400, "validation_error", "run_id is required")
+                return
+            if not isinstance(vault_id, str) or not vault_id.strip():
+                self._error(400, "validation_error", "vault_id is required")
+                return
+            if decision not in ("approve", "reject"):
+                self._error(400, "validation_error", "decision must be 'approve' or 'reject'")
+                return
+            try:
+                result = launcher.decide_vault_sync(run_id, vault_id, decision)
+            except AdapterError as exc:
+                if exc.kind == "not_found":
+                    code = 404
+                elif exc.kind == "conflict":
+                    code = 409
+                elif exc.kind == "unprocessable_entity":
+                    code = 422
+                else:
+                    code = 400
+                self._error(code, exc.kind, exc.message)
                 return
             self._send_json(200, result)
 

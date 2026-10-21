@@ -5,6 +5,13 @@ class EmbeddingService:
     def __init__(self, model_path: str):
         self.model = load_embedding_model(model_path)
 
+    @property
+    def dimension(self) -> int:
+        """Return embedding vector dimension."""
+        if hasattr(self.model, "get_dimension"):
+            return int(self.model.get_dimension())
+        return int(getattr(self.model, "dimension", 0))
+
     def embed(self, text: str):
         return self.model.encode([text])[0]
 

@@ -27,6 +27,9 @@ import type {
   TranslateRequest,
   TranslateResponse,
   VaultIndexResponse,
+  VaultSyncDecideRequest,
+  VaultSyncDecideResponse,
+  VaultSyncStatusResponse,
 } from "../contracts/transport";
 
 export const TOKEN_HEADER = "X-LAE-Token";
@@ -58,6 +61,11 @@ export interface LiveClient {
   pickFolder(purpose: FolderPurpose): Promise<FolderPickResponse>;
   revealFolder(purpose: FolderPurpose): Promise<RevealFolderResponse>;
   indexVault(): Promise<VaultIndexResponse>;
+  getVaultSyncStatus(): Promise<VaultSyncStatusResponse>;
+  authorizeVaultSync(vault_root?: string): Promise<VaultIndexResponse>;
+  revokeVaultSync(): Promise<{ authorized: boolean; status: string }>;
+  reconcileVaultSync(): Promise<unknown>;
+  decideVaultSync(req: VaultSyncDecideRequest): Promise<VaultSyncDecideResponse>;
   startRun(req: RunRequest): Promise<RunResponse>;
   approve(req: ApproveRequest): Promise<ApproveResponse>;
   acceptProposal(run_id?: string): Promise<AcceptProposalResponse>;
@@ -120,6 +128,19 @@ class FetchLiveClient implements LiveClient {
     return (await resp.json()) as T;
   }
 
+  private async get<T>(path: string): Promise<T> {
+    let resp: Response;
+    try {
+      resp = await fetch(path, {
+        headers: this.authHeader(),
+      });
+    } catch {
+      throw new Error("connection_unavailable");
+    }
+    if (!resp.ok) throw new Error(await this.errorKind(resp));
+    return (await resp.json()) as T;
+  }
+
   private async errorKind(resp: Response): Promise<string> {
     try {
       const payload = (await resp.json()) as {
@@ -170,6 +191,26 @@ class FetchLiveClient implements LiveClient {
 
   indexVault(): Promise<VaultIndexResponse> {
     return this.post<VaultIndexResponse>("/api/vault/index", {});
+  }
+
+  getVaultSyncStatus(): Promise<VaultSyncStatusResponse> {
+    return this.get<VaultSyncStatusResponse>("/api/vault/sync/status");
+  }
+
+  authorizeVaultSync(vault_root?: string): Promise<VaultIndexResponse> {
+    return this.post<VaultIndexResponse>("/api/vault/sync/authorize", { vault_root });
+  }
+
+  revokeVaultSync(): Promise<{ authorized: boolean; status: string }> {
+    return this.post<{ authorized: boolean; status: string }>("/api/vault/sync/revoke", {});
+  }
+
+  reconcileVaultSync(): Promise<unknown> {
+    return this.post<unknown>("/api/vault/sync/reconcile", {});
+  }
+
+  decideVaultSync(req: VaultSyncDecideRequest): Promise<VaultSyncDecideResponse> {
+    return this.post<VaultSyncDecideResponse>("/api/vault/sync/decide", req);
   }
 
   startRun(req: RunRequest): Promise<RunResponse> {
@@ -288,6 +329,11 @@ const unavailable: LiveClient = {
   pickFolder: () => Promise.reject(new Error("connection_unavailable")),
   revealFolder: () => Promise.reject(new Error("connection_unavailable")),
   indexVault: () => Promise.reject(new Error("connection_unavailable")),
+  getVaultSyncStatus: () => Promise.reject(new Error("connection_unavailable")),
+  authorizeVaultSync: () => Promise.reject(new Error("connection_unavailable")),
+  revokeVaultSync: () => Promise.reject(new Error("connection_unavailable")),
+  reconcileVaultSync: () => Promise.reject(new Error("connection_unavailable")),
+  decideVaultSync: () => Promise.reject(new Error("connection_unavailable")),
   startRun: () => Promise.reject(new Error("connection_unavailable")),
   approve: () => Promise.reject(new Error("connection_unavailable")),
   acceptProposal: () => Promise.reject(new Error("connection_unavailable")),

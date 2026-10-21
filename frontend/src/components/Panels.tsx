@@ -64,6 +64,8 @@ export function ProcessingResult() {
     liveError,
     dismissRunOutcome,
     cancelActiveRun,
+    pendingSyncApproval,
+    liveDecideVaultSync,
   } = useStore();
 
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
@@ -86,7 +88,8 @@ export function ProcessingResult() {
 
   const hasInputOutcome = Boolean(state.inputOutcome);
   const isClarification = state.inputOutcome === "NEEDS_CLARIFICATION";
-  const safeStop = !hasInputOutcome && (state.safeStop || (state.run.stopped && state.run.stop_reason));
+  const hasSyncApproval = Boolean(pendingSyncApproval);
+  const safeStop = !hasInputOutcome && !hasSyncApproval && (state.safeStop || (state.run.stopped && state.run.stop_reason));
 
   const isRunning =
     liveAvailable &&
@@ -94,6 +97,7 @@ export function ProcessingResult() {
     !state.run.stopped &&
     !safeStop &&
     !hasInputOutcome &&
+    !hasSyncApproval &&
     !state.run.error &&
     state.run.current_stage !== "completed" &&
     !state.run.status.toLowerCase().includes("finished") &&
@@ -107,7 +111,7 @@ export function ProcessingResult() {
   const stateKind =
     safeStop || state.run.error || (hasInputOutcome && !isClarification)
       ? "err"
-      : isClarification
+      : isClarification || hasSyncApproval
       ? "processing"
       : livePending || showFixture
       ? "ok"
@@ -118,6 +122,8 @@ export function ProcessingResult() {
   const stateLabel =
     state.inputOutcome === "STOPPED" || (state.run.stopped && !hasInputOutcome && safeStop)
       ? t("ui.stage.stopped")
+      : hasSyncApproval
+      ? (state.appLanguage === "fa" ? "همگام‌سازی Vault لازم است" : "Vault Sync Approval Required")
       : isClarification
       ? t("ui.recovery.clarificationTitle")
       : stateKind === "err"
@@ -235,7 +241,93 @@ export function ProcessingResult() {
               </button>
             </div>
           </div>
-      ) : safeStop ? (
+        ) : hasSyncApproval && pendingSyncApproval ? (
+          /* Vault Synchronization Human Approval Card */
+          <div className="safestop-card vault-sync-card" role="region" aria-label="Vault Synchronization Approval">
+            <div className="safestop-header">
+              <span className="error-icon" aria-hidden="true" style={{ color: "var(--accent-color, #e5a50a)" }}>
+                ⚡
+              </span>
+              <div>
+                <p className="err-title" style={{ color: "var(--accent-color, #e5a50a)" }}>
+                  {state.appLanguage === "fa"
+                    ? "تأیید همگام‌سازی یادداشت‌های Vault الزامی است"
+                    : "Obsidian Vault Synchronization Approval Required"}
+                </p>
+                <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", margin: "0.25rem 0", flexWrap: "wrap" }}>
+                  <span className="badge-chip outcome-chip" style={{ background: "rgba(229,165,10,0.15)", color: "#e5a50a", borderColor: "#e5a50a" }}>
+                    [SYNC APPROVAL GATE]
+                  </span>
+                  {pendingSyncApproval.vault_id && (
+                    <span className="muted" style={{ fontSize: "0.75rem" }}>
+                      vault: <code>{pendingSyncApproval.vault_id}</code>
+                    </span>
+                  )}
+                  {pendingSyncApproval.run_id && (
+                    <span className="muted" style={{ fontSize: "0.75rem" }}>
+                      run: <code>{pendingSyncApproval.run_id}</code>
+                    </span>
+                  )}
+                </div>
+                <p className="err-desc">
+                  {state.appLanguage === "fa"
+                    ? "تغییراتی در یادداشت‌های Vault شناسایی شد. قبل از بازیابی، همگام‌سازی با ایندکس برداری نیاز به تأیید صریح شما دارد. در صورت رد، اجرای فعلی بدون تغییر و بدون استفاده از داده‌های قدیمی متوقف می‌شود."
+                    : "Changes were detected in the Obsidian Vault. Synchronization updates the persistent vector/lexical index before candidate retrieval proceeds. If rejected, the active run terminates safely without writing to the index and without querying stale data."}
+                </p>
+              </div>
+            </div>
+
+            {/* Changes Breakdown */}
+            <div className="sync-diff-summary" style={{ margin: "0.75rem 0", padding: "0.75rem", background: "var(--card-bg, rgba(255,255,255,0.03))", borderRadius: "6px", border: "1px solid var(--border-color, #333)" }}>
+              <div style={{ display: "flex", gap: "1.5rem", marginBottom: "0.5rem", flexWrap: "wrap", fontSize: "0.85rem" }}>
+                <span>
+                  🟢 <strong>{pendingSyncApproval.diff.added.length}</strong> {state.appLanguage === "fa" ? "افزوده شده" : "Added"}
+                </span>
+                <span>
+                  🟡 <strong>{pendingSyncApproval.diff.modified.length}</strong> {state.appLanguage === "fa" ? "ویرایش شده" : "Modified"}
+                </span>
+                <span>
+                  🔴 <strong>{pendingSyncApproval.diff.removed.length}</strong> {state.appLanguage === "fa" ? "حذف شده" : "Removed"}
+                </span>
+              </div>
+              <div style={{ maxHeight: "120px", overflowY: "auto", fontSize: "0.75rem", fontFamily: "var(--font-mono, monospace)" }}>
+                {pendingSyncApproval.diff.added.map((path) => (
+                  <div key={`add-${path}`} style={{ color: "#4ade80" }}>+ {path}</div>
+                ))}
+                {pendingSyncApproval.diff.modified.map((path) => (
+                  <div key={`mod-${path}`} style={{ color: "#facc15" }}>~ {path}</div>
+                ))}
+                {pendingSyncApproval.diff.removed.map((path) => (
+                  <div key={`del-${path}`} style={{ color: "#f87171" }}>- {path}</div>
+                ))}
+              </div>
+            </div>
+
+            <div className="safestop-actions" style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginTop: "0.75rem" }}>
+              <button
+                type="button"
+                className="btn approve"
+                onClick={() => void liveDecideVaultSync("approve")}
+              >
+                {state.appLanguage === "fa" ? "تأیید و همگام‌سازی" : "Approve & Synchronize"}
+              </button>
+              <button
+                type="button"
+                className="btn reject"
+                onClick={() => void liveDecideVaultSync("reject")}
+              >
+                {state.appLanguage === "fa" ? "رد و توقف امن" : "Reject & Stop Run"}
+              </button>
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => void cancelActiveRun()}
+              >
+                {state.appLanguage === "fa" ? "لغو درخواست" : "Cancel Run"}
+              </button>
+            </div>
+          </div>
+        ) : safeStop ? (
         /* Recoverable Safe-Stop / Paused Run recovery view */
         <div className="safestop-card" role="alert">
           <div className="safestop-header">
@@ -811,8 +903,12 @@ export function Composer() {
     liveAvailable,
     startLiveRun,
     liveError,
+    setRetrievalType,
   } = useStore();
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
+  const semanticReady =
+    state.resources.vector_db.validity === "configured_valid" &&
+    state.resources.embedding_model.validity === "configured_valid";
 
   const [text, setText] = useState(state.composerText);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -909,6 +1005,36 @@ export function Composer() {
         role="region"
         aria-label={t("ui.welcome.composer.title")}
       >
+        <div className="composer-strategy-bar">
+          <span className="strategy-label">{t("ui.strategy.title")}:</span>
+          <button
+            type="button"
+            className={`strategy-chip ${state.retrievalType === "lexical" ? "active" : ""}`}
+            onClick={() => setRetrievalType("lexical")}
+            disabled={runActive}
+            aria-pressed={state.retrievalType === "lexical"}
+          >
+            ● {t("ui.strategy.lexical")}
+          </button>
+          <button
+            type="button"
+            className={`strategy-chip ${state.retrievalType === "semantic" ? "active" : ""}`}
+            onClick={() => setRetrievalType("semantic")}
+            disabled={runActive}
+            aria-pressed={state.retrievalType === "semantic"}
+            title={semanticReady ? undefined : t("ui.nav.semanticNeedsSetup")}
+          >
+            ● {t("ui.strategy.semantic")} {semanticReady ? "" : "⚠"}
+          </button>
+          <button
+            type="button"
+            className="strategy-chip disabled"
+            disabled={true}
+            title={t("ui.strategy.hybridDisabled")}
+          >
+            ○ {t("ui.strategy.hybrid")}
+          </button>
+        </div>
         <div className="composer-input-row">
           <textarea
             ref={textareaRef}

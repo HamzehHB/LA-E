@@ -313,3 +313,110 @@ sequenceDiagram
 * **Authoritative Recomputation:** Edits are recomputed server-side in `apply_proposal_edit()`; client-supplied hashes are strictly ignored.
 * **Stale Approval Invalidation:** Because approval is bound to `proposal_hash`, any edit produces $H_1 \ne H_0$, invalidating prior approvals.
 * **Fail-Closed Tamper Protection:** If note or proposal contents are altered without re-approval, `Revalidator.revalidate()` fails closed (`proposal_contents` or `proposal_identity` check failure), preventing controlled execution.
+
+---
+
+## 14. Retrieval Strategies, Temporary Input Embedding Cache, and Corpus Immutability
+
+### 14.1 Persistent Corpus Embeddings vs. Temporary Input Embeddings
+* **Persistent Vector Index (Corpus Data):**
+  * Persistent embeddings represent previously ingested, indexed, and synchronized corpus/vault knowledge stored in the configured vector store (e.g. LanceDB).
+  * The persistent vector store is strictly derived data, never authoritative knowledge, and is updated only via explicit operator synchronization (`synchronize_index`).
+  * In-flight retrieval candidate evaluation NEVER mutates, inserts into, re-indexes, or modifies the persistent vector store.
+* **Temporary Input Embeddings (Current Run Only):**
+  * Current-input chunks generate temporary vectors solely to perform semantic similarity candidate lookup against the persistent index.
+  * Stored exclusively in an isolated, in-memory, run-scoped cache (`TemporaryEmbeddingCache`) keyed by `scope_id`.
+  * Temporary vectors are NEVER saved to disk, NEVER inserted into the persistent vector store, and NEVER treated as authoritative corpus knowledge.
+
+### 14.2 Temporary Cache Lifecycle and Guaranteed Cleanup
+```text
+[Input Ingestion]
+       │ (Chunks produced)
+       ▼
+[Retrieval Step] ──(Strategy = Semantic)──► [Allocate TemporaryEmbeddingCache(scope_id)]
+       │                                                 │
+       │                                       Generate temporary vectors
+       │                                                 │
+       ▼                                                 ▼
+[Query Vector Candidate Search] ◄────────────── [Vectors in Temporary Cache]
+       │
+       ▼ (Search complete)
+[Cache Cleanup] ──► temporary_cache.cleanup() ──► Vectors wiped from memory
+       │
+       ▼ (Guaranteed execution via try...finally on success, error, cancellation, or safe-stop)
+[Receipt Emitted] ──► CacheReceipt(scope_id, generated, failed, cleaned_up, cleanup_error)
+```
+* **Run-Scoped Isolation:** Each run generates a unique `scope_id` (e.g. `cache-run-001`). Vectors cannot collide or leak across runs.
+* **Deterministic Cleanup:** `cleanup()` is invoked as soon as chunk candidate retrieval completes, with an idempotent outer `finally:` block in `adapter/app.py` guaranteeing cleanup on unexpected exceptions, user cancellation, or safe-stops.
+* **Zero Residual Vectors:** Upon `cleanup()`, all vector lists and embeddings are cleared from memory.
+* **Observable Failure Handling:** If a cache fails to clean up, `cleaned_up` is set to `False`, the error is recorded in `cleanup_error`, and an observable event (`retrieval_cache_cleanup_failed`) is emitted to the audit trail. The system never claims simulated success.
+
+### 14.3 User-Selectable Retrieval Strategies
+Researchers can select the retrieval strategy directly from the UI composer or via API (`retrieval_mode` in `RunRequest`):
+* **`lexical` (Default / Baseline):**
+  * Pure deterministic token-overlap candidate retrieval.
+  * **Zero-Embedding Purity:** Completely bypasses the embedding model and allocates ZERO temporary embeddings. Does not require or touch vector database infrastructure.
+* **`semantic`:**
+  * Dense vector similarity retrieval using temporary input embeddings compared against the persistent index.
+  * **Strict Fail-Closed Availability:** Requires both vector database and embedding model to be configured and valid. If either is missing, misconfigured, or has dimensional mismatch, the system fails closed with a structured `validation_error` and halts safely. It **never** silently falls back to lexical retrieval.
+* **`hybrid` (Future-Ready Contract):**
+  * Formally defined in `RetrievalStrategy.HYBRID` and registered in `RetrievalStrategyRegistry`.
+  * **Strictly Non-Operational:** Marked as planned (`is_operational = False`). Selecting hybrid in `/api/run` raises `UnsupportedStrategyError` (`validation_error`), and the UI chip is permanently disabled. This prevents premature pseudo-hybrid heuristics before contractual reciprocal rank fusion and score normalization are formally verified.
+
+### 14.4 Audit Traceability Fields
+Every evaluated candidate records complete retrieval cache metadata in `AuditRecord` and `audit.jsonl`:
+* `retrieval_strategy`: Selected strategy (`"lexical"` or `"semantic"`).
+* `retrieval_cache_scope_id`: Unique run cache identifier (`"cache-<run_id>"` or `"none"` for lexical).
+* `retrieval_embeddings_generated`: Number of vectors generated in temporary cache (0 for lexical).
+* `retrieval_embeddings_failed`: Number of failed chunk embedding attempts.
+* `retrieval_cache_cleaned_up`: Boolean confirming memory cleanup.
+* `retrieval_cache_cleanup_error`: Diagnostic error string if cleanup failed, else `None`.
+* `embedding_provider`, `embedding_model`, `embedding_dimension`: Metadata of the active embedding provider (`None` for lexical).
+* `retrieval_chunk_count`: Number of input chunks evaluated during retrieval.
+* **Zero Leakage:** Raw vector floats and private input texts are strictly excluded from audit records.
+
+---
+
+## 15. Vault-Scoped Persistent Index Synchronization (Process A) vs. Run-Scoped Temporary Retrieval Embeddings (Process B)
+
+### 15.1 Core Architecture: Two Distinct Lifecycles
+
+The LivingAuthenticity Environment strictly separates two independent vector lifecycles:
+
+| Dimension | Process A: Authorized Vault Synchronization | Process B: Run-Scoped Temporary Retrieval Embeddings |
+|:---|:---|:---|
+| **Trigger** | Explicit researcher authorization (`/api/vault/sync/authorize`) | Researcher submits text for analysis (`/api/run`) |
+| **Lifecycle** | Persistent & continuous while authorized | Ephemeral & run-scoped (`cache-<run_id>`) |
+| **Scope** | One dedicated persistent index per authorized Vault | Active input chunks during candidate retrieval |
+| **Storage Location** | `<vector_db_root>/vault_<sha256[:12]>` | In-memory `TemporaryEmbeddingCache` |
+| **Corpus Authority** | Strictly read-only to Vault; index is derived | Evaluates candidates; never mutates persistent store |
+| **Cleanup Rules** | Cleared only upon explicit user command or re-indexing | Guaranteed wiped immediately after retrieval via `finally:` |
+| **Change Detection** | Incremental mtime/hash manifest diffing | N/A (single-run query embedding) |
+
+### 15.2 One Authorized Vault → Dedicated Persistent Index Isolation
+
+* **Physical Isolation by Construction:** Rather than filtering by row tag in a shared table, each Vault receives a dedicated, non-sensitive filesystem directory:
+  $$\text{Index Directory} = \text{PathBoundary}(\text{vector\_db\_root}) \mathbin{/} \text{vault\_}\langle\text{sha256}(\text{normalized\_vault\_root})[:12]\rangle$$
+* **Cross-Vault Isolation:** Switching between Vaults never reuses, pollutes, or overwrites another Vault's persistent database. Re-selecting a previously synchronized Vault safely reattaches to its dedicated store.
+* **Corpus Immutability & Read-Only Guarantee:** The authoritative Obsidian Vault is opened with strict read-only semantics. Synchronization NEVER creates, edits, moves, or deletes files inside the Vault.
+* **Strict Source Exclusion Boundary:** Notes eligible for corpus indexing must be genuine `.md` files residing inside the authorized Vault. Symlinks are rejected. Files located inside Staging, Audit, Vector DB, or repository workspace roots are strictly excluded by construction.
+
+### 15.3 Explicit Operator Reconciliation & Freshness Lifecycle
+
+In accordance with system security contracts (operator action only — no watcher and no background reindex), synchronization and reconciliation execute strictly through explicit operator action (`POST /api/vault/sync/authorize`, `POST /api/vault/sync/reconcile`, or pre-retrieval run reconciliation):
+1. `unauthorized`: Default initial state. No background task runs, no indexing occurs.
+2. `authorizing`: User initiated authorization; resolving boundaries, initializing store, and performing initial synchronization.
+3. `sync_in_progress`: Ingesting notes, generating embeddings, writing persistent rows.
+4. `fresh`: Dedicated index is completely aligned with current Vault disk state.
+5. `stale` / `change_detected`: Added, modified, or removed files detected awaiting explicit reconciliation.
+6. `revoked`: User explicitly revoked authorization (`/api/vault/sync/revoke`).
+7. `error`: Unhandled disk or permission failure; surfaces diagnostic reason without silent fallback.
+
+### 15.4 Pre-Retrieval Freshness Verification & Human-Controlled Reconciliation
+
+* **Non-Mutating Freshness Check:** When semantic retrieval executes in `personal_vault` mode, the adapter inspects the current Vault state against the persistent index's recorded manifest (`check_changes()`).
+* **Explicit Update Approval / Rejection:**
+  - If no changes are detected, retrieval proceeds against the existing index without unnecessary prompts or writes.
+  - If changes (added, modified, or removed notes) are detected, an explicit decision is requested. If approved, synchronization updates the persistent index explicitly. If rejected, the persistent index is NOT modified, its stale state is preserved and reported accurately (never falsely marked fresh), and retrieval continues using the existing index if technically usable.
+* **Fail-Closed Availability:** If the authorized Vault index contains 0 vectors or has not been authorized, retrieval fails closed with `validation_error` ("dedicated Vault index holds 0 vectors. Please synchronize the Vault first."). The system **never** silently falls back to lexical search.
+* **Audit Provenance:** All audit records persist `vault_id` alongside the temporary cache receipt, guaranteeing full forensic traceability.

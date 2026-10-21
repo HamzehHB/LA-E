@@ -1,5 +1,6 @@
 """Integrated evidence-first analytical pipeline (composition layer)."""
 from dataclasses import dataclass, field
+from typing import Any
 from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
 from src.living_authenticity.knowledge.analysis.comparison.outcome import ComparisonResult
 from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
@@ -81,7 +82,7 @@ class EvidenceFirstPipeline:
             metadata_extractor=self.metadata_extractor, parser=self.parser,
             normalizer=self.normalizer, classifier=None,
             stage_observer=None)
-        self.retriever = retriever or DefaultRetriever()
+        self.retriever: Any = retriever or DefaultRetriever()
         self.comparator = comparator or DefaultComparator()
         self.relation_detector = relation_detector or DefaultDetector()
         self.core_analyzer = core_analyzer or DefaultCoreAnalyzer()
@@ -128,6 +129,18 @@ class EvidenceFirstPipeline:
             if not isinstance(item, KnowledgeUnit):
                 raise TypeError("core_units must hold KnowledgeUnit objects")
         unit_results = tuple(self.run_unit(u, corpus_units, cores) for u in ingestion.knowledge_units)
+        cache = getattr(self.retriever, "cache", None)
+        if cache is not None:
+            cache.cleanup()
+            for r in unit_results:
+                ret_res = getattr(r, "retrieval_result", None)
+                if ret_res is not None and isinstance(ret_res.metadata, dict):
+                    ret_res.metadata["cleaned_up"] = getattr(cache, "cleaned_up", True)
+                    ret_res.metadata["cleanup_error"] = getattr(cache, "cleanup_error", None)
+                    receipt_fn = getattr(cache, "receipt", None)
+                    if callable(receipt_fn):
+                        receipt = receipt_fn()
+                        ret_res.metadata["cleanup_time"] = getattr(receipt, "cleanup_time_iso", "")
         note = "analysis-only integrated result for human review; not approval or execution."
         if not unit_results:
             note = "no knowledge units extracted; nothing analyzed."

@@ -67,7 +67,21 @@ Implemented foundations include:
   default integrated pipeline keeps its deterministic token-overlap
   retriever unless embedding is explicitly requested. Vector results are
   evidence only (Retrieval ≠ Decision; Similarity ≠ Identity), and the
-  vector store is a retrieval index, never an authoritative store
+  vector store is a retrieval index, never an authoritative store.
+- User-selectable retrieval strategies (`RetrievalStrategyRegistry`):
+  `lexical` (deterministic token-overlap baseline; strictly zero embeddings
+  and no vector allocation), `semantic` (dense vector similarity candidate
+  retrieval using temporary input chunk embeddings against the persistent index;
+  fails closed with typed errors rather than silent fallback when resources
+  are missing), and an extensible future-ready `hybrid` contract (fails closed
+  until formal fusion and scoring are implemented).
+- An isolated, run-scoped temporary embedding cache (`TemporaryEmbeddingCache`):
+  new-input chunks are embedded solely for active query retrieval and held in an
+  in-memory cache that is deterministically cleaned up on every exit path
+  (success, error, cancellation, safe-stop). Temporary input embeddings are
+  strictly isolated and NEVER inserted or merged into the persistent corpus
+  vector store. Cache lifecycle metrics and receipts are recorded in audit trails
+  without raw vector floats or private text leakage.
 - An explicit Personal Vault vs Examples operating-mode contract
   (`knowledge/modes.py`): examples mode fails closed rather than ever
   resolving the configured personal vault; mode is recorded in audit
@@ -116,9 +130,11 @@ Implemented foundations include:
   with a full-stack REST/SSE transport API:
   - Interactive top navigation with `TEST` / `VAULT` mode switching,
     native folder selection and validation (`staging`, `audit`, `vector_db`),
-    and model configuration dropdowns (`Database`, `AI`, `Knowledge Language`).
+    and model configuration dropdowns (`Database` with retrieval strategy selection, `AI`, `Knowledge Language`).
   - First-time onboarding flows for initial vault vector indexing, LanceDB setup,
     and audit directory provisioning (`passed/`, `failed/`, `errors/`).
+  - In-place Composer with bottom dock, character/letter boundary feedback,
+    and user-selectable retrieval strategy switcher (Lexical, Semantic, disabled Hybrid).
   - 17-node chronological workflow timeline tracking live pipeline stage states.
   - Upper constellation band with 13 connected stars and DeepThink `Current Audit`
     overlay streaming sanitized operational events during active runs.

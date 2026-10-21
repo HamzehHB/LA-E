@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from typing import Any
 
 from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import (
     KnowledgeUnit,
@@ -31,6 +32,11 @@ class KnowledgeRetriever(ABC):
     def name(self) -> str:
         """Stable strategy name recorded on results and candidates."""
         raise NotImplementedError
+
+    @property
+    def cache(self) -> Any:
+        """Optional temporary embedding cache attached to this retriever."""
+        return None
 
     @abstractmethod
     def retrieve(

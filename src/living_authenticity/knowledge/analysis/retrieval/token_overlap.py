@@ -100,6 +100,11 @@ class TokenOverlapRetriever(KnowledgeRetriever):
     def max_candidates(self) -> int:
         return self._max_candidates
 
+    @property
+    def cache(self) -> None:
+        """Token overlap retrieval does not use a temporary embedding cache."""
+        return None
+
     def retrieve(
         self, query: KnowledgeUnit, corpus: Sequence[Any]
     ) -> RetrievalResult:

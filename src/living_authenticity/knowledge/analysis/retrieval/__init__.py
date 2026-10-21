@@ -2,10 +2,18 @@
 from typing import TYPE_CHECKING
 
 from .base_retriever import KnowledgeRetriever
+from .cache import CacheCleanupError, CacheReceipt, TemporaryEmbeddingCache
 from .candidate import RetrievedCandidate
 from .result import RetrievalResult
 from .retriever_registry import RetrieverRegistry
 from .store import InMemoryKnowledgeStore, KnowledgeCorpus
+from .strategy import (
+    RetrievalStrategy,
+    RetrievalStrategyRegistry,
+    StrategyConfigurationError,
+    StrategyDefinition,
+    UnsupportedStrategyError,
+)
 from .token_overlap import (
     DefaultRetriever,
     TokenOverlapRetriever,
@@ -46,4 +54,12 @@ __all__ = (
     "DefaultRetriever",
     "normalize_query_text",
     "tokenize",
+    "TemporaryEmbeddingCache",
+    "CacheCleanupError",
+    "CacheReceipt",
+    "RetrievalStrategy",
+    "StrategyDefinition",
+    "RetrievalStrategyRegistry",
+    "UnsupportedStrategyError",
+    "StrategyConfigurationError",
 )

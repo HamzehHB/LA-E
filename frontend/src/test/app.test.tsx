@@ -637,5 +637,29 @@ describe("Input Stage — Chat Input UI, Loading, Localization, and Timeline", (
     expect(screen.getByText(/50 \/ 50 letters.*ready to send/i)).toBeInTheDocument();
     expect(submitBtn).toBeEnabled();
   });
+
+  it("renders retrieval strategy selector with lexical active by default and hybrid strictly disabled", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    const user = userEvent.setup();
+    render(<App />);
+
+    const lexicalBtn = screen.getByRole("button", { name: /lexical/i });
+    const semanticBtn = screen.getByRole("button", { name: /semantic/i });
+    const hybridBtn = screen.getByRole("button", { name: /hybrid/i });
+
+    expect(lexicalBtn).toHaveAttribute("aria-pressed", "true");
+    expect(semanticBtn).toHaveAttribute("aria-pressed", "false");
+    expect(hybridBtn).toBeDisabled();
+
+    // Selecting semantic updates pressed state
+    await user.click(semanticBtn);
+    expect(semanticBtn).toHaveAttribute("aria-pressed", "true");
+    expect(lexicalBtn).toHaveAttribute("aria-pressed", "false");
+
+    // Switching back to lexical works
+    await user.click(lexicalBtn);
+    expect(lexicalBtn).toHaveAttribute("aria-pressed", "true");
+    expect(semanticBtn).toHaveAttribute("aria-pressed", "false");
+  });
 });
 

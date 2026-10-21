@@ -10,11 +10,16 @@ existing ``AuditWriter``, inside the runner.
 """
 import hashlib
 import json
+import logging
 import secrets
 import threading
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 APP_NAME = "living-authenticity"
 VERSION = "0.1.0"
@@ -43,6 +48,7 @@ _RUN_SCOPED_EVENT_KINDS = frozenset({
     "stage_completed", "status", "warning", "error", "stopped",
     "human_review_required", "approval_decided", "consent_required",
     "revalidation_result", "execution_result", "completed",
+    "sync_approval_required",
 })
 
 
@@ -87,6 +93,64 @@ class _Pending:
         if not self._event.wait(timeout):
             return None
         return self._result
+
+
+class ApprovalState(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    RECONCILING = "reconciling"
+    TERMINAL = "terminal"
+
+
+class _PendingSyncApproval:
+    """One pending human Vault sync approval decision, run-bound."""
+
+    def __init__(self, run_id: str, vault_id: str, vault_root: str,
+                 diff: dict, manifest: dict | None = None) -> None:
+        self.run_id = run_id
+        self.vault_id = vault_id
+        self.vault_root = vault_root
+        self.diff = diff
+        self.manifest = manifest or {}
+        self.created_at = _utcnow()
+        self.state = ApprovalState.PENDING
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+
+    def resolve(self, decision: str) -> bool:
+        """Atomically transition state from PENDING. Returns True if first transition."""
+        with self._lock:
+            if self.state != ApprovalState.PENDING:
+                return False
+            if decision == "approve":
+                self.state = ApprovalState.APPROVED
+            elif decision == "reject":
+                self.state = ApprovalState.REJECTED
+            elif decision == "cancelled":
+                self.state = ApprovalState.CANCELLED
+            else:
+                return False
+            self._event.set()
+            return True
+
+    def transition_to_reconciling(self) -> bool:
+        """Transition from APPROVED to RECONCILING before executing reconcile."""
+        with self._lock:
+            if self.state != ApprovalState.APPROVED:
+                return False
+            self.state = ApprovalState.RECONCILING
+            return True
+
+    def retire(self) -> None:
+        """Mark as terminal and unblock any waiters."""
+        with self._lock:
+            self.state = ApprovalState.TERMINAL
+            self._event.set()
+
+    def wait(self, timeout: float = 0.5) -> bool:
+        return self._event.wait(timeout)
 
 
 class _PublishingGate:
@@ -203,9 +267,17 @@ class Launcher:
         self._paused_run = None
         self._pending_approval = None
         self._pending_consent = None
+        self._pending_vault_sync: _PendingSyncApproval | None = None
+        self._vault_sync_run_info: dict[str, dict] = {}
         self._reports = {}
         from .events import RunEventLog
+        from src.living_authenticity.knowledge.analysis.retrieval.lancedb_retriever import (
+            VectorEmbeddingService,
+        )
+        from src.living_authenticity.knowledge.vault.sync import VaultSyncSession
 
+        self._vault_sync_session = VaultSyncSession(stage_observer=self._sink)
+        self._embedder: VectorEmbeddingService | None = None
         self.events = RunEventLog()
         self._bootstrap_from_paths()
 
@@ -507,10 +579,16 @@ class Launcher:
             raise AdapterError(
                 "validation_error",
                 "source_mode must be one of: " + ", ".join(SOURCE_MODES))
-        if retrieval_mode not in ("lexical", "semantic"):
-            raise AdapterError(
-                "validation_error",
-                "retrieval_mode must be one of: lexical, semantic")
+        from src.living_authenticity.knowledge.analysis.retrieval.strategy import (
+            RetrievalStrategyRegistry,
+            UnsupportedStrategyError,
+        )
+
+        try:
+            strategy_defn = RetrievalStrategyRegistry().validate(retrieval_mode)
+            retrieval_mode = strategy_defn.name
+        except UnsupportedStrategyError as exc:
+            raise AdapterError("validation_error", str(exc))
         for name, value in (("app_language", app_language),
                             ("staging_language", staging_language),
                             ("audit_language", audit_language)):
@@ -750,6 +828,9 @@ class Launcher:
             )
             summary = self._report_summary(report)
             with self._lock:
+                sync_info = self._vault_sync_run_info.pop(run_id, None)
+                if sync_info is not None:
+                    summary["vault_sync"] = sync_info
                 self._reports[run_id] = summary
             if summary.get("audit_warning"):
                 self._sink({"kind": "warning", "stage": "audit",
@@ -758,8 +839,15 @@ class Launcher:
                         "message": "run finished" + (" (with audit warnings)" if summary.get("audit_warning") else "")})
         except Exception as exc:  # bounded; never leaks a raw traceback
             with self._lock:
-                self._reports[run_id] = {"run_id": run_id,
-                                         "error": type(exc).__name__}
+                existing = self._reports.get(run_id, {})
+                rep = {"run_id": run_id, "error": type(exc).__name__}
+                if "outcome" in existing:
+                    rep["outcome"] = existing["outcome"]
+                if "reason" in existing:
+                    rep["reason"] = existing["reason"]
+                if "terminal_outcome" in existing:
+                    rep["terminal_outcome"] = existing["terminal_outcome"]
+                self._reports[run_id] = rep
                 self._paused_run = {
                     "run_id": run_id,
                     "input_text": input_text,
@@ -773,6 +861,9 @@ class Launcher:
                         "message": "run paused on error: " + (str(exc) or type(exc).__name__)})
         finally:
             with self._lock:
+                if self._pending_vault_sync and self._pending_vault_sync.run_id == run_id:
+                    self._pending_vault_sync.retire()
+                    self._pending_vault_sync = None
                 self._active_run_id = ""
                 self._cancel_flags.discard(run_id)
 
@@ -795,11 +886,39 @@ class Launcher:
                 raise AdapterError(
                     "validation_error", "unknown or inactive run_id")
             self._cancel_flags.add(run_id)
+            if self._pending_vault_sync and self._pending_vault_sync.run_id == run_id:
+                self._pending_vault_sync.resolve("cancelled")
         self._sink({"kind": "status", "stage": "cancellation",
                     "message": "cancellation requested"})
         return {"run_id": run_id, "status": "cancel_requested",
                 "reason": "cancellation will take effect at the next "
                           "safe boundary"}
+
+    def decide_vault_sync(self, run_id: str, vault_id: str, decision: str) -> dict:
+        """Validate and record explicit operator decision for pending Vault sync."""
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AdapterError("validation_error", "run_id is required")
+        if not isinstance(vault_id, str) or not vault_id.strip():
+            raise AdapterError("validation_error", "vault_id is required")
+        if decision not in ("approve", "reject"):
+            raise AdapterError("validation_error", "decision must be 'approve' or 'reject'")
+
+        with self._lock:
+            pending = self._pending_vault_sync
+            if pending is None or pending.run_id != run_id:
+                raise AdapterError("not_found", f"no pending vault sync approval for run_id '{run_id}'")
+            if pending.vault_id != vault_id:
+                raise AdapterError("unprocessable_entity", f"vault_id mismatch: expected '{pending.vault_id}', got '{vault_id}'")
+
+            if not pending.resolve(decision):
+                raise AdapterError("conflict", f"vault sync approval for run '{run_id}' is already {pending.state.value}")
+
+        return {
+            "status": "ok",
+            "run_id": run_id,
+            "vault_id": vault_id,
+            "decision": decision,
+        }
 
     def _cancelled(self, run_id: str) -> bool:
         with self._lock:
@@ -807,6 +926,8 @@ class Launcher:
 
     @staticmethod
     def _report_summary(report):
+        if isinstance(report, dict):
+            return dict(report)
         units = list(getattr(report, "units", ()))
         receipts = list(getattr(report, "audit_receipts", ()))
         failed_receipts = [r for r in receipts if not r.get("persisted", True)]
@@ -961,170 +1082,612 @@ class Launcher:
         )
 
         paths = self.paths()
-        # Retrieval mode is an explicit request, not a silent default.
-        # "semantic" requires a validated isolated vector store, a loaded
-        # embedding service, and dimensional compatibility with the store
-        # schema. Anything missing falls back to "lexical" and the run
-        # records the effective mode, so the UI never shows "semantic"
-        # while the pipeline actually ran lexical.
-        effective_retrieval = "lexical"
+        from src.living_authenticity.knowledge.analysis.retrieval.strategy import (
+            RetrievalStrategyRegistry,
+            UnsupportedStrategyError,
+        )
+
+        try:
+            strategy_defn = RetrievalStrategyRegistry().validate(retrieval_mode)
+            effective_retrieval = strategy_defn.name
+        except UnsupportedStrategyError as exc:
+            raise AdapterError("validation_error", str(exc))
+
         vector_components = None
-        vector_note = ""
-        if retrieval_mode == "semantic":
-            try:
-                from src.living_authenticity.knowledge.integration import (
-                    vector as _vector,
+        vector_service = None
+        vector_retriever = None
+        temporary_cache = None
+        expected = 0
+        got = 0
+        sync_requested = False
+        sync_decision = None
+
+        if effective_retrieval == "semantic":
+            from src.living_authenticity.knowledge.integration import (
+                vector as _vector,
+            )
+
+            vector_db = (
+                self.session_destination("vector_db")
+                or paths.get("vector_db", {}).get("lancedb", "")
+                or paths.get("vector_db", {}).get("root", "")
+            )
+            if not vector_db:
+                raise AdapterError(
+                    "validation_error",
+                    "semantic retrieval requested but no vector database selected",
                 )
-                vector_db = self.session_destination("vector_db")
-                if not vector_db:
-                    vector_note = (
-                        "semantic requested but no vector database "
-                        "selected; lexical used")
-                else:
-                    eligible, _reason, _check = (
-                        _vector.check_vector_store_eligible(
-                            vector_db,
-                            _vector.resolve_production_vector_db(paths)))
-                    if not eligible:
-                        vector_note = (
-                            "semantic requested but the vector database "
-                            "is not eligible; lexical used")
-                    else:
-                        model_path = self.session_destination(
-                            "embedding_model")
-                        if not model_path:
-                            vector_note = (
-                                "semantic requested but no embedding model "
-                                "selected; lexical used")
+            vault_dest = (
+                self.session_destination("vault")
+                or paths.get("obsidian", {}).get("vault", "")
+                or paths.get("vault", {}).get("root", "")
+            )
+            audit_dest = (
+                self.session_destination("audit")
+                or paths.get("audit", {}).get("root", "")
+            )
+            staging_dest = (
+                self.session_destination("staging")
+                or paths.get("staging", {}).get("root", "")
+            )
+            eligible, reason, _check = _vector.check_vector_store_eligible(
+                vector_db,
+                _vector.resolve_production_vector_db(paths),
+                vault_root=vault_dest,
+                audit_root=audit_dest,
+                staging_root=staging_dest,
+            )
+            if not eligible:
+                raise AdapterError(
+                    "validation_error",
+                    f"semantic retrieval requested but vector database is not eligible: {reason}",
+                )
+            if mode_value == "personal_vault" and not vault_dest:
+                raise AdapterError(
+                    "validation_error",
+                    "semantic retrieval in Vault mode requires a configured Vault",
+                )
+
+            if vault_dest:
+                from src.living_authenticity.knowledge.vault.identity import (
+                    compute_vault_id,
+                    resolve_vault_index_dir,
+                )
+                active_vault_id = compute_vault_id(vault_dest)
+                target_vector_db = str(resolve_vault_index_dir(vector_db, vault_dest))
+
+                # Check Vault / index freshness and handle explicit sync approval
+                if (
+                    self._vault_sync_session.is_authorized
+                    and self._vault_sync_session.vault_root == str(Path(vault_dest).resolve())
+                ):
+                    try:
+                        changes = self._vault_sync_session.check_changes()
+                    except Exception as exc:
+                        raise AdapterError(
+                            "validation_error",
+                            f"Vault vector index freshness check failed: {exc}",
+                        ) from exc
+
+                    if changes.get("stale", False):
+                        sync_requested = True
+                        pending = _PendingSyncApproval(
+                            run_id=run_id,
+                            vault_id=active_vault_id,
+                            vault_root=str(Path(vault_dest).resolve()),
+                            diff=changes,
+                            manifest=getattr(self._vault_sync_session, "_manifest", {}),
+                        )
+                        with self._lock:
+                            self._pending_vault_sync = pending
+
+                        self._sink({
+                            "kind": "sync_approval_required",
+                            "stage": "synchronization",
+                            "run_id": run_id,
+                            "vault_id": active_vault_id,
+                            "message": (
+                                f"Vault changes detected ({len(changes.get('added', []))} added, "
+                                f"{len(changes.get('modified', []))} modified, "
+                                f"{len(changes.get('removed', []))} removed). "
+                                "Explicit synchronization approval required."
+                            ),
+                            "diff": changes,
+                        })
+
+                        # Wait for human decision or cancellation
+                        while not pending.wait(timeout=0.25):
+                            if self._cancelled(run_id):
+                                pending.resolve("cancelled")
+                                break
+
+                        if pending.state == ApprovalState.CANCELLED or self._cancelled(run_id):
+                            decision = "cancelled"
+                        elif pending.state == ApprovalState.APPROVED:
+                            decision = "approve"
+                        elif pending.state == ApprovalState.REJECTED:
+                            decision = "reject"
                         else:
-                            try:
-                                service, _store, retriever = (
-                                    _vector.build_vector_components(
-                                        vector_db, model_path=model_path))
-                            except Exception as exc:
-                                vector_note = (
-                                    "semantic requested but the embedding "
-                                    "model could not load (%s); lexical used"
-                                    % type(exc).__name__)
+                            decision = "cancelled"
+
+                        sync_decision = decision
+                        if decision == "approve":
+                            # Atomic transition to reconciling before running reconcile
+                            if not pending.transition_to_reconciling():
+                                decision = "cancelled"
                             else:
+                                self._sink({
+                                    "kind": "status",
+                                    "stage": "synchronization",
+                                    "status": "reconciling",
+                                    "run_id": run_id,
+                                    "vault_id": active_vault_id,
+                                    "message": "User approved persistent index synchronization; updating index explicitly.",
+                                })
                                 try:
-                                    from src.living_authenticity.database import (
-                                        schema as _schema,
+                                    reconcile_res = self._vault_sync_session.reconcile()
+                                except Exception as exc:
+                                    session_audit = self._session_destinations.get("audit", "")
+                                    auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+                                    if not auth_audit:
+                                        auth_audit = resolve_authorized_audit_root(paths)
+                                    if auth_audit and Path(auth_audit).is_dir():
+                                        from src.living_authenticity.knowledge.governance.audit import AuditWriter
+                                        from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+                                        writer = AuditWriter(auth_audit)
+                                        rec = AuditRecord(
+                                            run_id=run_id,
+                                            operating_mode=mode_value,
+                                            vault_id=active_vault_id,
+                                            terminal_outcome="infrastructure_error",
+                                            validation_result="FAILED",
+                                            stop_reason=str(exc),
+                                            errors=(str(exc),),
+                                        )
+                                        writer.append(rec)
+                                    with self._lock:
+                                        self._reports[run_id] = {
+                                            "run_id": run_id,
+                                            "accepted": False,
+                                            "outcome": "FAILED",
+                                            "reason": f"Vault vector index reconciliation failed: {exc}",
+                                            "processed": 0,
+                                            "executed": 0,
+                                            "held": 0,
+                                            "terminal_outcome": "infrastructure_error",
+                                        }
+                                    raise AdapterError(
+                                        "validation_error",
+                                        f"Vault vector index reconciliation failed: {exc}",
+                                    ) from exc
+
+                                if not reconcile_res.get("fresh", False):
+                                    err_msg = reconcile_res.get("error") or "reconciliation failed to produce a fresh index"
+                                    session_audit = self._session_destinations.get("audit", "")
+                                    auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+                                    if not auth_audit:
+                                        auth_audit = resolve_authorized_audit_root(paths)
+                                    if auth_audit and Path(auth_audit).is_dir():
+                                        from src.living_authenticity.knowledge.governance.audit import AuditWriter
+                                        from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+                                        writer = AuditWriter(auth_audit)
+                                        rec = AuditRecord(
+                                            run_id=run_id,
+                                            operating_mode=mode_value,
+                                            vault_id=active_vault_id,
+                                            terminal_outcome="infrastructure_error",
+                                            validation_result="FAILED",
+                                            stop_reason=err_msg,
+                                            errors=(err_msg,),
+                                        )
+                                        writer.append(rec)
+                                    with self._lock:
+                                        self._reports[run_id] = {
+                                            "run_id": run_id,
+                                            "accepted": False,
+                                            "outcome": "FAILED",
+                                            "reason": f"Vault vector index is not fresh: {err_msg}",
+                                            "processed": 0,
+                                            "executed": 0,
+                                            "held": 0,
+                                            "terminal_outcome": "infrastructure_error",
+                                        }
+                                    raise AdapterError(
+                                        "validation_error",
+                                        f"Vault vector index is not fresh: {err_msg}",
                                     )
-                                    expected = int(
-                                        getattr(_schema,
-                                                "VECTOR_DIMENSION", 0))
-                                except Exception:
-                                    expected = 0
-                                try:
-                                    got = int(
-                                        service.model.get_dimension())
-                                except Exception:
-                                    got = 0
-                                _ = (_store,)
-                                if expected and got and expected != got:
-                                    vector_note = (
-                                        "semantic requested but embedding "
-                                        "dimension %s mismatches schema %s; "
-                                        "lexical used" % (got, expected))
-                                else:
-                                    effective_retrieval = "semantic"
-                                    vector_components = (
-                                        service, retriever)
-            except Exception as exc:
-                vector_note = ("semantic unavailable (%s); lexical used"
-                               % type(exc).__name__)
+
+                                if self._cancelled(run_id):
+                                    decision = "cancelled"
+
+                        if decision == "reject":
+                            self._sink({
+                                "kind": "stopped",
+                                "stage": "synchronization",
+                                "run_id": run_id,
+                                "vault_id": active_vault_id,
+                                "terminal_outcome": "sync_rejected_by_user",
+                                "outcome": "STOPPED",
+                                "reason": "Vault synchronization rejected by human operator",
+                                "message": "User rejected persistent index update; run stopped safely.",
+                                "metadata": {"fresh": False, "status": "stale"},
+                            })
+                            session_audit = self._session_destinations.get("audit", "")
+                            auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+                            if not auth_audit:
+                                auth_audit = resolve_authorized_audit_root(paths)
+                            if auth_audit and Path(auth_audit).is_dir():
+                                from src.living_authenticity.knowledge.governance.audit import AuditWriter
+                                from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+                                writer = AuditWriter(auth_audit)
+                                rec = AuditRecord(
+                                    run_id=run_id,
+                                    operating_mode=mode_value,
+                                    vault_id=active_vault_id,
+                                    terminal_outcome="sync_rejected_by_user",
+                                    validation_result="STOPPED",
+                                    stop_reason="Vault synchronization rejected by human operator",
+                                )
+                                writer.append(rec)
+                            with self._lock:
+                                self._reports[run_id] = {
+                                    "run_id": run_id,
+                                    "accepted": False,
+                                    "outcome": "STOPPED",
+                                    "reason": "Vault synchronization rejected by human operator",
+                                    "processed": 0,
+                                    "executed": 0,
+                                    "held": 0,
+                                    "terminal_outcome": "sync_rejected_by_user",
+                                }
+                            return {
+                                "run_id": run_id,
+                                "accepted": False,
+                                "outcome": "STOPPED",
+                                "terminal_outcome": "sync_rejected_by_user",
+                                "reason": "Vault synchronization rejected by human operator",
+                            }
+
+                        elif decision == "cancelled":
+                            self._sink({
+                                "kind": "stopped",
+                                "stage": "cancellation",
+                                "run_id": run_id,
+                                "terminal_outcome": "stopped_by_user",
+                                "outcome": "STOPPED",
+                                "reason": "run cancelled by user request",
+                                "message": "Run cancelled by user request during synchronization.",
+                            })
+                            session_audit = self._session_destinations.get("audit", "")
+                            auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+                            if not auth_audit:
+                                auth_audit = resolve_authorized_audit_root(paths)
+                            if auth_audit and Path(auth_audit).is_dir():
+                                from src.living_authenticity.knowledge.governance.audit import AuditWriter
+                                from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+                                writer = AuditWriter(auth_audit)
+                                rec = AuditRecord(
+                                    run_id=run_id,
+                                    operating_mode=mode_value,
+                                    vault_id=active_vault_id,
+                                    terminal_outcome="stopped_by_user",
+                                    validation_result="STOPPED",
+                                    stop_reason="run cancelled by user request",
+                                )
+                                writer.append(rec)
+                            with self._lock:
+                                self._reports[run_id] = {
+                                    "run_id": run_id,
+                                    "accepted": False,
+                                    "outcome": "STOPPED",
+                                    "reason": "run cancelled by user request",
+                                    "processed": 0,
+                                    "executed": 0,
+                                    "held": 0,
+                                    "terminal_outcome": "stopped_by_user",
+                                }
+                            return {
+                                "run_id": run_id,
+                                "accepted": False,
+                                "outcome": "STOPPED",
+                                "terminal_outcome": "stopped_by_user",
+                                "reason": "run cancelled by user request",
+                            }
+            else:
+                target_vector_db = vector_db
+                active_vault_id = ""
+
+            model_path = (
+                self.session_destination("embedding_model")
+                or paths.get("models", {}).get("bge_m3", "")
+                or paths.get("models", {}).get("root", "")
+            )
+            if self._embedder is not None:
+                service = self._embedder
+                from src.living_authenticity.database.lancedb_manager import LanceDBManager
+                from src.living_authenticity.knowledge.analysis.retrieval.lancedb_retriever import (
+                    LanceDBVectorRetriever,
+                )
+                store = LanceDBManager(target_vector_db)
+                store.create_knowledge_vector_table()
+                retriever = LanceDBVectorRetriever(
+                    embedding_service=service,
+                    db_manager=store,
+                    vault_id=active_vault_id,
+                )
+            else:
+                if not model_path:
+                    raise AdapterError(
+                        "validation_error",
+                        "semantic retrieval requested but no embedding model selected",
+                    )
+                try:
+                    service, store, retriever = _vector.build_vector_components(
+                        target_vector_db, model_path=model_path, vault_id=active_vault_id
+                    )
+                except Exception as exc:
+                    raise AdapterError(
+                        "validation_error",
+                        f"semantic retrieval requested but embedding model could not load ({type(exc).__name__}: {exc})",
+                    )
+            try:
+                from src.living_authenticity.database import schema as _schema
+
+                expected = int(getattr(_schema, "VECTOR_DIMENSION", 0))
+            except Exception:
+                expected = 0
+            got = int(getattr(service, "dimension", 0))
+            if expected and got and expected != got:
+                raise AdapterError(
+                    "validation_error",
+                    f"semantic retrieval requested but embedding dimension {got} mismatches schema {expected}",
+                )
+
+            if mode_value == "personal_vault" and vault_dest:
+                rows = store.show_all()
+                if not rows:
+                    raise AdapterError(
+                        "validation_error",
+                        f"semantic retrieval requested but dedicated Vault index for {active_vault_id} holds 0 vectors. Please synchronize the Vault first.",
+                    )
+
+            vector_service = service
+            vector_retriever = retriever
+            vector_components = (service, retriever)
+
         if self._pipeline_factory is not None:
             pipe = self._pipeline_factory(self._sink)
         elif vector_components is not None:
             _service, _retriever = vector_components
-            pipe = EvidenceFirstPipeline(stage_observer=self._sink,
-                                         retriever=_retriever)
+            pipe = EvidenceFirstPipeline(
+                stage_observer=self._sink, retriever=_retriever
+            )
         else:
             pipe = EvidenceFirstPipeline(stage_observer=self._sink)
-        self._sink({"kind": "status", "stage": "retrieval",
-                    "message": (f"retrieval mode: {effective_retrieval}"
-                                + (f" ({vector_note})"
-                                   if vector_note else ""))})
+
+        if effective_retrieval == "semantic":
+            self._sink(
+                {
+                    "kind": "status",
+                    "stage": "retrieval",
+                    "run_id": run_id,
+                    "message": (
+                        "retrieval strategy: semantic "
+                        "(isolated vector similarity with temporary embedding cache)"
+                    ),
+                }
+            )
+        else:
+            self._sink(
+                {
+                    "kind": "status",
+                    "stage": "retrieval",
+                    "run_id": run_id,
+                    "message": (
+                        "retrieval strategy: lexical "
+                        "(deterministic token-overlap; no embedding required)"
+                    ),
+                }
+            )
+
         # Knowledge-language contract (honest). The requested content
         # languages are recorded on the run, but the pipeline has no
         # translation provider, so generated Audit/Staging content is NOT
         # rewritten or translated. Existing records keep their stored
         # language. This never alters authorization or source meaning.
-        self._sink({"kind": "status", "stage": "localization",
-                    "message": ("requested content languages: "
-                                f"staging={staging_language} "
-                                f"audit={audit_language}; no translation "
-                                "provider is configured, so generated "
-                                "content language is unchanged")})
+        self._sink(
+            {
+                "kind": "status",
+                "stage": "localization",
+                "message": (
+                    "requested content languages: "
+                    f"staging={staging_language} "
+                    f"audit={audit_language}; no translation "
+                    "provider is configured, so generated "
+                    "content language is unchanged"
+                ),
+            }
+        )
         source_label = (
             f"{input_provenance.source_type}:{input_provenance.input_id}"
             if input_provenance
             else "<text-input>"
         )
-        self._sink({"kind": "stage_started", "stage": "ingestion", "run_id": run_id,
-                    "message": "ingesting and extracting knowledge units"})
+        self._sink(
+            {
+                "kind": "stage_started",
+                "stage": "ingestion",
+                "run_id": run_id,
+                "message": "ingesting and extracting knowledge units",
+            }
+        )
         source_type = (
             getattr(input_provenance, "source_type", "")
             if input_provenance
             else "chat_input"
         )
-        kind = source_type if source_type in ("chat_input", "text") else "chat_input"
-        ingestion = pipe.ingestion.ingest_text(
-            input_text, source=source_label, kind=kind,
-            observer=self._sink, input_provenance=input_provenance)
-        self._sink({"kind": "stage_completed", "stage": "ingestion", "run_id": run_id,
-                    "message": f"ingestion completed ({len(ingestion.knowledge_units)} unit(s) extracted)"})
-        # Portable UI-first resolution: a UI-validated session destination
-        # (set by pick_folder() this launch) takes precedence; otherwise
-        # fall back to the config-declared location. The chosen value is
-        # revalidated below by run_bounded_integration's own guards, so a
-        # stale or tampered session value fails closed instead of writing
-        # somewhere unexpected.
-        session_staging = self._session_destinations.get("staging", "")
-        session_audit = self._session_destinations.get("audit", "")
-        staging_arg = (session_staging.strip()
-                       if isinstance(session_staging, str) else "")
-        if not staging_arg:
-            staging_arg = resolve_authorized_staging_root(paths)
-        authorized_audit = (session_audit.strip()
-                            if isinstance(session_audit, str) else "")
-        if not authorized_audit:
-            authorized_audit = resolve_authorized_audit_root(paths)
-        authorized_passed = resolve_authorized_audit_passed(paths)
-        authorized_failed = resolve_authorized_audit_failed(paths)
-        llm_config = self.llm_config()
-        if self._synthesis_factory is not None:
-            synthesis = self._synthesis_factory(
-                confirm=self._consent_confirm, config=llm_config)
-        else:
-            from src.living_authenticity.llm.orchestration import (
-                build_synthesis,
-            )
-            from src.living_authenticity.llm.registry import build_provider
-
-            synthesis = build_synthesis(
-                build_provider(llm_config), confirm=self._consent_confirm,
-                config=llm_config)
-        corpus_units, core_units, vault_ctx = self._load_knowledge_corpus(
-            mode_value, pipe, paths, run_id=run_id)
-        return _integration.run_bounded_integration(
-            "", staging_arg, pipeline=pipe,
-            corpus=corpus_units, core_units=core_units, max_files=1,
-            llm_config=llm_config, synthesis=synthesis,
-            ingestion=ingestion,
-            vault_context=vault_ctx,
-            approval_gate=_PublishingGate(self),
-            approval_reader=self._approval_reader,
-            run_id=run_id, event_sink=self._sink,
-            operating_mode=mode_value,
-            audit_root=authorized_audit,
-            authorized_audit_root=authorized_audit,
-            authorized_audit_passed=authorized_passed,
-            authorized_audit_failed=authorized_failed,
-            guarded_roots=resolve_guarded_roots(paths),
-            should_cancel=lambda: self._cancelled(run_id),
+        kind = (
+            source_type if source_type in ("chat_input", "text") else "chat_input"
         )
+        ingestion = pipe.ingestion.ingest_text(
+            input_text,
+            source=source_label,
+            kind=kind,
+            observer=self._sink,
+            input_provenance=input_provenance,
+        )
+        self._sink(
+            {
+                "kind": "stage_completed",
+                "stage": "ingestion",
+                "run_id": run_id,
+                "message": (
+                    f"ingestion completed ({len(ingestion.knowledge_units)} unit(s) extracted)"
+                ),
+            }
+        )
+
+        if effective_retrieval == "semantic":
+            from src.living_authenticity.knowledge.analysis.retrieval.cache import (
+                TemporaryEmbeddingCache,
+            )
+
+            provider_n = (
+                getattr(vector_service, "provider_name", "embedding_service")
+                if vector_service
+                else "embedding_service"
+            )
+            model_n = (
+                getattr(vector_service, "model_name", "local_embedding_model")
+                if vector_service
+                else "local_embedding_model"
+            )
+            model_v = (
+                getattr(vector_service, "model_version", "1.0")
+                if vector_service
+                else "1.0"
+            )
+            dim_val = got or expected or 1024
+            temporary_cache = TemporaryEmbeddingCache(
+                run_id=run_id,
+                input_ref=source_label,
+                provider_name=provider_n,
+                model_name=model_n,
+                model_version=model_v,
+                dimension=dim_val,
+                chunk_count=len(ingestion.knowledge_units),
+            )
+            if hasattr(pipe, "retriever") and hasattr(
+                pipe.retriever, "set_cache"
+            ):
+                pipe.retriever.set_cache(temporary_cache)
+            self._sink(
+                {
+                    "kind": "status",
+                    "stage": "retrieval",
+                    "run_id": run_id,
+                    "message": (
+                        f"temporary embedding cache allocated (scope={temporary_cache.scope_id}, "
+                        f"chunks={len(ingestion.knowledge_units)}, dim={temporary_cache.dimension})"
+                    ),
+                }
+            )
+
+        try:
+            # Portable UI-first resolution: a UI-validated session destination
+            # (set by pick_folder() this launch) takes precedence; otherwise
+            # fall back to the config-declared location. The chosen value is
+            # revalidated below by run_bounded_integration's own guards, so a
+            # stale or tampered session value fails closed instead of writing
+            # somewhere unexpected.
+            session_staging = self._session_destinations.get("staging", "")
+            session_audit = self._session_destinations.get("audit", "")
+            staging_arg = (
+                session_staging.strip() if isinstance(session_staging, str) else ""
+            )
+            if not staging_arg:
+                staging_arg = resolve_authorized_staging_root(paths)
+            authorized_audit = (
+                session_audit.strip() if isinstance(session_audit, str) else ""
+            )
+            if not authorized_audit:
+                authorized_audit = resolve_authorized_audit_root(paths)
+            authorized_passed = resolve_authorized_audit_passed(paths)
+            authorized_failed = resolve_authorized_audit_failed(paths)
+            llm_config = self.llm_config()
+            if self._synthesis_factory is not None:
+                synthesis = self._synthesis_factory(
+                    confirm=self._consent_confirm, config=llm_config
+                )
+            else:
+                from src.living_authenticity.llm.orchestration import (
+                    build_synthesis,
+                )
+                from src.living_authenticity.llm.registry import build_provider
+
+                synthesis = build_synthesis(
+                    build_provider(llm_config),
+                    confirm=self._consent_confirm,
+                    config=llm_config,
+                )
+            corpus_units, core_units, vault_ctx = self._load_knowledge_corpus(
+                mode_value, pipe, paths, run_id=run_id
+            )
+            report = _integration.run_bounded_integration(
+                "",
+                staging_arg,
+                pipeline=pipe,
+                corpus=corpus_units,
+                core_units=core_units,
+                max_files=1,
+                llm_config=llm_config,
+                synthesis=synthesis,
+                ingestion=ingestion,
+                vault_context=vault_ctx,
+                approval_gate=_PublishingGate(self),
+                approval_reader=self._approval_reader,
+                run_id=run_id,
+                event_sink=self._sink,
+                operating_mode=mode_value,
+                audit_root=authorized_audit,
+                authorized_audit_root=authorized_audit,
+                authorized_audit_passed=authorized_passed,
+                authorized_audit_failed=authorized_failed,
+                guarded_roots=resolve_guarded_roots(paths),
+                should_cancel=lambda: self._cancelled(run_id),
+            )
+            with self._lock:
+                self._vault_sync_run_info[run_id] = {
+                    "requested": sync_requested,
+                    "decision": sync_decision,
+                    "index_fresh": self._vault_sync_session.is_fresh if self._vault_sync_session.is_authorized else False,
+                }
+            return report
+        finally:
+            if temporary_cache is not None:
+                cleanup_ok = temporary_cache.cleanup()
+                if cleanup_ok:
+                    self._sink(
+                        {
+                            "kind": "status",
+                            "stage": "retrieval",
+                            "run_id": run_id,
+                            "message": (
+                                f"temporary embedding cache released successfully (scope={temporary_cache.scope_id})"
+                            ),
+                        }
+                    )
+                else:
+                    self._sink(
+                        {
+                            "kind": "warning",
+                            "stage": "retrieval",
+                            "run_id": run_id,
+                            "message": (
+                                f"temporary embedding cache cleanup failed: {temporary_cache.cleanup_error}"
+                            ),
+                        }
+                    )
 
 
     # ---- journals (read-only observation) -------------------------------
@@ -1369,9 +1932,12 @@ class Launcher:
                 and isinstance(path, str) and path.strip()):
             clean_path = path.strip()
             with self._lock:
+                prev_vault = self._session_destinations.get("vault", "")
                 self._session_destinations[canonical] = clean_path
                 if canonical == "vault":
                     self._active_source_mode = "personal_vault"
+                    if prev_vault and prev_vault != clean_path and self._vault_sync_session is not None:
+                        self._vault_sync_session.revoke()
             try:
                 from Config.settings import save_paths_local
                 mapping = {}
@@ -1465,6 +2031,17 @@ class Launcher:
             },
             "active_run_id": self._active_run_id,
             "paused_run": self._paused_run,
+            "pending_sync_approval": (
+                {
+                    "run_id": self._pending_vault_sync.run_id,
+                    "vault_id": self._pending_vault_sync.vault_id,
+                    "diff": self._pending_vault_sync.diff,
+                    "message": "Vault changes detected requiring synchronization approval",
+                    "created_at": self._pending_vault_sync.created_at,
+                }
+                if self._pending_vault_sync and self._pending_vault_sync.state == ApprovalState.PENDING
+                else None
+            ),
         }
 
     def update_config(self, updates: dict) -> dict:
@@ -1671,53 +2248,89 @@ class Launcher:
             "items": items[:100],
         }
 
-    def index_vault(self) -> dict:
-        """Run initial vector index on configured Vault notes into isolated vector DB."""
-        from src.living_authenticity.knowledge.integration.vector import (
-            build_vector_components,
-            check_vector_store_eligible,
-            resolve_production_vector_db,
-        )
-        from src.living_authenticity.knowledge.integration import index_units
-        from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
-        from src.living_authenticity.knowledge.vault.context import read_vault_units
-
+    def authorize_vault_sync(self, vault_root: str | None = None) -> dict:
+        """Explicitly authorize synchronization for the selected Vault."""
         paths = self.paths()
-        vault_root = self.session_destination("vault")
-        if not vault_root:
+        vault = (
+            vault_root
+            or self.session_destination("vault")
+            or paths.get("obsidian", {}).get("vault", "")
+            or paths.get("vault", {}).get("root", "")
+        )
+        if not vault:
             raise AdapterError("validation_error", "No Vault folder is configured.")
-        vector_db = self.session_destination("vector_db")
+        vector_db = (
+            self.session_destination("vector_db")
+            or paths.get("vector_db", {}).get("lancedb", "")
+            or paths.get("vector_db", {}).get("root", "")
+        )
         if not vector_db:
             raise AdapterError("validation_error", "No Database folder is configured for the vector index.")
-        model_path = self.session_destination("embedding_model")
-        if not model_path:
-            raise AdapterError("validation_error", "No embedding model (BGE-M3) configured.")
+        model_path = (
+            self.session_destination("embedding_model")
+            or paths.get("models", {}).get("bge_m3", "")
+            or paths.get("models", {}).get("root", "")
+        )
+        embedder = self._embedder
+        if embedder is None and not model_path:
+            raise AdapterError("validation_error", "No embedding model configured.")
+        staging_root = self.session_destination("staging") or paths.get("staging", {}).get("root", "")
+        audit_root = self.session_destination("audit") or paths.get("audit", {}).get("root", "")
 
-        eligible, reason, _ = check_vector_store_eligible(
-            vector_db, resolve_production_vector_db(paths), vault_root=vault_root)
-        if not eligible:
-            raise AdapterError("validation_error", f"Vector database is not eligible: {reason}")
-
+        from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
         pipe = EvidenceFirstPipeline(stage_observer=self._sink)
-        vault_units, vault_files, vault_skipped = read_vault_units(vault_root, pipe)
-        if not vault_units:
+        try:
+            report = self._vault_sync_session.authorize(
+                vault_root=vault,
+                vector_db_root=vector_db,
+                embedder=embedder,
+                model_path=model_path if embedder is None else None,
+                pipeline=pipe,
+                staging_root=staging_root,
+                audit_root=audit_root,
+                auto_watch=False,
+            )
+            if not report.get("fresh", False):
+                err = report.get("error") or "Initial synchronization failed to produce a fresh index"
+                raise AdapterError("validation_error", f"Vault synchronization authorization failed: {err}")
             return {
-                "indexed": False,
-                "reason": f"No valid vault notes discovered ({vault_skipped} skipped).",
-                "files_discovered": vault_files,
-                "notes_indexed": 0,
-                "files_skipped": vault_skipped,
+                "indexed": report.get("fresh", False),
+                "vault_id": report.get("vault_id", ""),
+                "files_discovered": report.get("indexed_notes", 0),
+                "notes_indexed": report.get("indexed_vectors", 0),
+                "files_skipped": 0,
+                "status": report.get("status", ""),
+                "last_synced_at": report.get("last_synced_at", ""),
             }
+        except AdapterError:
+            raise
+        except Exception as exc:
+            raise AdapterError("validation_error", f"Vault synchronization authorization failed: {exc}")
 
-        service, store, _retriever = build_vector_components(vector_db, model_path=model_path)
-        figures = index_units(vault_units, service, store)
-        stored = figures[1] if len(figures) > 1 else len(vault_units)
-        return {
-            "indexed": True,
-            "files_discovered": vault_files,
-            "notes_indexed": stored,
-            "files_skipped": vault_skipped,
-        }
+    def revoke_vault_sync(self) -> dict:
+        """Revoke synchronization authorization for the active Vault."""
+        return self._vault_sync_session.revoke()
+
+    def get_vault_sync_status(self) -> dict:
+        """Return the current synchronization and freshness status."""
+        return self._vault_sync_session.get_status()
+
+    def reconcile_vault_sync(self) -> dict:
+        """Explicitly reconcile changes for the authorized Vault."""
+        return self._vault_sync_session.reconcile()
+
+    def check_vault_sync_changes(self) -> dict:
+        """Inspect current Vault changes against recorded index manifest without mutating."""
+        return self._vault_sync_session.check_changes()
+
+    def index_vault(self) -> dict:
+        """Run initial vector index on configured Vault notes into isolated vector DB."""
+        return self.authorize_vault_sync()
+
+    def close(self) -> None:
+        """Shut down background monitor threads cleanly."""
+        if self._vault_sync_session is not None:
+            self._vault_sync_session.close()
 
     # ---- health ---------------------------------------------------------
 

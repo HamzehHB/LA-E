@@ -368,12 +368,25 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
             titles).encode("utf-8")).hexdigest() if titles else ""
     core = (getattr(unit_result, "core_analysis", None)
             if unit_result is not None else None)
+    retrieval_meta = getattr(retrieval, "metadata", {}) if retrieval is not None else {}
+    if not isinstance(retrieval_meta, dict):
+        retrieval_meta = {}
     return {"record_id": record_id, "run_id": run_id,
             "operating_mode": operating_mode, "input_hash": input_hash,
             "input_hash_source": input_hash_source,
             "retrieval_strategy": strategy,
             "retrieval_candidates": tuple(candidates),
             "retrieval_note": note, "evidence_hash": evidence_hash,
+            "retrieval_cache_scope_id": retrieval_meta.get("scope_id", ""),
+            "retrieval_embeddings_generated": retrieval_meta.get("embeddings_generated", 0),
+            "retrieval_embeddings_failed": retrieval_meta.get("embeddings_failed", 0),
+            "retrieval_cache_cleaned_up": retrieval_meta.get("cleaned_up", False),
+            "retrieval_cache_cleanup_error": retrieval_meta.get("cleanup_error", ""),
+            "embedding_provider": retrieval_meta.get("provider_name", ""),
+            "embedding_model": retrieval_meta.get("model_name", ""),
+            "embedding_dimension": retrieval_meta.get("dimension", 0),
+            "retrieval_chunk_count": retrieval_meta.get("chunk_count", 0),
+            "vault_id": retrieval_meta.get("vault_id", ""),
             "llm_provider": provider_name, "llm_model": model_name,
             "llm_config_hash": llm_config_hash,
             "prompt_sha256": prompt_sha256 or "",

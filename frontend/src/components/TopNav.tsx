@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useStore } from "../state/store";
 import { translate } from "../i18n/resources";
-import type { FolderPurpose } from "../contracts/transport";
+import type { FolderPurpose, VaultSyncStatusResponse } from "../contracts/transport";
 
 function validityKey(v: string): string {
   switch (v) {
@@ -46,7 +46,10 @@ export function TopNav() {
     liveAvailable,
     liveConnected,
     pickLiveFolder,
-    liveIndexVault,
+    liveAuthorizeVaultSync,
+    liveRevokeVaultSync,
+    liveReconcileVaultSync,
+    liveGetVaultSyncStatus,
     liveCancel,
     liveRevealFolder,
   } = useStore();
@@ -54,6 +57,13 @@ export function TopNav() {
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
   const [open, setOpen] = useState<string | null>(null);
   const toggle = (k: string) => setOpen((v) => (v === k ? null : k));
+  const [syncStatus, setSyncStatus] = useState<VaultSyncStatusResponse | null>(null);
+
+  useEffect(() => {
+    if (liveAvailable && open === "db") {
+      void liveGetVaultSyncStatus().then(setSyncStatus);
+    }
+  }, [open, liveAvailable, liveGetVaultSyncStatus]);
 
   // Contextual first-click onboarding states
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
@@ -151,9 +161,12 @@ export function TopNav() {
 
   const runInitialIndex = async () => {
     setIndexingMsg("Running initial vector indexing…");
-    const res = await liveIndexVault();
+    const res = await liveAuthorizeVaultSync();
     if (res.indexed) {
       setIndexingMsg("Initial index complete!");
+      if (liveAvailable) {
+        void liveGetVaultSyncStatus().then(setSyncStatus);
+      }
       setTimeout(() => {
         setVaultModalOpen(false);
         setIndexingMsg("");
@@ -327,7 +340,56 @@ export function TopNav() {
                 </span>
               </button>
               <hr />
-              <span className="dropdown-title">{t("ui.db.retrievalType")}</span>
+              <span className="dropdown-title">Vault Index Sync</span>
+              {syncStatus && (
+                <div style={{ padding: "0.25rem 0.5rem", fontSize: "0.85em" }}>
+                  <span>Status: <strong>{syncStatus.status}</strong></span>
+                  {syncStatus.indexed_notes > 0 && <span> ({syncStatus.indexed_notes} notes, {syncStatus.indexed_vectors} vectors)</span>}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: "0.5rem", padding: "0.25rem 0.5rem" }}>
+                {syncStatus?.authorized ? (
+                  <>
+                    <button
+                      type="button"
+                      className="btn small"
+                      onClick={async () => {
+                        await liveReconcileVaultSync();
+                        const s = await liveGetVaultSyncStatus();
+                        setSyncStatus(s);
+                      }}
+                    >
+                      Re-sync Now
+                    </button>
+                    <button
+                      type="button"
+                      className="btn small danger"
+                      onClick={async () => {
+                        await liveRevokeVaultSync();
+                        const s = await liveGetVaultSyncStatus();
+                        setSyncStatus(s);
+                      }}
+                    >
+                      Revoke Sync
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn small"
+                    disabled={!semanticReady}
+                    onClick={async () => {
+                      await liveAuthorizeVaultSync();
+                      const s = await liveGetVaultSyncStatus();
+                      setSyncStatus(s);
+                    }}
+                  >
+                    Authorize Sync
+                  </button>
+                )}
+              </div>
+              <hr />
+              <span className="dropdown-title">{t("ui.strategy.title")}</span>
               <button
                 type="button"
                 role="menuitemradio"
@@ -335,7 +397,7 @@ export function TopNav() {
                 aria-checked={state.retrievalType === "lexical"}
                 onClick={() => setRetrievalType("lexical")}
               >
-                ● Lexical Retrieval
+                ● {t("ui.strategy.lexical")}
               </button>
               <button
                 type="button"
@@ -345,7 +407,17 @@ export function TopNav() {
                 onClick={() => setRetrievalType("semantic")}
                 title={semanticReady ? undefined : t("ui.nav.semanticNeedsSetup")}
               >
-                ● Semantic Retrieval {semanticReady ? "" : "⚠"}
+                ● {t("ui.strategy.semantic")} {semanticReady ? "" : "⚠"}
+              </button>
+              <button
+                type="button"
+                role="menuitemradio"
+                className="disabled"
+                disabled={true}
+                aria-checked={false}
+                title={t("ui.strategy.hybridDisabled")}
+              >
+                ○ {t("ui.strategy.hybrid")}
               </button>
               {!semanticReady && (
                 <span className="note warn">{t("ui.nav.semanticNeedsSetup")}</span>

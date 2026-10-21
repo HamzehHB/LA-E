@@ -99,7 +99,7 @@ def check_vector_store_eligible(db_path, production_vector_db="",
 
 
 def build_vector_components(vector_db_path, embedder=None, model_path=None,
-                            max_candidates: int = 5):
+                            max_candidates: int = 5, cache=None, vault_id: str = ""):
     """Build the isolated vector retrieval triple for one run.
 
     Returns ``(embedder, store, retriever)``. When ``embedder`` is not
@@ -117,5 +117,5 @@ def build_vector_components(vector_db_path, embedder=None, model_path=None,
     store.create_knowledge_vector_table()
     retriever = LanceDBVectorRetriever(
         embedding_service=service, db_manager=store,
-        max_candidates=max_candidates)
+        max_candidates=max_candidates, cache=cache, vault_id=vault_id)
     return (service, store, retriever)

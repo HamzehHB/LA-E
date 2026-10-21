@@ -1,6 +1,12 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { AppState, ConfigResourceState, CurrentRunView } from "../contracts/ui";
-import type { FolderPurpose, RunEvent } from "../contracts/transport";
+import type {
+  FolderPurpose,
+  PendingSyncApprovalInfo,
+  RunEvent,
+  VaultChangeDiff,
+  VaultSyncStatusResponse,
+} from "../contracts/transport";
 import { FIXTURE_AUDITS, FIXTURE_RUN, FIXTURE_STAGING, IDLE_RUN } from "../fixtures/demo";
 import { createLiveClient, type LiveClient } from "../live/client";
 
@@ -97,8 +103,13 @@ interface Store {
   liveStop: () => Promise<void>;
   liveTranslate: (text: string, target_lang?: "en" | "fa") => Promise<string>;
   liveIndexVault: () => Promise<{ indexed: boolean; reason?: string }>;
+  liveAuthorizeVaultSync: (vaultRoot?: string) => Promise<{ indexed: boolean; reason?: string; vault_id?: string; status?: string }>;
+  liveRevokeVaultSync: () => Promise<{ authorized: boolean; status: string }>;
+  liveReconcileVaultSync: () => Promise<unknown>;
+  liveGetVaultSyncStatus: () => Promise<VaultSyncStatusResponse | null>;
   liveRevealFolder: (purpose: FolderPurpose) => Promise<Array<{ name: string; is_dir: boolean; size: number; modified: string }>>;
   liveConsent: (decision: "approve" | "reject") => Promise<void>;
+  liveDecideVaultSync: (decision: "approve" | "reject") => Promise<void>;
   liveCancel: () => Promise<void>;
   refreshJournals: () => Promise<void>;
   /** Open the native folder dialog for one purpose via the launcher. */
@@ -118,6 +129,7 @@ interface Store {
     classification_type?: string;
   } | null;
   liveConsentRequest: { consent_id: string; message: string } | null;
+  pendingSyncApproval: PendingSyncApprovalInfo | null;
 }
 
 const Ctx = createContext<Store | null>(null);
@@ -159,6 +171,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [liveConsentRequest, setLiveConsentRequest] = useState<
     Store["liveConsentRequest"]
   >(null);
+  const [pendingSyncApproval, setPendingSyncApproval] = useState<PendingSyncApprovalInfo | null>(null);
+  const lastInstanceIdRef = useRef<string>("");
 
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -198,6 +212,36 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         retrievalType: effective,
         run: { ...s.run, status: message },
       }));
+      return;
+    }
+    if (event.kind === "sync_approval_required") {
+      const vaultId = String(extra.vault_id ?? "");
+      const diff = extra.diff as VaultChangeDiff | undefined;
+      if (runId && diff) {
+        if (stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
+          return;
+        }
+        setPendingSyncApproval({
+          run_id: runId,
+          vault_id: vaultId,
+          diff,
+          message: message || "Obsidian Vault changes detected — synchronization requires approval before retrieval",
+          created_at: event.timestamp || new Date().toISOString(),
+        });
+        setState((s) => {
+          if (s.run.stopped && (!runId || runId === s.run.run_id)) {
+            return s;
+          }
+          return {
+            ...s,
+            run: {
+              ...s.run,
+              run_id: runId || s.run.run_id,
+              status: "awaiting Vault synchronization approval",
+            },
+          };
+        });
+      }
       return;
     }
     if (event.kind === "human_review_required") {
@@ -300,6 +344,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         };
       });
       if (event.kind === "completed" || event.kind === "run_completed") {
+        setPendingSyncApproval(null);
         void refreshJournalsQuiet();
       }
       return;
@@ -310,6 +355,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       event.kind === "error" ||
       event.kind === "warning"
     ) {
+      if (event.kind !== "warning") {
+        setPendingSyncApproval(null);
+      }
       const outcome = (event.outcome as AppState["inputOutcome"]) ||
         (event.kind === "stopped" ? "STOPPED" : "REJECTED");
       setState((s) => ({
@@ -408,6 +456,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     setLiveError(null);
     setLiveApproval(null);
+    setPendingSyncApproval(null);
     try {
       const res = await live.startRun({
         input_text: inputText,
@@ -606,6 +655,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       liveConsentRequest,
       startLiveRun: startLiveRunFn,
       fixInput: () => {
+        setPendingSyncApproval(null);
         setState((s) => ({
           ...s,
           composerOpen: true,
@@ -632,6 +682,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         setLiveError(null);
         setLiveApproval(null);
+        setPendingSyncApproval(null);
         try {
           const res = await live.startRun({
             input_text: textToRetry,
@@ -665,6 +716,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       },
       dismissRunOutcome: () => {
         setLiveError(null);
+        setPendingSyncApproval(null);
         setState((s) => ({
           ...s,
           inputOutcome: null,
@@ -676,6 +728,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }));
       },
       cancelActiveRun: async () => {
+        setPendingSyncApproval(null);
         if (live.available && state.run.run_id) {
           try {
             await live.cancel({ run_id: state.run.run_id });
@@ -841,6 +894,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return { indexed: false, reason: (e as Error)?.message ?? "Indexing failed" };
         }
       },
+      liveAuthorizeVaultSync: async (vaultRoot?: string) => {
+        if (!live.available) return { indexed: false, reason: "Live client unavailable" };
+        try {
+          const res = await live.authorizeVaultSync(vaultRoot);
+          return res;
+        } catch (e) {
+          return { indexed: false, reason: (e as Error)?.message ?? "Authorization failed" };
+        }
+      },
+      liveRevokeVaultSync: async () => {
+        if (!live.available) return { authorized: false, status: "unauthorized" };
+        try {
+          return await live.revokeVaultSync();
+        } catch {
+          return { authorized: false, status: "error" };
+        }
+      },
+      liveReconcileVaultSync: async () => {
+        if (!live.available) return null;
+        try {
+          return await live.reconcileVaultSync();
+        } catch {
+          return null;
+        }
+      },
+      liveGetVaultSyncStatus: async () => {
+        if (!live.available) return null;
+        try {
+          return await live.getVaultSyncStatus();
+        } catch {
+          return null;
+        }
+      },
       liveRevealFolder: async (purpose) => {
         if (!live.available) return [];
         try {
@@ -863,6 +949,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setLiveError((e as Error)?.message ?? "backend_error");
         }
       },
+      liveDecideVaultSync: async (decision: "approve" | "reject") => {
+        if (!live.available || !pendingSyncApproval) return;
+        setLiveError(null);
+        try {
+          await live.decideVaultSync({
+            run_id: pendingSyncApproval.run_id,
+            vault_id: pendingSyncApproval.vault_id,
+            decision,
+          });
+          setPendingSyncApproval(null);
+          setState((s) => ({
+            ...s,
+            run: {
+              ...s.run,
+              status:
+                decision === "approve"
+                  ? "synchronizing Obsidian Vault..."
+                  : "synchronization rejected — halting run safely",
+            },
+          }));
+        } catch (e) {
+          setLiveError((e as Error)?.message ?? "backend_error");
+        }
+      },
+      pendingSyncApproval,
       liveCancel: async () => {
         if (!live.available) {
           setLiveError("connection_unavailable");
@@ -961,6 +1072,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           await live.health();
           setLiveConnected(true);
           const st = await live.state();
+          if (st?.instance_id) {
+            if (lastInstanceIdRef.current && lastInstanceIdRef.current !== st.instance_id) {
+              setPendingSyncApproval(null);
+            }
+            lastInstanceIdRef.current = st.instance_id;
+          }
+          if (st?.pending_sync_approval) {
+            setPendingSyncApproval(st.pending_sync_approval);
+          } else if (!st?.active_run_id) {
+            setPendingSyncApproval(null);
+          }
           setState((s) => {
             const res = { ...s.resources };
             if (st && st.folders) {
@@ -1002,6 +1124,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       liveError,
       liveApproval,
       liveConsentRequest,
+      pendingSyncApproval,
     ],
   );
   // SSE stream lifecycle: connect once when live is available; abort on unmount.
@@ -1020,6 +1143,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         void refreshJournalsQuiet();
         try {
           const st = await live.state();
+          if (st?.instance_id) {
+            if (lastInstanceIdRef.current && lastInstanceIdRef.current !== st.instance_id) {
+              setPendingSyncApproval(null);
+            }
+            lastInstanceIdRef.current = st.instance_id;
+          }
+          if (st?.pending_sync_approval) {
+            setPendingSyncApproval(st.pending_sync_approval);
+          } else if (!st?.active_run_id) {
+            setPendingSyncApproval(null);
+          }
           setState((s) => {
             const res = { ...s.resources };
             if (st && st.folders) {

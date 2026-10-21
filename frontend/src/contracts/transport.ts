@@ -49,8 +49,8 @@ export interface HealthResponse {
 export interface RunRequest {
   input_text: string;
   source_mode: "personal_vault" | "examples";
-  /** Requested retrieval mode; backend falls back honestly when unavailable. */
-  retrieval_mode?: "lexical" | "semantic";
+  /** Requested retrieval mode; backend validates against registry and fails safely when unavailable. */
+  retrieval_mode?: "lexical" | "semantic" | "hybrid";
   app_language: "en" | "fa";
   staging_language: "en" | "fa";
   audit_language: "en" | "fa";
@@ -64,7 +64,7 @@ export interface RunResponse {
   accepted: boolean;
   reason: string;
   /** Effective retrieval actually used for this run. */
-  retrieval_mode?: "lexical" | "semantic";
+  retrieval_mode?: "lexical" | "semantic" | "hybrid";
   source_type?: string;
   input_id?: string;
 }
@@ -188,6 +188,40 @@ export interface StateResponse {
     error_message: string;
     timestamp: string;
   } | null;
+  pending_sync_approval?: PendingSyncApprovalInfo | null;
+}
+
+/** @category transport — Vault change diff */
+export interface VaultChangeDiff {
+  added: string[];
+  modified: string[];
+  removed: string[];
+  unchanged?: string[];
+  renamed_hint?: Array<[string, string]>;
+  stale: boolean;
+}
+
+/** @category transport — Pending Vault sync approval */
+export interface PendingSyncApprovalInfo {
+  run_id: string;
+  vault_id: string;
+  diff: VaultChangeDiff;
+  message: string;
+  created_at: string;
+}
+
+/** @category transport — POST /api/vault/sync/decide */
+export interface VaultSyncDecideRequest {
+  run_id: string;
+  vault_id: string;
+  decision: "approve" | "reject";
+}
+
+export interface VaultSyncDecideResponse {
+  status: "ok";
+  run_id: string;
+  vault_id: string;
+  decision: "approve" | "reject";
 }
 
 /** @category transport — POST /api/translate */
@@ -221,6 +255,30 @@ export interface VaultIndexResponse {
   notes_indexed: number;
   files_skipped: number;
   reason?: string;
+  vault_id?: string;
+  status?: string;
+  last_synced_at?: string;
+}
+
+/** @category transport — GET /api/vault/sync/status */
+export interface VaultSyncStatusResponse {
+  authorized: boolean;
+  vault_id: string;
+  sync_active: boolean;
+  status:
+    | "unauthorized"
+    | "authorizing"
+    | "sync_active"
+    | "change_detected"
+    | "sync_in_progress"
+    | "fresh"
+    | "stale"
+    | "error"
+    | "revoked";
+  last_synced_at?: string;
+  indexed_notes: number;
+  indexed_vectors: number;
+  error?: string | null;
 }
 
 /** @category transport — POST /api/run/accept */
@@ -252,7 +310,8 @@ export type RunEventKind =
   | "consent_required"
   | "revalidation_result"
   | "execution_result"
-  | "completed";
+  | "completed"
+  | "sync_approval_required";
 
 /** @category transport */
 export interface RunEvent {
@@ -276,4 +335,9 @@ export interface RunEvent {
   recovery_options?: string[];
   input_id?: string;
   input_hash?: string;
+  vault_id?: string;
+  diff?: VaultChangeDiff;
+  terminal_outcome?: string;
+  reason?: string;
+  status?: string;
 }

@@ -1079,6 +1079,59 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
   gap: 0.25rem;
 }
 
+.composer-strategy-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0 0.15rem 0.15rem;
+  font-size: 0.75rem;
+}
+
+.strategy-label {
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-right: 0.2rem;
+}
+
+.strategy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 0.12rem 0.5rem;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--panel-subtle);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: 1.4;
+}
+
+.strategy-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--bg-subtle);
+}
+
+.strategy-chip.active {
+  border-color: var(--accent);
+  background: var(--accent-subtle, rgba(37, 99, 235, 0.1));
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.strategy-chip:disabled,
+.strategy-chip.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  border-style: dashed;
+}
+
 .composer-input-row {
   display: flex;
   align-items: flex-end;

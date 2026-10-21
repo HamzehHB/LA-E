@@ -5,7 +5,7 @@ was queried, which existing items were found, and the limits of the search.
 It proposes nothing, decides nothing, and authorizes nothing.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .candidate import RetrievedCandidate
 
@@ -28,6 +28,7 @@ class RetrievalResult:
     corpus_size: int = 0
     query_terms: tuple[str, ...] = ()
     note: str = ""
+    metadata: dict = field(default_factory=dict)
 
     @property
     def has_candidates(self) -> bool:

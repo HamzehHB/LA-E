@@ -46,6 +46,16 @@ class AuditRecord:
     retrieval_candidates: tuple = field(default_factory=tuple)
     retrieval_note: str = ""
     evidence_hash: str = ""
+    retrieval_cache_scope_id: str = ""
+    retrieval_embeddings_generated: int = 0
+    retrieval_embeddings_failed: int = 0
+    retrieval_cache_cleaned_up: bool = False
+    retrieval_cache_cleanup_error: str = ""
+    embedding_provider: str = ""
+    embedding_model: str = ""
+    embedding_dimension: int = 0
+    retrieval_chunk_count: int = 0
+    vault_id: str = ""
     llm_provider: str = ""
     llm_model: str = ""
     llm_config_hash: str = ""
@@ -255,6 +265,16 @@ def build_audit_record(request, outcome, revalidation=None, execution=None,
         retrieval_candidates=retrieval_candidates,
         retrieval_note=_text("retrieval_note"),
         evidence_hash=_text("evidence_hash"),
+        retrieval_cache_scope_id=_text("retrieval_cache_scope_id"),
+        retrieval_embeddings_generated=int(info.get("retrieval_embeddings_generated") or 0),
+        retrieval_embeddings_failed=int(info.get("retrieval_embeddings_failed") or 0),
+        retrieval_cache_cleaned_up=bool(info.get("retrieval_cache_cleaned_up")),
+        retrieval_cache_cleanup_error=_text("retrieval_cache_cleanup_error"),
+        embedding_provider=_text("embedding_provider"),
+        embedding_model=_text("embedding_model"),
+        embedding_dimension=int(info.get("embedding_dimension") or 0),
+        retrieval_chunk_count=int(info.get("retrieval_chunk_count") or 0),
+        vault_id=_text("vault_id"),
         llm_provider=_text("llm_provider"),
         llm_model=_text("llm_model"),
         llm_config_hash=_text("llm_config_hash"),
