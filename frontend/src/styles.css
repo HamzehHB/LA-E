@@ -657,7 +657,103 @@ ol.timeline li .grp {
   color: var(--muted);
   letter-spacing: 0.01em;
 }
+ol.timeline li.has-substeps {
+  align-items: flex-start;
+}
 
+ol.timeline li.has-substeps .node {
+  margin-top: 3px;
+}
+
+ol.timeline li .timeline-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.timeline-substeps {
+  list-style: none;
+  margin: 0.25rem 0 0.35rem 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.substep-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.68rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  transition: all 0.15s ease;
+}
+
+.substep-pill .substep-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.substep-pill.substep-completed {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.substep-pill.substep-completed .substep-dot {
+  background: var(--accent);
+}
+
+.substep-pill.substep-current {
+  border-color: var(--warn);
+  color: var(--warn);
+  font-weight: 600;
+  background: color-mix(in srgb, var(--warn) 15%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
+.substep-pill.substep-current .substep-dot {
+  background: var(--warn);
+  box-shadow: 0 0 4px var(--warn);
+}
+
+.substep-pill.substep-pending {
+  opacity: 0.6;
+}
+
+.substep-pill.substep-failed {
+  border-color: var(--danger, #ef4444);
+  color: var(--danger, #ef4444);
+  background: color-mix(in srgb, var(--danger, #ef4444) 15%, transparent);
+}
+
+.substep-pill.substep-failed .substep-dot {
+  background: var(--danger, #ef4444);
+}
+
+.substep-pill.substep-cancelled,
+.substep-pill.substep-stopped {
+  border-color: var(--muted);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 15%, transparent);
+}
+
+.substep-pill.substep-cancelled .substep-dot,
+.substep-pill.substep-stopped .substep-dot {
+  background: var(--muted);
+}
+
+.substep-pill.substep-unknown {
+  border-color: var(--line-strong);
+  color: var(--muted);
+}
 /* Idle: white node circle with subtle line */
 ol.timeline li[data-state="pending"] .node {
   background: #ffffff;
@@ -1042,6 +1138,34 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
 .news-summary.excerpt {
   color: var(--muted);
   font-style: italic;
+}
+
+.news-narrative {
+  margin: 0.35rem 0 0.25rem 0;
+  padding: 0.35rem 0.5rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.narrative-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+  text-transform: uppercase;
+}
+
+.narrative-body {
+  font-family: inherit;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  color: var(--ink);
+  max-height: 140px;
+  overflow-y: auto;
 }
 
 .journal-foot {
@@ -1643,4 +1767,57 @@ ol.timeline[data-terminal="rejected"] li[data-state="stopped"] .node {
   background: var(--accent-subtle);
   border-radius: var(--radius-sm);
   font-size: 0.82rem;
+}
+
+.translate-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.translate-badge {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  padding: 0.05rem 0.35rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.translate-badge.translate-stale {
+  border-color: var(--warn, #eab308);
+  color: var(--warn, #eab308);
+}
+
+.translate-badge.translate-unverifiable {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+.translate-badge.status-unavailable {
+  border-color: var(--danger, #ef4444);
+  color: var(--danger, #ef4444);
+}
+
+.translate-badge.status-current {
+  border-color: var(--accent, #3b82f6);
+  color: var(--accent, #3b82f6);
+}
+
+.translate-badge.on-demand {
+  border-color: var(--accent, #3b82f6);
+  opacity: 0.8;
+}
+
+.translate-translator {
+  opacity: 0.85;
+}
+
+.translate-hash {
+  font-family: var(--font-mono, monospace);
+  opacity: 0.8;
 }

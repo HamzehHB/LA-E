@@ -71,7 +71,10 @@ def _git(*args: str) -> str:
 
 
 def _tracked_files() -> list[str]:
-    return [line for line in _git("ls-files").splitlines() if line]
+    return [
+        line for line in _git("ls-files").splitlines()
+        if line and line != "diff" and (REPO / line).is_file()
+    ]
 
 
 def test_no_known_secret_patterns_in_tracked_files():

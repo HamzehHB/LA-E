@@ -679,8 +679,73 @@ def test_journals_reconciles_orphaned_staging_file(tmp_path):
     assert unlinked_file.exists()
 
 
+def test_journals_includes_emergency_audit_records_and_excludes_unrelated_logs(tmp_path):
+    """Emergency audit records from errors/audit_emergency.jsonl are inspectable via journals()
+    with emergency=True, while unrelated internal error logs in errors/ remain excluded."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    (audit / "passed").mkdir()
+    (audit / "failed").mkdir()
+    errors_dir = audit / "errors"
+    errors_dir.mkdir()
+
+    # 1. Real emergency audit record in errors/audit_emergency.jsonl
+    emergency_file = errors_dir / "audit_emergency.jsonl"
+    emergency_entry = {
+        "record_id": "rec-emergency-001",
+        "run_id": "run-emergency-001",
+        "proposal_hash": "e" * 64,
+        "timestamp": "2026-10-24T12:00:00Z",
+        "storage_category": "errors",
+        "terminal_outcome": "audit_persistence_failed",
+        "artifact_reference": "emergency_art.md",
+        "proposal_action": "CREATE",
+        "emergency": True,
+        "narrative": "Emergency audit persistence fallback was activated.",
+        "narrative_language": "en",
+    }
+    emergency_file.write_text(json.dumps(emergency_entry) + "\n", encoding="utf-8")
+
+    # 2. Unrelated internal error file in errors/ (must NOT leak into journals)
+    unrelated_log = errors_dir / "internal_traceback.log"
+    unrelated_log.write_text("Traceback (most recent call last):\nException: raw secret crash details\n", encoding="utf-8")
+
+    launcher = _launcher(paths={
+        "staging": {"root": str(staging)},
+        "audit": {"root": str(audit), "passed": str(audit / "passed"), "failed": str(audit / "failed")},
+    })
+
+    j = launcher.journals()
+    audits = j["audits"]
+    staging_items = j["staging"]
+
+    # Emergency audit record is present and properly tagged
+    emerg_audits = [a for a in audits if a.get("emergency") is True]
+    assert len(emerg_audits) == 1
+    ea = emerg_audits[0]
+    assert ea["record_id"] == "rec-emergency-001"
+    assert ea["storage_category"] == "errors"
+    assert "Emergency Audit" in ea["title"]
+    assert ea["emergency"] is True
+    assert ea["narrative"] == "Emergency audit persistence fallback was activated."
+
+    # Staging slot is also paired with emergency flag
+    emerg_staging = [s for s in staging_items if s.get("emergency") is True]
+    assert len(emerg_staging) == 1
+    assert emerg_staging[0]["record_id"] == "rec-emergency-001"
+
+    # Verify unrelated error file was NOT parsed or included
+    for a in audits:
+        assert "Traceback" not in a.get("title", "")
+        assert "Traceback" not in a.get("summary", "")
+        assert "Traceback" not in a.get("record_id", "")
+
+
+
 def test_translate_text_honest_offline_fallback():
-    """Untranslated text when offline must honestly say model is not connected."""
+    """Untranslated text when offline must honestly say model is not connected and return TranslationRecord."""
     launcher = _launcher()
     result = launcher.translate_text("Unique unmapped term", target_lang="fa")
     assert isinstance(result, dict)
@@ -688,6 +753,141 @@ def test_translate_text_honest_offline_fallback():
     assert "مدل زبانی متصل نیست" in translated
     assert "ترجمه خودکار در دسترس نیست" in translated
     assert "Unique unmapped term" in translated
+    # TranslationRecord contract
+    assert result.get("target_language") == "fa"
+    assert result.get("source_language") == "en"
+    assert result.get("source_hash") != ""
+    assert result.get("status") == "unavailable"
+    assert result.get("translator") == "offline-fallback"
+
+
+def test_translate_endpoint_returns_translation_record(running):
+    """The /api/translate HTTP endpoint returns a complete TranslationRecord payload."""
+    launcher, server = running
+    status, raw_data = _request(
+        server,
+        "POST",
+        "/api/translate",
+        body={"text": "Processing Result", "target_lang": "fa", "source_lang": "en"},
+        token=launcher.token,
+    )
+    assert status == 200
+    data = json.loads(raw_data)
+    assert data["target_lang"] == "fa"
+    assert data["target_language"] == "fa"
+    assert data["source_language"] == "en"
+    assert data["translated_text"] == "نتیجه پردازش"
+    assert data["status"] == "current"
+    assert data["translator"] == "static-dictionary-v1"
+    assert data["source_hash"] != ""
+    assert data["translated_hash"] != ""
+
+
+def test_translate_endpoint_with_source_kind_and_id(running):
+    """The /api/translate endpoint preserves source_kind and source_id provenance."""
+    launcher, server = running
+    status, raw_data = _request(
+        server,
+        "POST",
+        "/api/translate",
+        body={
+            "text": "Audit Log",
+            "target_lang": "fa",
+            "source_lang": "en",
+            "source_kind": "audit_narrative",
+            "source_id": "rec-prov-001",
+        },
+        token=launcher.token,
+    )
+    assert status == 200
+    data = json.loads(raw_data)
+    assert data["source_kind"] == "audit_narrative"
+    assert data["source_id"] == "rec-prov-001"
+    assert data["source_text"] == "Audit Log"
+    assert data["persisted"] is False
+
+
+def test_translate_endpoint_same_language_identity(running):
+    """Translating with same source and target language returns identity translation."""
+    launcher, server = running
+    sample_text = "Exact authentic observation text"
+    status, raw_data = _request(
+        server,
+        "POST",
+        "/api/translate",
+        body={
+            "text": sample_text,
+            "target_lang": "en",
+            "source_lang": "en",
+            "source_kind": "proposal",
+            "source_id": "prop-hash-001",
+        },
+        token=launcher.token,
+    )
+    assert status == 200
+    data = json.loads(raw_data)
+    assert data["translated_text"] == sample_text
+    assert data["translator"] == "identity"
+    assert data["status"] == "current"
+    assert data["persisted"] is False
+    assert data["source_kind"] == "proposal"
+    assert data["source_id"] == "prop-hash-001"
+
+
+def test_translate_endpoint_empty_text(running):
+    """Translating empty or whitespace text returns empty string cleanly."""
+    launcher, server = running
+    status, raw_data = _request(
+        server,
+        "POST",
+        "/api/translate",
+        body={"text": "   ", "target_lang": "fa", "source_lang": "en"},
+        token=launcher.token,
+    )
+    assert status == 200
+    data = json.loads(raw_data)
+    assert data["translated_text"] == ""
+    assert data["status"] == "unavailable"
+
+
+def test_translate_source_lang_detection_not_inferred_from_target(running):
+    """When source_lang is omitted, source language is detected from text content,
+    not inferred solely from target_lang."""
+    launcher, server = running
+
+    # 1. English text with target_lang="en" and no source_lang:
+    # Must NOT infer source as "fa"; must detect "en" and return identity translation.
+    status, raw_data = _request(
+        server,
+        "POST",
+        "/api/translate",
+        body={"text": "English observation without explicit source_lang", "target_lang": "en"},
+        token=launcher.token,
+    )
+    assert status == 200
+    data = json.loads(raw_data)
+    assert data["source_language"] == "en"
+    assert data["target_language"] == "en"
+    assert data["translator"] == "identity"
+    assert data["translated_text"] == "English observation without explicit source_lang"
+
+    # 2. Persian text with target_lang="fa" and no source_lang:
+    # Detects "fa" from Persian characters and returns identity translation.
+    persian_text = "متن مشاهده معتبر بدون تعیین صریح زبان مبدا"
+    status, raw_data = _request(
+        server,
+        "POST",
+        "/api/translate",
+        body={"text": persian_text, "target_lang": "fa"},
+        token=launcher.token,
+    )
+    assert status == 200
+    data = json.loads(raw_data)
+    assert data["source_language"] == "fa"
+    assert data["target_language"] == "fa"
+    assert data["translator"] == "identity"
+    assert data["translated_text"] == persian_text
+
 
 
 def test_cancellation_validation_and_terminal_behavior(running):
@@ -764,4 +964,119 @@ def test_reveal_folder_security_and_exclusion(running, tmp_path):
     assert "note1.md" in names
     assert "subfolder" in names
     assert ".hidden_secret" not in names
+
+
+def test_cancel_wakes_pending_approval_waiter_promptly():
+    """Cancellation must immediately unblock a thread waiting in _approval_reader."""
+    import time
+    import threading
+    launcher = _launcher()
+    run_id = "run-test-cancel-wake"
+    launcher._active_run_id = run_id
+
+    # Register a pending approval
+    class MockReq:
+        proposal_hash = "prop-hash-cancel-1"
+        confidence_score = 0.8
+    launcher.register_approval(MockReq(), None)
+
+    reader_result = []
+    start_time: float = 0.0
+    end_time: float = 0.0
+
+    def _wait_reader():
+        nonlocal start_time, end_time
+        start_time = time.monotonic()
+        res = launcher._approval_reader()
+        end_time = time.monotonic()
+        reader_result.append(res)
+
+    t = threading.Thread(target=_wait_reader)
+    t.start()
+    time.sleep(0.05)  # ensure thread is in wait()
+
+    # Cancel the active run
+    launcher.request_cancel(run_id)
+    t.join(timeout=1.0)
+    assert not t.is_alive(), "approval reader must unblock immediately on cancel"
+    assert reader_result == ["cancel"], "reader must return 'cancel' signal"
+    assert start_time > 0.0 and end_time >= start_time
+    elapsed = end_time - start_time
+    assert elapsed < 0.5, f"cancellation must wake waiter promptly, took {elapsed}s"
+
+
+def test_late_approval_after_cancel_raises_conflict_409(running):
+    """Calling approve after run cancellation is rejected with 409 Conflict."""
+    launcher, server = running
+    run_id = "run-test-late-approve"
+    launcher._active_run_id = run_id
+
+    class MockReq:
+        proposal_hash = "prop-hash-late-1"
+        confidence_score = 0.8
+    launcher.register_approval(MockReq(), None)
+
+    # Cancel the run
+    launcher.request_cancel(run_id)
+
+    # Late approve via HTTP POST
+    status, data = _request(
+        server, "POST", "/api/approve",
+        body={"proposal_hash": "prop-hash-late-1", "query_unit_id": "", "decision": "approve"},
+        token=launcher.token,
+    )
+    assert status == 409, f"expected 409 Conflict for late approval, got {status}: {data}"
+    payload = json.loads(data)
+    assert payload["error"]["kind"] == "conflict"
+
+
+def test_journals_fails_closed_when_audit_boundary_cannot_be_created(tmp_path):
+    """When audit PathBoundary cannot be constructed, journals() fails closed without reading paths."""
+    from src.living_authenticity.security.path_boundary import PathBoundary
+
+    launcher = _launcher(paths={
+        "staging": {"root": str(tmp_path / "staging")},
+        "audit": {"root": "\0invalid-null-byte-path"},
+    })
+    j = launcher.journals()
+    assert j["audits"] == []
+    assert j["staging"] == []
+
+
+def test_journals_staging_path_boundary_enforcement(tmp_path):
+    """Staging artifacts outside staging_root boundary are rejected and not read into excerpts."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    (audit / "passed").mkdir()
+
+    outside_file = tmp_path / "outside_secret.md"
+    outside_file.write_text("SUPER SECRET DATA OUTSIDE STAGING", encoding="utf-8")
+
+    # Write audit log containing artifact_path pointing outside staging root
+    passed_log = audit / "passed" / "audit.jsonl"
+    entry = {
+        "record_id": "rec-boundary-001",
+        "run_id": "run-b-001",
+        "proposal_hash": "a" * 64,
+        "timestamp": "2026-10-24T12:00:00Z",
+        "storage_category": "passed",
+        "artifact_reference": "outside_secret.md",
+        "artifact_path": str(outside_file),
+        "proposal_action": "CREATE",
+    }
+    passed_log.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    launcher = _launcher(paths={
+        "staging": {"root": str(staging)},
+        "audit": {"root": str(audit), "passed": str(audit / "passed")},
+    })
+    j = launcher.journals()
+    assert len(j["audits"]) == 1
+    staging_slot = j["staging"][0]
+    # Outside artifact is rejected by PathBoundary: not staged, no secret excerpt leaked
+    assert staging_slot["staging_available"] is False
+    assert "SUPER SECRET DATA" not in staging_slot["excerpt"]
+    assert staging_slot["artifact_path"] == ""
 

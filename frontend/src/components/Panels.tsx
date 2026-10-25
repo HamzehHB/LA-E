@@ -1,15 +1,27 @@
 import { useState, useEffect, useRef, useMemo, startTransition } from "react";
 import { useStore } from "../state/store";
 import { translate, hasUiKey, ERROR_CODE_TO_KEY, type UiKey } from "../i18n/resources";
+import type { TranslateResponse } from "../contracts/transport";
+import { computeSha256 } from "../contracts/crypto";
 
 /**
  * Translate affordance calling live backend translation endpoint (/api/translate).
  */
-export function TranslateAction({ text }: { text?: string }) {
+export function TranslateAction({
+  text,
+  sourceKind = "dynamic_text",
+  recordId,
+  sourceLang,
+}: {
+  text?: string;
+  sourceKind?: string;
+  recordId?: string;
+  sourceLang?: string;
+}) {
   const { state, liveTranslate } = useStore();
   const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
   const [loading, setLoading] = useState(false);
-  const [translated, setTranslated] = useState("");
+  const [record, setRecord] = useState<TranslateResponse | null>(null);
   const [open, setOpen] = useState(false);
 
   const handleTranslate = async () => {
@@ -19,11 +31,72 @@ export function TranslateAction({ text }: { text?: string }) {
     }
     setLoading(true);
     const target = state.appLanguage === "fa" ? "fa" : "en";
-    const res = await liveTranslate(text, target);
+    const res = await liveTranslate(text, target, sourceLang, sourceKind, recordId);
     setLoading(false);
-    setTranslated(res);
+    setRecord(res);
     setOpen(true);
   };
+
+  const currentTarget = state.appLanguage === "fa" ? "fa" : "en";
+  const expectedHash = text ? computeSha256(text) : "";
+
+  // 1. Unavailable: status is unavailable/failed or no translated text exists
+  const isUnavailable = Boolean(
+    record &&
+    (record.status === "unavailable" ||
+     record.status === "failed" ||
+     !record.translated_text ||
+     !record.translated_text.trim())
+  );
+
+  // 2. Unverifiable: missing required language, hash, identity, or provenance metadata
+  const hasMissingRequiredMetadata = Boolean(
+    record &&
+    (
+      !record.target_language ||
+      !record.target_language.trim() ||
+      (sourceLang && (!record.source_language || !record.source_language.trim())) ||
+      !record.source_hash ||
+      !record.source_hash.trim() ||
+      !record.source_kind ||
+      !record.source_kind.trim() ||
+      (recordId && (!record.source_id || !record.source_id.trim()))
+    )
+  );
+
+  const isUnverifiable = Boolean(
+    record &&
+    !isUnavailable &&
+    (record.status === "unverifiable" ||
+     record.status === "invalid" ||
+     record.status === "missing" ||
+     hasMissingRequiredMetadata)
+  );
+
+  // 3. Stale: metadata is verifiable, but outdated or mismatched against current expectations
+  const isStale = Boolean(
+    record &&
+    !isUnavailable &&
+    !isUnverifiable &&
+    (
+      record.status === "stale" ||
+      record.target_language !== currentTarget ||
+      (expectedHash && record.source_hash !== expectedHash) ||
+      (text && record.source_text && record.source_text !== text) ||
+      (recordId && record.source_id !== recordId) ||
+      (sourceKind && record.source_kind !== sourceKind) ||
+      (sourceLang && record.source_language && record.source_language !== sourceLang)
+    )
+  );
+
+  // 4. Current: all required metadata verified, matches target language & content hash, and status is "current"
+  const isCurrent = Boolean(
+    record &&
+    !isUnavailable &&
+    !isUnverifiable &&
+    !isStale &&
+    record.status === "current"
+  );
 
   return (
     <div className="translate-row">
@@ -36,9 +109,25 @@ export function TranslateAction({ text }: { text?: string }) {
       >
         {loading ? "Translating…" : t("ui.translate.action")}
       </button>
-      {open && translated && (
+      {open && record && record.translated_text && (
         <div role="note" className="translate-result">
-          <p>{translated}</p>
+          <div className="translate-meta">
+            {isUnavailable && <span className="translate-badge status-unavailable">{record.status || "unavailable"}</span>}
+            {isUnverifiable && <span className="translate-badge translate-unverifiable">unverifiable</span>}
+            {isStale && <span className="translate-badge translate-stale">stale</span>}
+            {isCurrent && <span className="translate-badge status-current">current</span>}
+            {record.source_kind && <span className="translate-kind">[{record.source_kind}]</span>}
+            {record.translator && <span className="translate-translator">via {record.translator}</span>}
+            {record.source_hash && (
+              <span className="translate-hash" title={record.source_hash}>
+                hash: {record.source_hash.slice(0, 8)}
+              </span>
+            )}
+            {record.persisted === false && (
+              <span className="translate-badge on-demand">on-demand</span>
+            )}
+          </div>
+          <p>{record.translated_text}</p>
         </div>
       )}
     </div>
@@ -395,7 +484,12 @@ export function ProcessingResult() {
           </div>
 
           <div className="proposal-footer">
-            <TranslateAction text={state.run.edited_body ?? state.run.proposal_body} />
+            <TranslateAction
+              text={state.run.edited_body ?? state.run.proposal_body}
+              sourceKind="proposal"
+              recordId={state.run.proposal_hash}
+              sourceLang={state.stagingLanguage}
+            />
             <p className="hash-label">
               proposal_hash: <code>{state.run.proposal_hash || "hash-pending"}</code>
             </p>
@@ -648,10 +742,28 @@ export function Journals() {
                 <span className={`status-badge ${currentAudit.statusKey === "journal.passed" ? "ok" : "failed"}`}>
                   {t(currentAudit.statusKey as Parameters<typeof translate>[1])}
                 </span>
+                {currentAudit.emergency && (
+                  <span className="status-badge failed emergency-badge">
+                    Emergency Journal
+                  </span>
+                )}
               </div>
               <h4 className="news-title">{currentAudit.title || `Audit Record: ${currentAudit.id}`}</h4>
               <p className="news-summary">{currentAudit.summary || `Audit record registered in category ${currentAudit.statusKey}.`}</p>
-              <TranslateAction text={currentAudit.summary || currentAudit.title} />
+              {currentAudit.narrative && (
+                <div className="news-narrative">
+                  <div className="narrative-badge">
+                    <span>{currentAudit.narrative_language === "fa" ? "گزارش حسابرسی پیوسته" : "Continuous Audit Narrative"}</span>
+                  </div>
+                  <pre className="narrative-body">{currentAudit.narrative}</pre>
+                </div>
+              )}
+              <TranslateAction
+                text={currentAudit.narrative || currentAudit.summary || currentAudit.title}
+                sourceKind="audit_narrative"
+                recordId={currentAudit.id || currentAudit.record_id}
+                sourceLang={currentAudit.narrative_language || state.auditLanguage}
+              />
             </div>
           ) : (
             <p className="muted">{t("ui.empty.journals")}</p>
@@ -696,12 +808,22 @@ export function Journals() {
                 <span className={`status-badge ${currentStaging.staging_available ? "ok" : "unavailable"}`}>
                   {currentStaging.staging_available ? "Staged" : "Unavailable"}
                 </span>
+                {currentStaging.emergency && (
+                  <span className="status-badge failed emergency-badge">
+                    Emergency
+                  </span>
+                )}
               </div>
               <h4 className="news-title">{currentStaging.title || "Staged Artifact"}</h4>
               <p className="news-summary excerpt">
                 {currentStaging.excerpt || (currentStaging.staging_available ? "Staging file generated and ready for human review." : "Unavailable — no staged note produced.")}
               </p>
-              <TranslateAction text={currentStaging.excerpt || currentStaging.title} />
+              <TranslateAction
+                text={currentStaging.excerpt || currentStaging.title}
+                sourceKind="staging_note"
+                recordId={currentStaging.id || currentStaging.proposalHash || currentStaging.record_id || currentStaging.proposal_hash}
+                sourceLang={state.stagingLanguage}
+              />
             </div>
           ) : (
             <p className="muted">{t("ui.empty.journals")}</p>

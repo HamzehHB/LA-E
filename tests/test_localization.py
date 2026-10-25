@@ -169,3 +169,56 @@ def test_new_review_keys_have_parity():
         assert key in en and key in fa
     report = validate_resources()
     assert report["ok"], report
+
+
+def test_translation_provenance_validation():
+    """Missing or mismatching source_id, source_kind, or source_language marks record not current."""
+    rec = build_translation_record(
+        source_kind="audit_narrative",
+        source_id="rec-001",
+        source_text="Authentic record observation",
+        source_language="en",
+        target_language="fa",
+        translated_text="مشاهده سند معتبر",
+        status=TranslationStatus.CURRENT,
+    )
+    # Valid matching provenance
+    assert is_translation_current(
+        rec, "Authentic record observation",
+        expected_source_id="rec-001",
+        expected_source_kind="audit_narrative",
+        expected_source_language="en",
+    )
+
+    # Mismatching source_id
+    assert not is_translation_current(
+        rec, "Authentic record observation",
+        expected_source_id="rec-OTHER",
+    )
+
+    # Mismatching source_kind
+    assert not is_translation_current(
+        rec, "Authentic record observation",
+        expected_source_kind="staging_note",
+    )
+
+    # Mismatching source_language
+    assert not is_translation_current(
+        rec, "Authentic record observation",
+        expected_source_language="fa",
+    )
+
+
+def test_translation_status_failed_and_unverifiable():
+    """TranslationRecord accepts FAILED and UNVERIFIABLE statuses."""
+    rec_fail = build_translation_record(
+        "audit", "rec-f", "text", "en", "fa", "",
+        status=TranslationStatus.FAILED,
+    )
+    assert rec_fail.status == "failed"
+
+    rec_unv = build_translation_record(
+        "audit", "rec-u", "text", "en", "fa", "",
+        status=TranslationStatus.UNVERIFIABLE,
+    )
+    assert rec_unv.status == "unverifiable"

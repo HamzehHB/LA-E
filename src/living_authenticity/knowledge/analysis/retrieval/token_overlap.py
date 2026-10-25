@@ -72,21 +72,46 @@ def _unit_text(unit: KnowledgeUnit) -> str:
 
 
 
+from .pipeline import (
+    PreparedQuery,
+    RelevanceAssessment,
+    RetrievalCoordinator,
+    assess_relevance,
+    identify_candidates,
+    prepare_query,
+    record_evidence,
+    retrieve_candidates,
+)
+
+
 class TokenOverlapRetriever(KnowledgeRetriever):
     """Retrieve corpus units sharing content tokens with the query unit."""
 
-    def __init__(self, min_shared_terms: int = 1, max_candidates: int = 5) -> None:
+    def __init__(
+        self,
+        min_shared_terms: int = 1,
+        max_candidates: int = 5,
+        observer: Any = None,
+    ) -> None:
         if isinstance(min_shared_terms, bool) or not isinstance(min_shared_terms, int):
             raise TypeError("min_shared_terms must be an int")
         if isinstance(max_candidates, bool) or not isinstance(max_candidates, int):
             raise TypeError("max_candidates must be an int")
         if min_shared_terms < 1:
             raise ValueError("min_shared_terms must be at least 1")
-        if max_candidates < 1:
-            raise ValueError("max_candidates must be at least 1")
+        if max_candidates < 0:
+            raise ValueError("max_candidates must be non-negative")
+        if observer is not None and not callable(observer):
+            raise TypeError("observer must be callable or None")
         self._min_shared_terms = min_shared_terms
         self._max_candidates = max_candidates
         self._name = "token_overlap"
+        self._observer = observer
+
+    def set_observer(self, observer: Any) -> None:
+        if observer is not None and not callable(observer):
+            raise TypeError("observer must be callable or None")
+        self._observer = observer
 
     @property
     def name(self) -> str:
@@ -106,78 +131,23 @@ class TokenOverlapRetriever(KnowledgeRetriever):
         return None
 
     def retrieve(
-        self, query: KnowledgeUnit, corpus: Sequence[Any]
+        self,
+        query: KnowledgeUnit,
+        corpus: Sequence[Any],
+        observer: Any = None,
     ) -> RetrievalResult:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError(
                 "query must be a KnowledgeUnit, got " + type(query).__name__
             )
-        query_terms = tokenize(_unit_text(query))
-        if not query_terms:
-            return RetrievalResult(
-                query_unit_id=query.id,
-                query_source=query.source,
-                query_position=query.position,
-                strategy=self._name,
-                candidates=(),
-                corpus_size=len(corpus),
-                query_terms=(),
-                note="Query has no analyzable content; no candidates retrieved.",
-            )
-
-        query_term_set = set(query_terms)
-        scored: list[tuple[int, KnowledgeUnit, tuple[str, ...]]] = []
-        for unit in corpus:
-            if not isinstance(unit, KnowledgeUnit):
-                raise TypeError(
-                    "corpus must contain only KnowledgeUnit objects, got "
-                    + type(unit).__name__
-                )
-            if unit.id == query.id:
-                continue
-            matched = _matched_terms(query_term_set, unit)
-            if len(matched) >= self._min_shared_terms:
-                scored.append((len(matched), unit, matched))
-
-        scored.sort(
-            key=lambda item: (
-                -item[0], item[1].source, item[1].position, item[1].id,
-            )
-        )
-        chosen = scored[: self._max_candidates]
-        candidates = tuple(
-            RetrievedCandidate(
-                unit_id=unit.id,
-                source=unit.source,
-                position=unit.position,
-                text=_unit_text(unit),
-                matched_terms=matched,
-                overlap_score=score,
-                retriever=self._name,
-            )
-            for score, unit, matched in chosen
-        )
-        if candidates:
-            note = (
-                "Retrieved " + str(len(candidates)) + " of " + str(len(corpus))
-                + " examined units as contextual evidence; relevance is "
-                + "token overlap only and decides nothing."
-            )
-        else:
-            note = (
-                "No corpus unit shares at least " + str(self._min_shared_terms)
-                + " distinct content tokens with the query."
-            )
-        return RetrievalResult(
-            query_unit_id=query.id,
-            query_source=query.source,
-            query_position=query.position,
+        eff_obs = observer if observer is not None else self._observer
+        coordinator = RetrievalCoordinator(
             strategy=self._name,
-            candidates=candidates,
-            corpus_size=len(corpus),
-            query_terms=query_terms,
-            note=note,
+            min_shared_terms=self._min_shared_terms,
+            max_candidates=self._max_candidates,
+            observer=eff_obs,
         )
+        return coordinator.run(query, corpus)
 
 
 # Short, stable alias used as the default retriever.

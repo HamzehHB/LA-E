@@ -156,9 +156,17 @@ class TestMultipleMatches:
         with pytest.raises(ValueError):
             TokenOverlapRetriever(min_shared_terms=0)
         with pytest.raises(ValueError):
-            TokenOverlapRetriever(max_candidates=0)
+            TokenOverlapRetriever(max_candidates=-1)
         with pytest.raises(TypeError):
             TokenOverlapRetriever(min_shared_terms="2")  # type: ignore[arg-type]
+
+    def test_max_candidates_zero_yields_empty_candidates(self):
+        query = _unit("calmness restores the mind", id="q")
+        corpus = [
+            _unit("calmness restores the mind today", id="strong", source="b.md"),
+        ]
+        result = _retriever(min_shared_terms=1, max_candidates=0).retrieve(query, corpus)
+        assert result.candidates == ()
 
 
 class TestDeterminism:

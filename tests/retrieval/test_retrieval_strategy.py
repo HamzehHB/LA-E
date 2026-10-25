@@ -125,8 +125,10 @@ def test_lexical_retrieval_requires_zero_embeddings():
     assert res.has_candidates
     assert len(res.candidates) == 1
     assert res.candidates[0].overlap_score >= 1
-    # No embedding metadata exists on lexical result
-    assert not res.metadata
+    # No embedding metadata exists on lexical result, but standard evidence metadata is recorded
+    assert "embeddings_generated" not in res.metadata
+    assert "capabilities" in res.metadata
+    assert res.metadata.get("corpus_size") == 1
 
 
 def test_semantic_retrieval_caches_and_validates_dimensions(tmp_path):

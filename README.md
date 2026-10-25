@@ -106,22 +106,55 @@ Implemented foundations include:
   traceability fields (input/evidence hashes, retrieval provenance with
   considered/retrieved/passed_downstream/used_as_evidence, prompt hash,
   artifact path/hash/timestamp on success, stop reasons); credentials
-  are never persisted (recursive sanitizer)
+  are never persisted (recursive sanitizer).
+- Resilient audit persistence and emergency journaling (`AuditWriter.append_emergency`
+  and `persist_record_resilient`): primary audit persistence performs standard
+  buffered stream writes (`durability="written"`). When primary persistence fails,
+  resilient persistence recovers the complete collected run history into emergency journals
+  (`errors/audit_emergency.jsonl`) with hardware synchronization (`durability="confirmed"`
+  via `os.fsync`), while leaving previously persisted primary records intact.
+  Durable success is never falsely claimed (`durability="confirmed"` vs
+  `"failed"`, `persisted=False` on failure or missing writer). File-level `fsync`
+  flushes file content and metadata to storage controllers without claiming
+  unconditional cross-platform power-loss crash durability (directory entry durability
+  requires parent directory sync on POSIX, unsupported on Windows directory handles).
+- Non-overwriting, path-confined post-execution artifact quarantine
+  (`ControlledExecutor.quarantine_artifact`): if both primary and emergency
+  audit persistence fail after staging execution, the artifact is moved to
+  `.unreconciled/` within the staging root (falling back to sibling
+  `.unreconciled.<filename>` when the `.unreconciled/` directory does not pre-exist,
+  preserving the no-mkdir AST invariant). Traversal, escaping symlinks, and
+  target collisions are strictly rejected without overwriting existing files.
+  On POSIX hard-linking, partial cleanup failures (destination created,
+  source unlink failed) are truthfully reported without rollback
+  (`partial_cleanup_failed`).
+- Canonical candidate identity and deterministic deduplication
+  (`candidate_identity_key` with format `<source>:<position>:<unit_id>`):
+  five discrete retrieval capabilities (`query_preparation`, `candidate_retrieval`,
+  `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording`)
+  with explicit lifecycle phases (`started`, `completed`, `failed`) and preserved
+  vector-distance evidence.
+- Canonical bilingual lifecycle narrative generation (English and Persian)
+  and traceable translation records (`build_narrative_translation_record`):
+  strict fallback provenance attribution (`"template-fallback"` on custom
+  translator failures, never falsely claiming `"custom-translator"`),
+  custom notes preservation, stale detection (`is_narrative_translation_stale`),
+  and explicit `persisted: false` markers for on-demand UI presentations.
 - An inspectable vault manifest/freshness contract
   (`snapshot_vault`, `diff_manifests`, `verify_index_freshness`) plus an
   explicit `synchronize_index` action — vault-derived state stays
   inspectable and synchronized only by explicit operator action, never
-  by a hidden background watcher
+  by a hidden background watcher.
 - An LLM provider/model discovery and selection contract
   (`llm/discovery.py`): read-only local model discovery, local-first
   default, cloud as an explicit choice, validated selection states for a
   future UI; no downloads, no credential exposure, mandatory gate
-  unchanged
+  unchanged.
 - An artifact lifecycle matrix documenting, for every pipeline state,
   what exists in memory, what persists, and when a staging artifact does
-  or does not exist ([docs/artifact-lifecycle-matrix.md](docs/artifact-lifecycle-matrix.md))
+  or does not exist ([docs/artifact-lifecycle-matrix.md](docs/artifact-lifecycle-matrix.md)).
 - A synthetic, public-safe example of that workflow under
-  [examples/bounded_local_integration/](examples/bounded_local_integration/README.md)
+  [examples/bounded_local_integration/](examples/bounded_local_integration/README.md).
 - A local loopback launcher (`living_authenticity/adapter/`): binds
   127.0.0.1 only, per-launch in-memory token, typed bounded errors, no
   direct filesystem writes outside authorized surfaces, and the only
@@ -142,7 +175,7 @@ Implemented foundations include:
     confidence band, proposal type, human review actions (`Approve`,
     `Edit proposal`, `Reject`, `Accept`), pause/fix/stop error recovery,
     and bilingual translation (English ↔ Persian).
-  - 1:1 paired newspaper journals for Audits (excluding `errors/`) and Staging
+  - 1:1 paired newspaper journals for Audits (passed, failed, and errors partitions) and Staging
     with 5s synchronized rotation, digests, and scrollable "View All" historical modal.
   - Run the full environment via: `python -m src.living_authenticity.adapter`.
 

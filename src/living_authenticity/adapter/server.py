@@ -379,9 +379,11 @@ def _make_handler(launcher: Launcher):
                     data.get("query_unit_id"),
                     data.get("decision"))
             except AdapterError as exc:
-                self._error(409 if ("pending" in exc.message
-                                    or "already" in exc.message)
-                            else 400, exc.kind, exc.message)
+                status_code = 409 if (exc.kind == "conflict"
+                                      or "pending" in exc.message
+                                      or "already" in exc.message
+                                      or "cancelled" in exc.message) else 400
+                self._error(status_code, exc.kind, exc.message)
                 return
             self._send_json(200, result)
 
@@ -441,8 +443,16 @@ def _make_handler(launcher: Launcher):
             text = data.get("text", "")
             target_lang = data.get("target_lang", "en")
             source_lang = data.get("source_lang", "")
+            source_kind = data.get("source_kind", "dynamic_text")
+            source_id = data.get("source_id", "")
             try:
-                result = launcher.translate_text(text, target_lang=target_lang, source_lang=source_lang)
+                result = launcher.translate_text(
+                    text,
+                    target_lang=target_lang,
+                    source_lang=source_lang,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                )
             except AdapterError as exc:
                 self._error(400, exc.kind, exc.message)
                 return

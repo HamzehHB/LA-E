@@ -1,4 +1,5 @@
 """Integrated evidence-first analytical pipeline (composition layer)."""
+import inspect
 from dataclasses import dataclass, field
 from typing import Any
 from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
@@ -39,6 +40,20 @@ class IntegratedResult:
     @property
     def has_units(self) -> bool:
         return bool(self.units)
+def _retriever_accepts_observer(retriever: Any) -> bool:
+    """Safely check if retriever.retrieve accepts an observer parameter."""
+    retrieve_fn = getattr(retriever, "retrieve", None)
+    if not callable(retrieve_fn):
+        return False
+    try:
+        sig = inspect.signature(retrieve_fn)
+        for p in sig.parameters.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "observer":
+                return True
+        return False
+    except (ValueError, TypeError):
+        return False
+
 
 class EvidenceFirstPipeline:
     def __init__(self, reader_registry=None, chunker_registry=None, extractor_registry=None,
@@ -83,6 +98,11 @@ class EvidenceFirstPipeline:
             normalizer=self.normalizer, classifier=None,
             stage_observer=None)
         self.retriever: Any = retriever or DefaultRetriever()
+        if hasattr(self.retriever, "set_observer") and callable(self.retriever.set_observer):
+            try:
+                self.retriever.set_observer(self._stage_observer)
+            except Exception:
+                pass
         self.comparator = comparator or DefaultComparator()
         self.relation_detector = relation_detector or DefaultDetector()
         self.core_analyzer = core_analyzer or DefaultCoreAnalyzer()
@@ -147,6 +167,7 @@ class EvidenceFirstPipeline:
         return IntegratedResult(
             source=ingestion.file_path, ingestion=ingestion,
             units=unit_results, note=note)
+
     def run_unit(self, query: KnowledgeUnit, corpus=(), core_units=()) -> IntegratedUnitResult:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError("query must be a KnowledgeUnit")
@@ -157,7 +178,12 @@ class EvidenceFirstPipeline:
                 raise TypeError("core_units must hold KnowledgeUnit objects")
         uid = query.id if isinstance(query, KnowledgeUnit) else ""
         self._observe("stage_started", "retrieval", uid)
-        retrieval = self.retriever.retrieve(query, corpus_units)
+        if _retriever_accepts_observer(self.retriever):
+            retrieval = self.retriever.retrieve(
+                query, corpus_units, observer=self._stage_observer
+            )
+        else:
+            retrieval = self.retriever.retrieve(query, corpus_units)
         self._observe("stage_completed", "retrieval", uid)
         if not isinstance(retrieval, RetrievalResult):
             raise TypeError("retriever must return a RetrievalResult")

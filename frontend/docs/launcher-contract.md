@@ -103,9 +103,55 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 
 ## POST /api/translate
 
-- Purpose: live translation between English and Persian for notes, proposals, and journal excerpts. Invokes the active LLM provider if available; falls back to deterministic bilingual translation table.
-- Request: `{ text: string, target_lang: "en" | "fa", source_lang?: "en" | "fa" }`.
-- Response: `{ original_text: string, translated_text: string, target_lang: string, provider: string }`.
+- Purpose: live translation between English and Persian for notes, proposals, dynamic text, and audit lifecycle narratives. Invokes the active LLM provider if available; falls back to deterministic bilingual template localization.
+- Request: `{ text: string, target_lang: "en" | "fa", source_lang?: "en" | "fa", source_kind?: string, source_id?: string }`.
+- Response: Returns a structured, traceable translation object:
+  ```json
+  {
+    "record_id": "tr-...",
+    "source_id": "...",
+    "source_kind": "audit_narrative" | "dynamic_text",
+    "source_language": "en" | "fa",
+    "target_language": "en" | "fa",
+    "source_hash": "<sha256-hex>",
+    "source_text": "...",
+    "translated_text": "...",
+    "translator": "ollama:..." | "template-fallback",
+    "lifecycle_state": "current" | "stale" | "unavailable",
+    "persisted": false,
+    "reason": "...",
+    "created_at": "ISO-8601",
+    "original_text": "...",
+    "target_lang": "...",
+    "provider": "..."
+  }
+  ```
+- Durability: Explicitly marked `persisted: false` because on-demand UI translations are presentation-layer only and do not write to persistent audit logs.
+- Provenance: When a custom translator fails or returns empty/whitespace text, `translator` is truthfully attributed to `"template-fallback"`, never `"custom-translator"`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/vault/sync/authorize
+
+- Purpose: explicitly authorize persistent vector indexing for the configured Vault.
+- Request: `{ vault_path?: string }`.
+- Response: `{ status: "authorized" | "already_authorized", vault_id: string, path: string }`.
+- Auth: token required.
+- Sync: synchronous authorization; executes initial sync.
+
+## POST /api/vault/sync/reconcile
+
+- Purpose: explicitly reconcile and re-synchronize added, modified, or removed notes into the dedicated Vault vector store.
+- Request: `{ vault_id?: string, strategy?: "incremental" }`.
+- Response: `{ status: "fresh" | "stale", synced_count: number, removed_count: number }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/vault/sync/revoke
+
+- Purpose: explicitly revoke authorization for Vault synchronization and stop all index sync actions.
+- Request: `{ vault_id?: string }`.
+- Response: `{ status: "revoked", vault_id: string }`.
 - Auth: token required.
 - Sync: synchronous.
 
@@ -152,9 +198,17 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 ## GET /api/journals
 
 - Purpose: observe recent audit/staging records with correlation (up to 10 records).
-- Features: strictly excludes `errors/` directory from the journal list; computes record digests; formats human-readable titles and summaries; pairs each audit record 1:1 with its staging artifact (or marks it `staging_available: false`).
+- Features: reads operational records from `passed/audit.jsonl`, `failed/audit.jsonl`, and `errors/audit.jsonl`, plus emergency audit records from `errors/audit_emergency.jsonl` (with `emergency: true`); computes record digests; formats human-readable titles and summaries; pairs each audit record 1:1 with its staging artifact (or marks it `staging_available: false`).
+- Durability and Emergency Recovery Semantics:
+  - Primary audit persistence uses standard buffered file stream writes (`durability="written"`).
+  - Emergency audit writes enforce `handle.flush()` and `os.fsync(handle.fileno())` (`durability="confirmed"`).
+  - When primary persistence fails, resilient persistence recovers the complete collected audit history for the affected run up to the point of failure into `errors/audit_emergency.jsonl`, while retaining all previously persisted primary records in `passed/` or `failed/` intact.
+  - Complete Recovery Verification: Resilient persistence validates the recovery outcome for all required records across the run. If any required record fails to write, has a malformed/unconfirmed receipt, has an identity mismatch, or experiences a content conflict, the recovery fails closed (`persisted=False`, `durability="failed"`, `recovery_all_ok=False`), and quarantine is triggered for unpersisted staging artifacts.
+  - Integrity-Validating Idempotency & Conflict Handling: Repeated recovery attempts validate stored domain content against in-memory records. Identical records are deduplicated without re-appending, while content conflicts are recorded as explicit conflicts and preserved as supplemental conflict records without overwriting historical entries.
+  - Crash durability limits: File-level `fsync` flushes file content and metadata to the storage controller, but does not provide an unconditional cross-platform guarantee of physical-media persistence across sudden hardware loss or power failure (POSIX directory entry durability requires syncing parent directory, unsupported on Windows directory handles).
+- Staging and Quarantine: Items that experienced post-execution audit failure reflect quarantine receipts (`quarantined: true`, `quarantine_status: "quarantined" | "partial_cleanup_failed"`, `quarantine_path: string`).
 - Request: none (token header only).
-- Response: `{ audits: JournalItem[], staging: JournalItem[] }` where `JournalItem = { record_id, run_id, proposal_hash, digest, title, summary, excerpt, timestamp, storage_category: "passed"|"failed", outcome, artifact_reference, staging_available }`
+- Response: `{ audits: JournalItem[], staging: JournalItem[] }` where `JournalItem = { record_id, run_id, proposal_hash, digest, title, summary, excerpt, timestamp, storage_category: "passed"|"failed"|"errors", outcome, artifact_reference, staging_available, emergency?, quarantined?, quarantine_status? }`
 - Errors: `connection_unavailable` when launcher is down.
 - Auth: token required.
 - Sync: synchronous snapshot.
@@ -162,8 +216,18 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 ## GET /api/events (SSE)
 
 - Purpose: stream run-scoped operational events for the Current Audit view and workflow timeline.
-- Envelope: `{ kind, run_id, stage, message, timestamp, confidence_score?, confidence_score_band?, classification_type?, proposal_hash? }`.
+- Envelope: `{ kind, run_id, stage, substage?, operation?, phase?, message, timestamp, confidence_score?, confidence_score_band?, classification_type?, proposal_hash?, candidate_count?, unit_count? }`.
 - Kinds: `run_started|stage_started|stage_completed|status|warning|error|stopped|human_review_required|approval_decided|revalidation_result|execution_result|run_completed|run_rejected`.
+- Stages and Operations:
+  - `ingestion`: discrete substages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `chunking`, `metadata_extraction`, `extraction`).
+  - `retrieval`: discrete operations (`query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording`) with explicit phases `started`, `completed`, and `failed`.
+- Rejection and Quarantine: When audit persistence fails post-execution, terminal rejection events explicitly report `"audit persistence failure: artifact quarantined"` or `"audit persistence failure: partial quarantine"`.
+- Client Correlation, Filtering, and Substep Lifecycle Contract:
+  - Clients MUST strictly filter incoming SSE events by the active `run_id` (`filterEventsByRun(events, run.run_id)`). When `run_id` is omitted, events must NEVER be selected solely because they occur later in the array.
+  - Events are scoped to a run only if there is a single distinct run, or if all distinct runs possess valid parseable timestamps that unambiguously establish a strictly latest run. If timestamps are missing, mixed, unparseable, or tied, correlation remains uncertain and returns an empty event list (`[]`) to prevent cross-run pollution or invented substep states.
+  - Substep lifecycle states are strictly `"pending" | "current" | "completed" | "failed" | "cancelled" | "stopped" | "unknown"`.
+  - Substep completion MUST NOT be inferred merely from relative array index order; substeps are marked completed only upon receiving an explicit completion signal (`phase === "completed"`), never inferred from overall stage completion or order alone.
+  - Substeps MUST NEVER convert a failed or cancelled operation into `pending` merely because it is no longer active. When retrieval stops or completes, failed and completed substeps remain visibly distinguished in their truthful terminal states.
 - Content: user-safe operational info only with numeric confidence score (0.00–1.00) and confidence band (`high`, `moderate`, `low`). NEVER: private LLM reasoning, credentials, raw tracebacks, hidden deliberation.
 - Auth: token required.
 - Correlation: every run event carries stable `run_id`; stage names use backend `STAGE_ORDER` keys.

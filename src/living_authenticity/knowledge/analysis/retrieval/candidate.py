@@ -25,3 +25,14 @@ class RetrievedCandidate:
     matched_terms: tuple[str, ...] = ()
     overlap_score: int = 0
     retriever: str = ""
+    evidence_basis: str = ""
+    candidate_identity_key: str = ""
+    vector_distance: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.candidate_identity_key:
+            object.__setattr__(
+                self,
+                "candidate_identity_key",
+                f"{self.source}:{self.position}:{self.unit_id}",
+            )

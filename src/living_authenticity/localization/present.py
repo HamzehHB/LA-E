@@ -30,6 +30,8 @@ class TranslationStatus:
     MISSING = "missing"
     INVALID = "invalid"
     UNAVAILABLE = "unavailable"
+    FAILED = "failed"
+    UNVERIFIABLE = "unverifiable"
 
 
 def _sha256(text: str) -> str:
@@ -61,7 +63,10 @@ class TranslationRecord:
                            normalize_language(self.source_language))
         object.__setattr__(self, "target_language",
                            normalize_language(self.target_language))
-        valid = ("current", "stale", "missing", "invalid", "unavailable")
+        valid = (
+            "current", "stale", "missing", "invalid",
+            "unavailable", "failed", "unverifiable",
+        )
         if self.status not in valid:
             raise ValueError("invalid translation status")
 
@@ -86,12 +91,28 @@ def build_translation_record(source_kind: str, source_id: str,
 
 
 def is_translation_current(record: "TranslationRecord",
-                           current_source_text: str) -> bool:
-    """True when record matches current source text and is current."""
+                           current_source_text: str,
+                           expected_source_id: str = "",
+                           expected_source_kind: str = "",
+                           expected_source_language: str = "",
+                           expected_target_language: str = "") -> bool:
+    """True when record matches current source text and is verified current."""
     if not isinstance(record, TranslationRecord):
         return False
     if record.status != TranslationStatus.CURRENT:
         return False
+    if not record.source_hash or not record.target_language or not record.source_kind:
+        return False
+    if expected_source_id and record.source_id != expected_source_id:
+        return False
+    if expected_source_kind and record.source_kind != expected_source_kind:
+        return False
+    if expected_source_language and record.source_language != normalize_language(expected_source_language):
+        return False
+    if expected_target_language and record.target_language != normalize_language(expected_target_language):
+        return False
+
+
     return record.source_hash == _sha256(current_source_text or "")
 
 

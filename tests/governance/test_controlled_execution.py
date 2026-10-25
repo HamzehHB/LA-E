@@ -161,15 +161,17 @@ def test_missing_staging_root_rejected(tmp_path):
 
 
 def test_write_failure_reports_explicit_failure(tmp_path, monkeypatch):
+    import os
     import pathlib
     request, outcome, prop, conf, note = _chain()
     expected = tmp_path / (request.proposal_hash + ".md")
     assert not expected.exists()
 
-    def _boom(self, *args, **kwargs):
+    def _boom(*args, **kwargs):
         raise OSError("simulated staging write failure")
 
     monkeypatch.setattr(pathlib.Path, "write_text", _boom)
+    monkeypatch.setattr(os, "write", _boom)
     result = execute_create(request, outcome, prop, conf, note, tmp_path)
     assert result.attempted is True
     assert result.permitted is False
@@ -222,3 +224,109 @@ def test_single_execution_writes_single_file(tmp_path):
     assert result.executed is True
     assert [p.name for p in tmp_path.iterdir()] == [result.artifact_path]
 
+
+def test_concurrent_staging_writes_prevent_corruption(tmp_path):
+    """Multiple concurrent executions for the same proposal must result in exactly one write."""
+    import concurrent.futures
+    request, outcome, prop, conf, note = _chain()
+
+    def _attempt():
+        return execute_create(request, outcome, prop, conf, note, tmp_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_attempt) for _ in range(16)]
+        results = [f.result() for f in futures]
+
+    executed = [r for r in results if r.executed]
+    rejected = [r for r in results if not r.executed]
+
+    assert len(executed) == 1
+    assert len(rejected) == 15
+    for r in rejected:
+        assert r.failed_check == "destination"
+        assert "no overwrite" in r.reason
+
+    # Target file is complete, valid, and exactly matches the note content
+    target = tmp_path / (request.proposal_hash + ".md")
+    assert target.is_file()
+    assert target.read_text(encoding="utf-8") == note.markdown
+    # No temporary .tmp files left in staging directory
+    assert [p.name for p in tmp_path.iterdir()] == [request.proposal_hash + ".md"]
+
+
+def test_interrupted_write_cleans_up_and_allows_retry(tmp_path, monkeypatch):
+    """An interrupted write leaves no partial file and does not lock out subsequent retries."""
+    import os
+    import pathlib
+    request, outcome, prop, conf, note = _chain()
+    target = tmp_path / (request.proposal_hash + ".md")
+
+    calls = 0
+    orig_write = os.write
+
+    def _flaky_write(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("disk full simulated")
+        return orig_write(fd, data)
+
+    monkeypatch.setattr(os, "write", _flaky_write)
+
+    # First attempt fails due to simulated interruption
+    first = execute_create(request, outcome, prop, conf, note, tmp_path)
+    assert first.executed is False
+    assert first.reason == "staging write failed"
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
+
+    # Second attempt succeeds: no retry lockout from leftover partial files!
+    second = execute_create(request, outcome, prop, conf, note, tmp_path)
+    assert second.executed is True
+    assert target.is_file()
+    assert target.read_text(encoding="utf-8") == note.markdown
+
+
+def test_partial_write_loop_completes_full_payload(tmp_path, monkeypatch):
+    """ControlledExecutor write loop handles short writes correctly and writes complete payload."""
+    import os
+    request, outcome, prop, conf, note = _chain()
+    target = tmp_path / (request.proposal_hash + ".md")
+
+    orig_write = os.write
+    chunk_size = 3
+    write_calls = 0
+
+    def _short_write(fd, data):
+        nonlocal write_calls
+        write_calls += 1
+        chunk = data[:chunk_size]
+        return orig_write(fd, chunk)
+
+    monkeypatch.setattr(os, "write", _short_write)
+
+    res = execute_create(request, outcome, prop, conf, note, tmp_path)
+    assert res.executed is True
+    assert write_calls > 1  # Proves loop executed multiple times
+    assert target.is_file()
+    assert target.read_text(encoding="utf-8") == note.markdown
+    # No lingering temp files
+    assert [p.name for p in tmp_path.iterdir()] == [request.proposal_hash + ".md"]
+
+
+def test_zero_byte_write_progress_raises_and_cleans_up(tmp_path, monkeypatch):
+    """Zero progress on write raises OSError and cleans up temporary file."""
+    import os
+    request, outcome, prop, conf, note = _chain()
+    target = tmp_path / (request.proposal_hash + ".md")
+
+    def _zero_write(fd, data):
+        return 0
+
+    monkeypatch.setattr(os, "write", _zero_write)
+
+    res = execute_create(request, outcome, prop, conf, note, tmp_path)
+    assert res.executed is False
+    assert "staging write failed" in res.reason
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []

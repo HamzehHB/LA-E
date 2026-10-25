@@ -340,3 +340,85 @@ def test_audit_record_constructor_compatibility_and_positional_stability():
     assert legacy_record.input_hash == "c" * 64
     assert legacy_record.input_hash_source == ""
     assert legacy_record.proposal_hash == "prop-legacy"
+
+
+def test_emergency_audit_journal_fallback(tmp_path):
+    """When primary audit append fails, emergency append writes to errors/audit_emergency.jsonl."""
+    import json
+    from src.living_authenticity.knowledge.governance.audit import (
+        AuditRecord,
+        AuditWriter,
+        EMERGENCY_LOG_FILENAME,
+        persist_record_resilient,
+    )
+
+    writer = AuditWriter(str(tmp_path))
+    record = AuditRecord(
+        record_id="rec-emg-1",
+        run_id="run-emg",
+        proposal_hash="hash-emg",
+        execution_executed=True,
+        terminal_outcome="executed",
+    )
+
+    # Monkeypatch primary append to fail
+    def _failing_append(record: object) -> dict:
+        raise OSError("primary disk error")
+
+    writer.append = _failing_append  # type: ignore[assignment]
+
+    receipts = []
+    res = persist_record_resilient(writer, record, receipts=receipts)
+    assert res["persisted"] is True
+    assert res["emergency"] is True
+    assert res["storage_category"] == "errors"
+    assert len(receipts) == 1
+    assert receipts[0]["emergency"] is True
+
+    # Verify emergency file was created on disk
+    emergency_file = tmp_path / "errors" / EMERGENCY_LOG_FILENAME
+    assert emergency_file.is_file()
+    lines = [json.loads(line) for line in emergency_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["record_id"] == "rec-emg-1"
+    assert lines[0]["emergency"] is True
+    assert "primary disk error" in lines[0]["emergency_reason"]
+
+
+def test_persist_record_resilient_catastrophic_failure(tmp_path):
+    """When both primary and emergency audit fail, resiliency reports failure cleanly."""
+    from src.living_authenticity.knowledge.governance.audit import (
+        AuditRecord,
+        AuditWriter,
+        persist_record_resilient,
+    )
+
+    audit_dir = tmp_path / "audit"
+    writer = AuditWriter(str(audit_dir))
+
+    # Monkeypatch both append and append_emergency to fail
+    def _fail(record: object, failure_reason: str = "", *args, **kwargs) -> dict:
+        raise OSError("catastrophic audit storage failure")
+
+    writer.append = _fail  # type: ignore[assignment]
+    writer.append_emergency = _fail  # type: ignore[assignment]
+
+    record = AuditRecord(
+        record_id="rec-catastrophic-1",
+        run_id="run-catastrophic",
+        proposal_hash="hash-catastrophic",
+        execution_executed=True,
+        terminal_outcome="executed",
+    )
+
+    receipts = []
+    res = persist_record_resilient(
+        writer,
+        record,
+        receipts=receipts,
+    )
+
+    assert res["persisted"] is False
+    assert "catastrophic audit storage failure" in res["reason"]
+    assert len(receipts) == 1
+    assert receipts[0]["persisted"] is False

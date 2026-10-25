@@ -14,6 +14,16 @@ from .strategy import (
     StrategyDefinition,
     UnsupportedStrategyError,
 )
+from .pipeline import (
+    PreparedQuery,
+    RelevanceAssessment,
+    RetrievalCoordinator,
+    assess_relevance,
+    identify_candidates,
+    prepare_query,
+    record_evidence,
+    retrieve_candidates,
+)
 from .token_overlap import (
     DefaultRetriever,
     TokenOverlapRetriever,
@@ -62,4 +72,12 @@ __all__ = (
     "RetrievalStrategyRegistry",
     "UnsupportedStrategyError",
     "StrategyConfigurationError",
+    "PreparedQuery",
+    "RelevanceAssessment",
+    "RetrievalCoordinator",
+    "prepare_query",
+    "retrieve_candidates",
+    "assess_relevance",
+    "identify_candidates",
+    "record_evidence",
 )

@@ -375,6 +375,37 @@ Every evaluated candidate records complete retrieval cache metadata in `AuditRec
 * `retrieval_chunk_count`: Number of input chunks evaluated during retrieval.
 * **Zero Leakage:** Raw vector floats and private input texts are strictly excluded from audit records.
 
+### 14.5 Discrete Retrieval Pipeline Lifecycle, Candidate Identity, and Deduplication
+
+The retrieval stage executes through five discrete observable sub-stages (`src.living_authenticity.knowledge.analysis.retrieval.pipeline`), streaming truthful real-time progress events over SSE without simulated or pre-computed progress:
+
+```mermaid
+flowchart TD
+    R1["1. Query Preparation<br/><code>operation='query_preparation'</code>"] --> R2["2. Candidate Retrieval<br/><code>operation='candidate_retrieval'</code>"]
+    R2 --> R3["3. Relevance Assessment<br/><code>operation='relevance_assessment'</code>"]
+    R3 --> R4["4. Candidate Identification<br/><code>operation='candidate_identification'</code>"]
+    R4 --> R5["5. Evidence Recording<br/><code>operation='retrieval_evidence_recording'</code>"]
+```
+
+Every retrieval capability emits lifecycle events with `kind: "status"`, `stage: "retrieval"`, and explicit phases (`started`, `completed`, `failed`):
+1. **`query_preparation`**: Normalizes text and extracts content tokens from the query `KnowledgeUnit`. Emits `phase="started"`, and on success `phase="completed"` with `query_terms_count`.
+2. **`candidate_retrieval`**: Retrieves potential matches from the candidate corpus (or persistent vector index) based on configured strategy. Emits `phase="started"` with `corpus_size`, and on success `phase="completed"` with raw candidate count.
+3. **`relevance_assessment`**: Evaluates overlap or cosine vector distance for each retrieved candidate. Emits `phase="started"`, and on success `phase="completed"` with `assessed_count`.
+4. **`candidate_identification`**: Applies canonical candidate identity deduplication and bounds ranking. Emits `phase="started"`, and on success `phase="completed"` with `candidates_count`.
+5. **`retrieval_evidence_recording`**: Constructs the final immutable `RetrievalResult` before downstream hand-off. Emits `phase="started"`, and ONLY after successful construction/validation emits `phase="completed"`.
+
+If an unhandled exception occurs in any capability, `phase="failed"` is immediately emitted with diagnostic details before the exception is propagated. Observer/telemetry failures are captured without crashing core retrieval or fabricating simulated success.
+
+#### Canonical Candidate Identity & Deterministic Deduplication
+- **Identity Key Contract:** `candidate_identity_key(candidate: RetrievalAssessment) -> str` establishes the canonical, stable candidate key format:
+  $$\text{key} = \langle\text{candidate.source}\rangle : \langle\text{candidate.position}\rangle : \langle\text{candidate.unit\_id}\rangle$$
+- **Deterministic Deduplication (`identify_candidates`):**
+  - When candidate assessments contain multiple entries for the same physical chunk or note unit, deduplication groups by canonical `candidate_identity_key`.
+  - For each group, it selects the entry with the highest similarity score (or earliest position on tie).
+  - The deduplicated result is deterministically sorted by score descending, position ascending, and unit ID ascending, and capped at `limit`.
+- **Vector Distance Evidence:**
+  - For semantic retrieval, the pipeline captures and preserves exact vector distance / similarity evidence (`evidence_distance`, `similarity_score`, `vector_metric`) without inflating confidence or inventing precision.
+
 ---
 
 ## 15. Vault-Scoped Persistent Index Synchronization (Process A) vs. Run-Scoped Temporary Retrieval Embeddings (Process B)
@@ -420,3 +451,67 @@ In accordance with system security contracts (operator action only — no watche
   - If changes (added, modified, or removed notes) are detected, an explicit decision is requested. If approved, synchronization updates the persistent index explicitly. If rejected, the persistent index is NOT modified, its stale state is preserved and reported accurately (never falsely marked fresh), and retrieval continues using the existing index if technically usable.
 * **Fail-Closed Availability:** If the authorized Vault index contains 0 vectors or has not been authorized, retrieval fails closed with `validation_error` ("dedicated Vault index holds 0 vectors. Please synchronize the Vault first."). The system **never** silently falls back to lexical search.
 * **Audit Provenance:** All audit records persist `vault_id` alongside the temporary cache receipt, guaranteeing full forensic traceability.
+
+---
+
+## 16. Resilient Audit Persistence, Emergency Journaling, and Artifact Quarantine
+
+The governance layer enforces fail-closed audit durability: a staging artifact must never exist as an untracked or unreconciled file if its corresponding audit record cannot be durably written.
+
+```mermaid
+flowchart TD
+    E["Controlled Execution:<br/>Write staging artifact (<hash>.md)"] --> A["Attempt Primary Audit Write<br/>(passed/audit.jsonl)"]
+    A -- "Primary Success" --> D1["Receipt: persisted=True<br/>durability='written'<br/>Artifact Preserved"]
+    A -- "Primary Fails" --> EJ["Attempt Emergency Journal<br/>(errors/audit_emergency.jsonl)"]
+    EJ -- "Emergency Success + fsync confirmed" --> D2["Receipt: persisted=True<br/>mode='emergency'<br/>durability='confirmed'<br/>Artifact Preserved"]
+    EJ -- "Emergency Fails / fsync fails" --> Q["Quarantine Artifact<br/>quarantine_artifact(source, target)"]
+    Q -- "Clean Move" --> QR["Outcome: quarantined<br/>Moved to .unreconciled/<br/>Run Rejected (quarantined)"]
+    Q -- "Source Unlink Fails (POSIX link)" --> QP["Outcome: partial_cleanup_failed<br/>Both Copies Preserved<br/>Run Rejected (partial quarantine)"]
+```
+
+### 16.1 Resilient Audit Persistence & Verified Fsync Durability
+- **Primary Persistence:** Primary writes target `passed/audit.jsonl` (for executed CREATE proposals) or `failed/audit.jsonl` (for rejections and safe stops). Successful primary append reports `persisted=True`, `mode="primary"`, `durability="written"`, confirming that data was written to the operating system's stream without error, but without hardware-level disk synchronization (`fsync`).
+- **Emergency Journaling & History Recovery (`append_emergency`):** If primary persistence encounters an I/O error or permission failure, resilient persistence recovers the complete collected audit history for the affected run up to the point of failure into `errors/audit_emergency.jsonl` (idempotently skipping records already present), while retaining all previously persisted primary records in `passed/` or `failed/` intact.
+- **Fail-Closed Receipt Validation (`validate_persistence_receipt`):** All persistence receipts are strictly validated fail-closed before execution or post-execution confirmation proceeds. `None`, empty dictionaries, non-dictionary payloads, contradictory receipts (`persisted=True` alongside `durability="failed"`), or unconfirmed states (`durability="unconfirmed"`) are strictly rejected and treated as persistence failures (`persisted=False`).
+- **Verifiable Durability Semantics:** Emergency writes enforce `handle.flush()` and `os.fsync(handle.fileno())` to synchronize file content and inode metadata to the storage controller:
+  - `durability="written"`: Standard buffered write for primary audit logs. Confirms that data was passed to the operating system's file stream without error, but does not execute hardware-level disk synchronization (`fsync`).
+  - `durability="confirmed"`: Emergency write flushed and synchronized to the storage controller via `os.fsync(handle.fileno())` (`persisted=True`, `mode="emergency"`).
+  - `durability="unconfirmed"`: Emergency write reported success but lacked verified `fsync` confirmation; treated as unpersisted (`persisted=False`).
+  - `durability="failed"`: Both primary and emergency persistence failed (`persisted=False`). Durability errors are never suppressed.
+  - `durability="unconfigured"`: No `AuditWriter` configured (`persisted=False`).
+- **Crash Durability and Directory Synchronization Limits:** File-level `fsync` flushes file content and metadata to the storage controller, but does not provide an unconditional cross-platform guarantee against sudden power loss. On POSIX systems, directory entry durability requires an additional `fsync` on the parent directory descriptor, whereas on Windows `os.fsync` cannot be invoked on directory handles. Cross-platform persistence guarantees file content and file-attribute flush rather than full directory-entry guarantees across platform crashes.
+- **Fail-Closed Observation:** When reading journals via `Launcher.journals()`, audit and staging paths are strictly validated through `PathBoundary`. If boundary construction fails or path validation fails, inspection fails closed immediately without reading or leaking unvalidated paths. Operational records are loaded across `passed/audit.jsonl`, `failed/audit.jsonl`, `errors/audit.jsonl`, and emergency journals `errors/audit_emergency.jsonl`.
+
+### 16.2 Non-Overwriting, Path-Confined Quarantine
+If an artifact has been executed and written to staging, but BOTH primary persistence and emergency journaling fail:
+- **Automatic Safe Quarantine:** `ControlledExecutor.quarantine_artifact` safely moves the unpersisted artifact out of the active staging root.
+- **Destination Selection Policy:**
+  - If `.unreconciled/` directory exists in the staging root, the artifact is moved to `.unreconciled/<file>.md`.
+  - If `.unreconciled/` directory is absent, quarantine moves the artifact to sibling `.unreconciled.<file>.md` in the staging root, strictly preserving the AST invariant that ControlledExecutor and quarantine never create unverified directories (`no-mkdir`).
+- **Non-Overwriting Guarantee:** If the quarantine destination already exists, quarantine refuses to overwrite it and returns a collision error (`FileExistsError`), preserving both files intact.
+- **Strict Path Confinement:** Both the source artifact and the target destination must resolve strictly within the authorized staging root. Directory traversal (`..`), absolute external paths, and symlinks escaping the staging root are rejected.
+- **Atomic Operations & Partial Cleanup Reporting:**
+  - On Windows, quarantine uses `os.rename` (atomic within the filesystem volume, strictly rejecting overwrite via `FileExistsError`).
+  - On POSIX, quarantine uses hard-linking (`os.link`) followed by unlinking the source (`os.unlink`).
+  - If destination creation succeeds but source removal fails (`os.unlink` raises `OSError`), quarantine does NOT perform an unsafe rollback. It returns `QuarantineOutcome(status="partial_cleanup_failed", success=False, source_removed=False)`.
+  - Both files remain on disk for inspection, and the runner truthfully records:
+    $$\text{rejection\_reason} = \text{"audit persistence failure: partial quarantine"}$$
+  - When source cleanup succeeds, the runner records:
+    $$\text{rejection\_reason} = \text{"audit persistence failure: artifact quarantined"}$$
+
+---
+
+## 17. Bilingual Audit Lifecycle Narratives and Translation Traceability
+
+### 17.1 Canonical Lifecycle Narratives
+The governance audit module (`src.living_authenticity.knowledge.governance.audit.narrative`) generates human-readable lifecycle narratives in English (`en`) and Persian (`fa`):
+- Narratives faithfully describe every pipeline step: query ingestion, candidate evaluation, classification, human approval or rejection, controlled execution, emergency journaling, full quarantine, and partial quarantine.
+- Persian narratives apply bidirectional Unicode isolates (`LRI`...`PDI`) around hashes, file paths, numbers, and UUIDs to prevent LTR/RTL layout distortion.
+
+### 17.2 Narrative Translation Records & Traceability
+`build_narrative_translation_record` produces structured, verifiable `TranslationRecord` objects:
+- **Source Hash Parity:** Computes SHA-256 hash strictly over the canonical source narrative text.
+- **Truthful Provenance on Fallback:** If a custom translation function fails, raises an exception, or returns empty text, the record falls back to deterministic template localization. The translator field is set to `"template-fallback"`, NEVER `"custom-translator"`.
+- **Custom Notes Preservation:** Custom notes appended to the source narrative are retained across fallback translations.
+- **Stale Detection (`is_narrative_translation_stale`):** Compares the record's `source_hash` against the current narrative's SHA-256 hash. If the source content has changed, the UI displays a `[stale]` indicator.
+- **Ephemeral Presentation Layer:** On-demand translations fetched via `POST /api/translate` return `persisted: false`. Live translations are presentation-layer representations and never claim to be durable audit logs.

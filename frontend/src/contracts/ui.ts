@@ -134,12 +134,17 @@ export interface JournalRow {
    *  fixtures omit these; live records populate them from persisted data. */
   runId?: string;
   proposalHash?: string;
+  proposal_hash?: string;
+  record_id?: string;
   artifactReference?: string;
   digest?: string;
   title?: string;
   summary?: string;
   excerpt?: string;
   staging_available?: boolean;
+  narrative?: string;
+  narrative_language?: string;
+  emergency?: boolean;
 }
 
 /** @category ui-model */

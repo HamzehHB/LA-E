@@ -80,6 +80,329 @@ const STAGE_TO_TIMELINE: Record<string, TimelineStageKey> = {
   representation: "knowledge_filter",
 };
 
+export const RETRIEVAL_SUBSTEPS = [
+  { key: "query_preparation", label: "Query Preparation" },
+  { key: "candidate_retrieval", label: "Candidate Retrieval" },
+  { key: "relevance_assessment", label: "Relevance Assessment" },
+  { key: "candidate_identification", label: "Candidate Identification" },
+  { key: "retrieval_evidence_recording", label: "Evidence Recording" },
+] as const;
+
+export type SubstepState = "pending" | "current" | "completed" | "failed" | "cancelled" | "stopped" | "unknown";
+
+export interface RetrievalSubstepStatus {
+  key: string;
+  label: string;
+  state: SubstepState;
+}
+
+export interface ActiveSubstepState {
+  operation: string;
+  phase: "started" | "completed" | "failed" | "cancelled" | "stopped" | "unknown";
+  isRunning: boolean;
+}
+
+export function filterEventsByRun(events: RunEvent[], runId?: string): RunEvent[] {
+  if (runId && runId.trim()) {
+    // When an explicit active run_id is known, strictly isolate events to that run
+    return events.filter((e) => e.run_id === runId);
+  }
+
+  // When runId is missing or omitted, do not silently merge distinct runs:
+  interface RunMeta {
+    runId: string;
+    maxEpoch: number;
+    hasInvalidTimestamp: boolean;
+    count: number;
+  }
+
+  const seen = new Map<string, RunMeta>();
+  for (const ev of events) {
+    const rid = ev.run_id;
+    if (!rid || !rid.trim()) continue;
+    const ts = ev.timestamp;
+    let epoch: number | null = null;
+    let invalid = false;
+    if (!ts || !ts.trim()) {
+      invalid = true;
+    } else {
+      const parsed = Date.parse(ts);
+      if (isNaN(parsed)) {
+        invalid = true;
+      } else {
+        epoch = parsed;
+      }
+    }
+
+    const entry = seen.get(rid);
+    if (!entry) {
+      seen.set(rid, {
+        runId: rid,
+        maxEpoch: epoch !== null ? epoch : -Infinity,
+        hasInvalidTimestamp: invalid,
+        count: 1,
+      });
+    } else {
+      entry.count += 1;
+      if (invalid) {
+        entry.hasInvalidTimestamp = true;
+      } else if (epoch !== null && epoch > entry.maxEpoch) {
+        entry.maxEpoch = epoch;
+      }
+    }
+  }
+
+  const distinctRuns = Array.from(seen.values());
+  if (distinctRuns.length === 0) {
+    return events;
+  }
+  if (distinctRuns.length === 1) {
+    // Exactly one run present: unambiguously isolate to this single run
+    const singleRunId = distinctRuns[0].runId;
+    return events.filter((e) => e.run_id === singleRunId);
+  }
+
+  // Multiple distinct run IDs are present without an active run_id specified.
+  // We must NEVER select a run solely because its events occur later in the array.
+  // We may only use timestamps when they establish an unambiguous ordering under the actual timestamp contract.
+
+  // 1. Check timestamp validity for every distinct run:
+  for (const r of distinctRuns) {
+    if (r.hasInvalidTimestamp || r.maxEpoch === -Infinity) {
+      // Missing or invalid timestamp on at least one event in candidate runs:
+      // cannot establish unambiguous ordering reliably
+      return [];
+    }
+  }
+
+  // 2. Sort runs by parsed timestamp descending:
+  distinctRuns.sort((a, b) => b.maxEpoch - a.maxEpoch);
+
+  // 3. Check for equal or contradictory timestamps among top candidates:
+  const topTime = distinctRuns[0].maxEpoch;
+  const secondTime = distinctRuns[1].maxEpoch;
+  if (topTime === secondTime) {
+    // Equal or contradictory timestamps (even if formatted with different timezone offsets):
+    // unambiguous latest run cannot be determined reliably
+    return [];
+  }
+
+  // Unambiguous latest run established strictly by timestamp:
+  const latestRunId = distinctRuns[0].runId;
+  return events.filter((e) => e.run_id === latestRunId);
+}
+
+export function deriveActiveRetrievalSubstep(
+  events: RunEvent[],
+  runId?: string,
+  isStopped?: boolean,
+): ActiveSubstepState | undefined {
+  const filtered = filterEventsByRun(events, runId);
+  const runStopped = Boolean(
+    isStopped ||
+    filtered.some(
+      (e) =>
+        e.kind === "stopped" ||
+        e.kind === "run_rejected" ||
+        e.stage === "cancellation" ||
+        (e as { outcome?: string }).outcome === "STOPPED"
+    )
+  );
+
+  for (let i = filtered.length - 1; i >= 0; i--) {
+    const ev = filtered[i];
+    if (ev.stage === "retrieval" && ev.operation) {
+      if (ev.phase === "completed") {
+        return {
+          operation: ev.operation,
+          phase: "completed",
+          isRunning: false,
+        };
+      }
+      if (ev.phase === "started") {
+        return {
+          operation: ev.operation,
+          phase: "started",
+          isRunning: !runStopped,
+        };
+      }
+      if (ev.phase === "failed" || ev.phase === "cancelled" || ev.phase === "stopped") {
+        return {
+          operation: ev.operation,
+          phase: ev.phase,
+          isRunning: false,
+        };
+      }
+      if (!ev.phase) {
+        // Explicit legacy policy: if no phase field, treat as started / running
+        // unless the run has stopped, but never falsely infer completed.
+        return {
+          operation: ev.operation,
+          phase: "started",
+          isRunning: !runStopped,
+        };
+      }
+      // Unknown / unexpected phase:
+      // Must NOT be treated as started with running icon or completed.
+      return {
+        operation: ev.operation,
+        phase: "unknown",
+        isRunning: false,
+      };
+    }
+  }
+  return undefined;
+}
+
+export function deriveRetrievalSubstep(events: RunEvent[], runId?: string): string | undefined {
+  const active = deriveActiveRetrievalSubstep(events, runId);
+  return active ? active.operation : undefined;
+}
+
+export function deriveRetrievalSubsteps(
+  stageState: TimelineState,
+  events: RunEvent[],
+  runId?: string,
+): RetrievalSubstepStatus[] {
+  if (stageState !== "current" && stageState !== "stopped" && stageState !== "completed") {
+    return RETRIEVAL_SUBSTEPS.map((s) => ({
+      key: s.key,
+      label: s.label,
+      state: "pending" as SubstepState,
+    }));
+  }
+
+  const runEvents = filterEventsByRun(events, runId);
+
+  const latestPhase = new Map<string, "started" | "completed" | "failed" | "cancelled" | "stopped" | "unknown">();
+  for (const ev of runEvents) {
+    if (ev.stage === "retrieval" && ev.operation) {
+      if (ev.phase === "completed") {
+        latestPhase.set(ev.operation, "completed");
+      } else if (ev.phase === "started") {
+        latestPhase.set(ev.operation, "started");
+      } else if (ev.phase === "failed" || ev.phase === "cancelled" || ev.phase === "stopped") {
+        latestPhase.set(ev.operation, ev.phase);
+      } else if (!ev.phase) {
+        // Explicit policy for unphased legacy events: record activity as started, never completed
+        if (!latestPhase.has(ev.operation)) {
+          latestPhase.set(ev.operation, "started");
+        }
+      } else {
+        latestPhase.set(ev.operation, "unknown");
+      }
+    }
+  }
+
+  if (stageState === "completed") {
+    return RETRIEVAL_SUBSTEPS.map((s) => {
+      const explicit = latestPhase.get(s.key);
+      let state: SubstepState = "unknown";
+      if (explicit === "completed") {
+        state = "completed";
+      } else if (explicit === "failed") {
+        state = "failed";
+      } else if (explicit === "cancelled") {
+        state = "cancelled";
+      } else if (explicit === "stopped") {
+        state = "stopped";
+      } else if (explicit === "unknown") {
+        state = "unknown";
+      } else {
+        // Started without completion, or missing event entirely: do not infer completion
+        state = "unknown";
+      }
+      return {
+        key: s.key,
+        label: s.label,
+        state,
+      };
+    });
+  }
+
+  const isRunStopped = stageState === "stopped";
+  const active = deriveActiveRetrievalSubstep(runEvents, runId, isRunStopped);
+  const activeOp = active?.operation;
+  const activeIdx = activeOp ? RETRIEVAL_SUBSTEPS.findIndex((s) => s.key === activeOp) : -1;
+
+  if (stageState === "stopped") {
+    return RETRIEVAL_SUBSTEPS.map((s, idx) => {
+      const explicit = latestPhase.get(s.key);
+      let state: SubstepState = "pending";
+      if (explicit === "completed") {
+        state = "completed";
+      } else if (explicit === "failed") {
+        state = "failed";
+      } else if (explicit === "cancelled") {
+        state = "cancelled";
+      } else if (explicit === "stopped") {
+        state = "stopped";
+      } else if (explicit === "started") {
+        state = "stopped";
+      } else if (explicit === "unknown") {
+        state = "unknown";
+      } else {
+        const laterHadEvents = RETRIEVAL_SUBSTEPS.slice(idx + 1).some((other) => latestPhase.has(other.key));
+        state = laterHadEvents ? "unknown" : "pending";
+      }
+      return {
+        key: s.key,
+        label: s.label,
+        state,
+      };
+    });
+  }
+
+  // stageState === "current"
+  return RETRIEVAL_SUBSTEPS.map((s, idx) => {
+    const explicit = latestPhase.get(s.key);
+    let state: SubstepState = "pending";
+    if (explicit === "completed") {
+      state = "completed";
+    } else if (explicit === "failed") {
+      state = "failed";
+    } else if (explicit === "cancelled") {
+      state = "cancelled";
+    } else if (explicit === "stopped") {
+      state = "stopped";
+    } else if (explicit === "unknown") {
+      state = "unknown";
+    } else if (s.key === activeOp) {
+      if (active?.phase === "completed") {
+        state = "completed";
+      } else if (active?.phase === "failed") {
+        state = "failed";
+      } else if (active?.phase === "cancelled") {
+        state = "cancelled";
+      } else if (active?.phase === "stopped") {
+        state = "stopped";
+      } else if (active?.phase === "unknown") {
+        state = "unknown";
+      } else {
+        state = "current";
+      }
+    } else if (explicit === "started") {
+      // An earlier substep that started but has no terminal event while later work is active
+      // must NOT remain current, and must not be inferred as completed.
+      state = "unknown";
+    } else {
+      // Substep with no explicit events
+      if (activeIdx !== -1 && idx < activeIdx) {
+        // An intermediate substep skipped without events before the active operation
+        state = "unknown";
+      } else {
+        state = "pending";
+      }
+    }
+    return {
+      key: s.key,
+      label: s.label,
+      state,
+    };
+  });
+}
+
+
 /**
  * Derive the 17-stage timeline from real events + run state.
  * - completed: a real completion signal was observed for that stage.

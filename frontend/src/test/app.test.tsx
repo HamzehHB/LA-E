@@ -1,8 +1,19 @@
 import { useState } from "react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
-import { deriveWorkflow, isTerminalSuccess } from "../components/workflowStages";
-import { StoreProvider, useStore } from "../state/store";
+import {
+  deriveWorkflow,
+  isTerminalSuccess,
+  deriveRetrievalSubstep,
+  deriveActiveRetrievalSubstep,
+  deriveRetrievalSubsteps,
+  filterEventsByRun,
+  RETRIEVAL_SUBSTEPS,
+} from "../components/workflowStages";
+import { StoreProvider, StoreContext, useStore } from "../state/store";
+import { Workflow } from "../components/Workflow";
+import { TranslateAction, Journals } from "../components/Panels";
+import { computeSha256 } from "../contracts/crypto";
 import type { RunEvent } from "../contracts/transport";
 
 beforeEach(() => {
@@ -95,6 +106,174 @@ describe("backend stage fidelity (Invariant A)", () => {
       "confidence",
       "knowledge_filter",
       "representation",
+    ]);
+  });
+});
+
+describe("retrieval substeps synchronization", () => {
+  it("derives the latest retrieval substep from events", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "r1", stage: "retrieval", message: "start", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "query_preparation", message: "prep", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "candidate_retrieval", message: "cand", timestamp: "" },
+    ];
+    expect(deriveRetrievalSubstep(events)).toBe("candidate_retrieval");
+  });
+
+  it("has the 5 distinct capabilities in RETRIEVAL_SUBSTEPS", () => {
+    expect(RETRIEVAL_SUBSTEPS.map((s) => s.key)).toEqual([
+      "query_preparation",
+      "candidate_retrieval",
+      "relevance_assessment",
+      "candidate_identification",
+      "retrieval_evidence_recording",
+    ]);
+  });
+
+  it("derives step lifecycle states accurately for active retrieval", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "r1", stage: "retrieval", message: "start", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "prep", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "candidate_retrieval", phase: "completed", message: "cand", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "relevance_assessment", phase: "started", message: "relevance", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("current", events);
+    expect(substeps.map((s) => ({ key: s.key, state: s.state }))).toEqual([
+      { key: "query_preparation", state: "completed" },
+      { key: "candidate_retrieval", state: "completed" },
+      { key: "relevance_assessment", state: "current" },
+      { key: "candidate_identification", state: "pending" },
+      { key: "retrieval_evidence_recording", state: "pending" },
+    ]);
+  });
+
+  it("does NOT infer substep completion from overall stage completion when events are missing", () => {
+    const substeps = deriveRetrievalSubsteps("completed", []);
+    // Must NOT infer completion without explicit events; missing evidence yields unknown
+    expect(substeps.every((s) => s.state === "unknown")).toBe(true);
+  });
+
+  it("marks retrieval substeps completed only when supported by explicit completion events", () => {
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "run-all", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-all", stage: "retrieval", operation: "candidate_retrieval", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-all", stage: "retrieval", operation: "relevance_assessment", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-all", stage: "retrieval", operation: "candidate_identification", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-all", stage: "retrieval", operation: "retrieval_evidence_recording", phase: "completed", message: "", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("completed", events, "run-all");
+    expect(substeps.every((s) => s.state === "completed")).toBe(true);
+  });
+
+  it("marks all retrieval substeps pending when stage is pending", () => {
+    const substeps = deriveRetrievalSubsteps("pending", []);
+    expect(substeps.every((s) => s.state === "pending")).toBe(true);
+  });
+
+  it("handles explicit started and completed phases with run_id scoping", () => {
+    const events: RunEvent[] = [
+      // Prior run event that should be ignored when scoped
+      { kind: "status", run_id: "other-run", stage: "retrieval", operation: "retrieval_evidence_recording", phase: "completed", message: "", timestamp: "" },
+      // Current run events
+      { kind: "status", run_id: "run-target", stage: "retrieval", operation: "query_preparation", phase: "started", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-target", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-target", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("current", events, "run-target");
+    expect(substeps.map((s) => ({ key: s.key, state: s.state }))).toEqual([
+      { key: "query_preparation", state: "completed" },
+      { key: "candidate_retrieval", state: "current" },
+      { key: "relevance_assessment", state: "pending" },
+      { key: "candidate_identification", state: "pending" },
+      { key: "retrieval_evidence_recording", state: "pending" },
+    ]);
+  });
+
+  it("accurately reflects stopped retrieval stage preserving completed substeps", () => {
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("stopped", events, "r1");
+    expect(substeps.map((s) => ({ key: s.key, state: s.state }))).toEqual([
+      { key: "query_preparation", state: "completed" },
+      { key: "candidate_retrieval", state: "stopped" },
+      { key: "relevance_assessment", state: "pending" },
+      { key: "candidate_identification", state: "pending" },
+      { key: "retrieval_evidence_recording", state: "pending" },
+    ]);
+  });
+
+  it("Workflow renders retrieval substeps when retrieval stage is current", () => {
+    const testState: any = {
+      appLanguage: "en",
+      run: {
+        run_id: "run-test-1",
+        current_stage: "retrieval",
+        stopped: false,
+        status: "retrieval in progress",
+        review_state: "",
+      },
+      runEvents: [
+        { kind: "run_started", run_id: "run-test-1", stage: "input", message: "", timestamp: "" },
+        { kind: "stage_completed", run_id: "run-test-1", stage: "ingestion", message: "", timestamp: "" },
+        { kind: "stage_started", run_id: "run-test-1", stage: "retrieval", message: "", timestamp: "" },
+        { kind: "status", run_id: "run-test-1", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+        { kind: "status", run_id: "run-test-1", stage: "retrieval", operation: "candidate_retrieval", phase: "completed", message: "", timestamp: "" },
+        { kind: "status", run_id: "run-test-1", stage: "retrieval", operation: "relevance_assessment", phase: "started", message: "", timestamp: "" },
+      ],
+    };
+
+    render(
+      <StoreContext.Provider value={{ state: testState } as any}>
+        <Workflow />
+      </StoreContext.Provider>
+    );
+
+    const retrievalLi = screen.getByRole("listitem", { name: /^RETRIEVAL:/i });
+    expect(retrievalLi).toHaveClass("has-substeps");
+    const substepsList = within(retrievalLi).getByRole("list", { name: "Retrieval Substeps" });
+    expect(substepsList).toBeInTheDocument();
+    const pills = within(substepsList).getAllByRole("listitem");
+    expect(pills).toHaveLength(5);
+    expect(pills[0]).toHaveAttribute("data-substep", "query_preparation");
+    expect(pills[0]).toHaveAttribute("data-state", "completed");
+    expect(pills[1]).toHaveAttribute("data-substep", "candidate_retrieval");
+    expect(pills[1]).toHaveAttribute("data-state", "completed");
+    expect(pills[2]).toHaveAttribute("data-substep", "relevance_assessment");
+    expect(pills[2]).toHaveAttribute("data-state", "current");
+    expect(pills[3]).toHaveAttribute("data-substep", "candidate_identification");
+    expect(pills[3]).toHaveAttribute("data-state", "pending");
+    expect(pills[4]).toHaveAttribute("data-substep", "retrieval_evidence_recording");
+    expect(pills[4]).toHaveAttribute("data-state", "pending");
+  });
+
+  it("does not infer first retrieval substep running merely because unrelated run events exist", () => {
+    const events: RunEvent[] = [
+      { kind: "run_started", run_id: "r1", stage: "input", message: "", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "ingestion", message: "", timestamp: "" },
+    ];
+    // Stage is "current", but NO retrieval event has been emitted yet
+    const substeps = deriveRetrievalSubsteps("current", events, "r1");
+    expect(substeps.every((s) => s.state === "pending")).toBe(true);
+  });
+
+  it("handles failed, cancelled, and stopped phases transitioning substep out of running", () => {
+    const failedEvents: RunEvent[] = [
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "r1", stage: "retrieval", operation: "candidate_retrieval", phase: "failed", message: "index connection dropped", timestamp: "" },
+    ];
+    const active = deriveActiveRetrievalSubstep(failedEvents, "r1");
+    expect(active?.phase).toBe("failed");
+    expect(active?.isRunning).toBe(false);
+
+    const substeps = deriveRetrievalSubsteps("current", failedEvents, "r1");
+    expect(substeps.map((s) => ({ key: s.key, state: s.state }))).toEqual([
+      { key: "query_preparation", state: "completed" },
+      { key: "candidate_retrieval", state: "failed" },
+      { key: "relevance_assessment", state: "pending" },
+      { key: "candidate_identification", state: "pending" },
+      { key: "retrieval_evidence_recording", state: "pending" },
     ]);
   });
 });
@@ -660,6 +839,844 @@ describe("Input Stage — Chat Input UI, Loading, Localization, and Timeline", (
     await user.click(lexicalBtn);
     expect(lexicalBtn).toHaveAttribute("aria-pressed", "true");
     expect(semanticBtn).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("strictly scopes retrieval events by runId and distinguishes running vs completed phases", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "other-run", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "status", run_id: "", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "" }, // untagged
+      { kind: "stage_started", run_id: "target-run", stage: "retrieval", operation: "candidate_retrieval", message: "", phase: "started", timestamp: "" },
+    ];
+
+    // 1. With active target-run: other-run and untagged are strictly excluded
+    const filtered = filterEventsByRun(events, "target-run");
+    expect(filtered.length).toBe(1);
+    expect(filtered[0].operation).toBe("candidate_retrieval");
+    expect(filtered[0].run_id).toBe("target-run");
+
+    // 2. Active substep detects running phase
+    const active = deriveActiveRetrievalSubstep(events, "target-run");
+    expect(active).toBeDefined();
+    expect(active?.operation).toBe("candidate_retrieval");
+    expect(active?.phase).toBe("started");
+    expect(active?.isRunning).toBe(true);
+
+    // 3. Substep status marks running substep as current
+    const substepsRunning = deriveRetrievalSubsteps("current", events, "target-run");
+    const candSub = substepsRunning.find((s) => s.key === "candidate_retrieval");
+    expect(candSub?.state).toBe("current");
+
+    // 4. When completed event arrives, isRunning becomes false
+    const eventsWithCompletion: RunEvent[] = [
+      ...events,
+      { kind: "stage_completed", run_id: "target-run", stage: "retrieval", operation: "candidate_retrieval", message: "", phase: "completed" as const, timestamp: "" },
+    ];
+    const completedActive = deriveActiveRetrievalSubstep(eventsWithCompletion, "target-run");
+    expect(completedActive).toBeDefined();
+    expect(completedActive?.operation).toBe("candidate_retrieval");
+    expect(completedActive?.phase).toBe("completed");
+    expect(completedActive?.isRunning).toBe(false);
+
+    const substepsCompleted = deriveRetrievalSubsteps("current", eventsWithCompletion, "target-run");
+    const candSubCompleted = substepsCompleted.find((s) => s.key === "candidate_retrieval");
+    expect(candSubCompleted?.state).toBe("completed");
+  });
+
+  it("legacy policy applies when runId is empty or undefined", () => {
+    const untaggedEvents: RunEvent[] = [
+      { kind: "status", run_id: "", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "status", run_id: "", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "" },
+    ];
+    expect(filterEventsByRun(untaggedEvents, "").length).toBe(2);
+    expect(filterEventsByRun(untaggedEvents, undefined).length).toBe(2);
+
+    // When exactly one tagged run exists, single-run isolation selects only that run's events
+    const singleTagged: RunEvent[] = [
+      { kind: "status", run_id: "tagged-run", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "status", run_id: "", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "" },
+    ];
+    const isolated = filterEventsByRun(singleTagged, undefined);
+    expect(isolated.length).toBe(1);
+    expect(isolated[0].run_id).toBe("tagged-run");
+  });
+
+  it("filterEventsByRun selects latest run by timestamp when runId is omitted", () => {
+    // Interleaved events where older run events appear after newer run events in array order
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "run-newer", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T03:00:00Z" },
+      { kind: "status", run_id: "run-older", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T01:00:00Z" },
+      { kind: "status", run_id: "run-newer", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "2026-10-25T03:01:00Z" },
+    ];
+    const filtered = filterEventsByRun(events, undefined);
+    expect(filtered.length).toBe(2);
+    expect(filtered.every((e) => e.run_id === "run-newer")).toBe(true);
+  });
+
+  it("deriveRetrievalSubsteps preserves failed substep even if stageState is completed", () => {
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "run-1", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-1", stage: "retrieval", operation: "candidate_retrieval", phase: "failed", message: "", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("completed", events, "run-1");
+    const candSub = substeps.find((s) => s.key === "candidate_retrieval");
+    expect(candSub?.state).toBe("failed");
+  });
+
+  it("does NOT infer earlier substep completion from sequential index ordering alone", () => {
+    // query_preparation started, followed by candidate_retrieval started (query_prep never emitted completed)
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "run-seq", stage: "retrieval", operation: "query_preparation", phase: "started", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-seq", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" },
+    ];
+
+    const currentSubsteps = deriveRetrievalSubsteps("current", events, "run-seq");
+    const querySub = currentSubsteps.find((s) => s.key === "query_preparation");
+    const candSub = currentSubsteps.find((s) => s.key === "candidate_retrieval");
+
+    // CRITICAL: query_preparation must NOT remain current and must NOT be inferred as completed!
+    // Since later work began without a terminal event, it is conservatively represented as unknown.
+    expect(querySub?.state).not.toBe("completed");
+    expect(querySub?.state).not.toBe("current");
+    expect(querySub?.state).toBe("unknown");
+    // Only real active work is shown as current
+    expect(candSub?.state).toBe("current");
+
+    // In a stopped run: neither should be marked completed, and in-flight operations are stopped
+    const stoppedSubsteps = deriveRetrievalSubsteps("stopped", events, "run-seq");
+    const queryStopped = stoppedSubsteps.find((s) => s.key === "query_preparation");
+    const candStopped = stoppedSubsteps.find((s) => s.key === "candidate_retrieval");
+    expect(queryStopped?.state).not.toBe("completed");
+    expect(candStopped?.state).not.toBe("completed");
+    expect(queryStopped?.state).toBe("stopped");
+    expect(candStopped?.state).toBe("stopped");
+
+    // When query_preparation emits explicit completed, it is properly recognized
+    const eventsWithExplicit: RunEvent[] = [
+      ...events,
+      { kind: "status", run_id: "run-seq", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+    ];
+    const explicitSubsteps = deriveRetrievalSubsteps("current", eventsWithExplicit, "run-seq");
+    expect(explicitSubsteps.find((s) => s.key === "query_preparation")?.state).toBe("completed");
+  });
+
+  it("marks missing intermediate substeps as unknown when later substeps have started", () => {
+    // query_preparation completed, candidate_retrieval was skipped without events, relevance_assessment started
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "run-skip", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-skip", stage: "retrieval", operation: "relevance_assessment", phase: "started", message: "", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("current", events, "run-skip");
+    expect(substeps.find((s) => s.key === "query_preparation")?.state).toBe("completed");
+    expect(substeps.find((s) => s.key === "candidate_retrieval")?.state).toBe("unknown");
+    expect(substeps.find((s) => s.key === "relevance_assessment")?.state).toBe("current");
+    expect(substeps.find((s) => s.key === "candidate_identification")?.state).toBe("pending");
+  });
+
+  it("handles contradictory event sequences conservatively as unknown", () => {
+    // Substep emitted an unrecognized/contradictory phase
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "run-contra", stage: "retrieval", operation: "query_preparation", phase: "contradictory_phase" as any, message: "", timestamp: "" },
+    ];
+    const substeps = deriveRetrievalSubsteps("current", events, "run-contra");
+    expect(substeps.find((s) => s.key === "query_preparation")?.state).toBe("unknown");
+  });
+
+  it("distinguishes started, completed, and unknown/unexpected phases cleanly", () => {
+    // 1. First-class failure phase ('failed')
+    const eventsFailed: RunEvent[] = [
+      { kind: "status", run_id: "run-failed", stage: "retrieval", operation: "relevance_assessment", phase: "failed", message: "", timestamp: "" },
+    ];
+    const activeFailed = deriveActiveRetrievalSubstep(eventsFailed, "run-failed");
+    expect(activeFailed).toBeDefined();
+    expect(activeFailed?.operation).toBe("relevance_assessment");
+    expect(activeFailed?.phase).toBe("failed");
+    expect(activeFailed?.isRunning).toBe(false);
+
+    const substepsFailed = deriveRetrievalSubsteps("current", eventsFailed, "run-failed");
+    const relSub = substepsFailed.find((s) => s.key === "relevance_assessment");
+    expect(relSub?.state).toBe("failed");
+
+    // 1b. Unknown / unexpected phase (e.g. invalid string)
+    const eventsUnknown: RunEvent[] = [
+      { kind: "status", run_id: "run-unknown", stage: "retrieval", operation: "relevance_assessment", phase: "corrupt_phase" as any, message: "", timestamp: "" },
+    ];
+    const activeUnknown = deriveActiveRetrievalSubstep(eventsUnknown, "run-unknown");
+    expect(activeUnknown).toBeDefined();
+    expect(activeUnknown?.operation).toBe("relevance_assessment");
+    expect(activeUnknown?.phase).toBe("unknown");
+    expect(activeUnknown?.isRunning).toBe(false);
+
+    // 2. Stopped run must not leave substeps as isRunning=true
+    const eventsStopped: RunEvent[] = [
+      { kind: "status", run_id: "run-stopped", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" },
+      { kind: "stopped", run_id: "run-stopped", stage: "retrieval", message: "run cancelled", timestamp: "" },
+    ];
+    const activeStopped = deriveActiveRetrievalSubstep(eventsStopped, "run-stopped");
+    expect(activeStopped?.isRunning).toBe(false);
+
+    // 3. Explicit isStopped parameter
+    const activeStoppedParam = deriveActiveRetrievalSubstep(
+      [{ kind: "status", run_id: "run-p", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" }],
+      "run-p",
+      true
+    );
+    expect(activeStoppedParam?.isRunning).toBe(false);
+
+    // 4. Legacy event with missing phase
+    const eventsMissingPhase: RunEvent[] = [
+      { kind: "status", run_id: "run-legacy", stage: "retrieval", operation: "candidate_identification", message: "", timestamp: "" },
+    ];
+    const activeLegacy = deriveActiveRetrievalSubstep(eventsMissingPhase, "run-legacy");
+    expect(activeLegacy).toBeDefined();
+    expect(activeLegacy?.operation).toBe("candidate_identification");
+    expect(activeLegacy?.phase).toBe("started");
+    expect(activeLegacy?.isRunning).toBe(true);
+  });
+});
+
+describe("TranslateAction provenance and stale handling", () => {
+  it("renders source kind badge and detects stale source text, recordId, and language changes", async () => {
+    const mockLiveTranslate = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "متن ترجمه‌شده",
+      status: "current",
+      translator: "static-dict",
+      source_hash: computeSha256("Original narrative text"),
+      translated_hash: "hash5678",
+      source_text: "Original narrative text",
+      source_kind: "audit_narrative",
+      source_id: "rec-audit-001",
+      persisted: false,
+    });
+
+    const mockContextValue = {
+      state: {
+        appLanguage: "fa",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: {},
+        runEvents: [],
+      },
+      liveTranslate: mockLiveTranslate,
+    };
+
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction
+          text="Original narrative text"
+          sourceKind="audit_narrative"
+          recordId="rec-audit-001"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+
+    const translateBtn = screen.getByRole("button", { name: /Translate|ترجمه/ });
+    await user.click(translateBtn);
+
+    expect(mockLiveTranslate).toHaveBeenCalledWith(
+      "Original narrative text",
+      "fa",
+      "en",
+      "audit_narrative",
+      "rec-audit-001"
+    );
+
+    // Shows source kind badge and translated text
+    expect(screen.getByText("[audit_narrative]")).toBeInTheDocument();
+    expect(screen.getByText("متن ترجمه‌شده")).toBeInTheDocument();
+    expect(screen.queryByText("stale")).not.toBeInTheDocument();
+
+    // Rerender with mutated text -> stale badge should appear
+    rerender(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction
+          text="Modified narrative text"
+          sourceKind="audit_narrative"
+          recordId="rec-audit-001"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    expect(screen.getByText("stale")).toBeInTheDocument();
+
+    // Rerender with mutated recordId -> stale badge should appear
+    rerender(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction
+          text="Original narrative text"
+          sourceKind="audit_narrative"
+          recordId="rec-audit-different"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    expect(screen.getByText("stale")).toBeInTheDocument();
+
+    // Rerender with mutated sourceKind -> stale badge should appear
+    rerender(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction
+          text="Original narrative text"
+          sourceKind="proposal"
+          recordId="rec-audit-001"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    expect(screen.getByText("stale")).toBeInTheDocument();
+
+    // Rerender with mutated sourceLang -> stale badge should appear
+    rerender(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction
+          text="Original narrative text"
+          sourceKind="audit_narrative"
+          recordId="rec-audit-001"
+          sourceLang="fa"
+        />
+      </StoreContext.Provider>
+    );
+    expect(screen.getByText("stale")).toBeInTheDocument();
+  });
+
+  it("marks translation unverifiable when source_hash is missing and stale when source_hash does not match", async () => {
+    // Missing source_hash
+    const mockNoHash = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "ترجمه بدون هش",
+      status: "current",
+      source_text: "Original text",
+      source_kind: "dynamic_text",
+      source_id: "id-1",
+      persisted: false,
+    });
+
+    const mockContextValue = {
+      state: {
+        appLanguage: "fa",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: {},
+        runEvents: [],
+      },
+      liveTranslate: mockNoHash,
+    };
+
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction text="Original text" sourceKind="dynamic_text" recordId="id-1" sourceLang="en" />
+      </StoreContext.Provider>
+    );
+
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    // Because source_hash is missing, it must not treat missing provenance as fresh; it is marked unverifiable
+    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+
+    // Mismatched source_hash
+    const mockBadHash = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "ترجمه با هش نامعتبر",
+      status: "current",
+      source_hash: "wrong_sha256_hash",
+      source_text: "Original text",
+      source_kind: "dynamic_text",
+      source_id: "id-1",
+      persisted: false,
+    });
+
+    rerender(
+      <StoreContext.Provider value={{ ...mockContextValue, liveTranslate: mockBadHash } as any}>
+        <TranslateAction text="Original text" sourceKind="dynamic_text" recordId="id-1" sourceLang="en" />
+      </StoreContext.Provider>
+    );
+
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("stale")).toBeInTheDocument();
+  });
+
+  it("renders unverifiable badge when translation status is unverifiable", async () => {
+    const mockUnverifiable = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "ترجمه غیرقابل‌تایید",
+      status: "unverifiable",
+      source_text: "Original text",
+      source_kind: "dynamic_text",
+      source_id: "id-1",
+      persisted: false,
+    });
+    const mockContextValue = {
+      state: {
+        appLanguage: "fa",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: {},
+        runEvents: [],
+      },
+      liveTranslate: mockUnverifiable,
+    };
+    render(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction text="Original text" sourceKind="dynamic_text" recordId="id-1" sourceLang="en" />
+      </StoreContext.Provider>
+    );
+    await userEvent.setup().click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+  });
+
+  it("does NOT mark unavailable translation as stale when source_hash is absent", async () => {
+    const mockUnavailable = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "«Original text» (ترجمه خودکار در دسترس نیست — مدل زبانی متصل نیست)",
+      status: "unavailable",
+      source_text: "Original text",
+      source_kind: "dynamic_text",
+      source_id: "id-1",
+      persisted: false,
+    });
+    const mockContextValue = {
+      state: {
+        appLanguage: "fa",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: {},
+        runEvents: [],
+      },
+      liveTranslate: mockUnavailable,
+    };
+    render(
+      <StoreContext.Provider value={mockContextValue as any}>
+        <TranslateAction text="Original text" sourceKind="dynamic_text" recordId="id-1" sourceLang="en" />
+      </StoreContext.Provider>
+    );
+    await userEvent.setup().click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.queryByText("stale")).not.toBeInTheDocument();
+    expect(screen.getByText("unavailable")).toBeInTheDocument();
+  });
+
+  it("does not silently merge events from different runs when runId is omitted and timestamps are missing", () => {
+    const multiRunEvents: RunEvent[] = [
+      { kind: "status", run_id: "run-old", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "status", run_id: "run-new", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "" },
+    ];
+    // Under conservative correlation, multiple runs without valid timestamps must NOT be correlated by array order
+    const scoped = filterEventsByRun(multiRunEvents, undefined);
+    expect(scoped).toEqual([]);
+  });
+
+  it("computes standard SHA-256 matching reference vectors", () => {
+    expect(computeSha256("")).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    expect(computeSha256("hello")).toBe("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+    expect(computeSha256("سلام دنیا")).toBe("a5243b50dac2e60ee8f7756fcb7c7cf282e485bea5f91db3ea621a786c0c554e");
+  });
+
+  it("renders emergency journal badges when emergency audit records are present", () => {
+    const mockContext = {
+      state: {
+        appLanguage: "en",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        knowledgeLanguageNote: "",
+        recentAudits: [
+          {
+            id: "rec-emerg-1",
+            timestamp: "2026-10-24T12:00:00Z",
+            statusKey: "journal.failed",
+            stagingNoteKey: "journal.stagingNotCreated",
+            title: "Emergency Audit: CREATE",
+            summary: "Emergency audit record: action CREATE reached terminal outcome: failed.",
+            emergency: true,
+          },
+        ],
+        recentStaging: [
+          {
+            id: "rec-emerg-1",
+            timestamp: "2026-10-24T12:00:00Z",
+            statusKey: "journal.failed",
+            stagingNoteKey: null,
+            title: "Staged Artifact",
+            excerpt: "Unavailable",
+            emergency: true,
+            staging_available: false,
+          },
+        ],
+        sourceMode: "vault",
+        journalIndex: 0,
+        run: {},
+        runEvents: [],
+      },
+      liveAvailable: true,
+      refreshJournals: vi.fn(),
+    };
+
+    render(
+      <StoreContext.Provider value={mockContext as any}>
+        <Journals />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByText("Emergency Journal")).toBeInTheDocument();
+    expect(screen.getByText("Emergency")).toBeInTheDocument();
+  });
+
+  it("marks translation unverifiable when record is missing source_id, source_kind, or source_language", async () => {
+    // Record where source_id is missing/empty even though caller expects recordId="rec-req-1"
+    const mockMissingSourceId = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "ترجمه بدون شناسه مبدا",
+      status: "current",
+      source_hash: computeSha256("Source text requiring id"),
+      source_text: "Source text requiring id",
+      source_kind: "dynamic_text",
+      source_id: "", // Missing source_id!
+      persisted: false,
+    });
+
+    const mockContext = {
+      state: {
+        appLanguage: "fa",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: {},
+        runEvents: [],
+      },
+      liveTranslate: mockMissingSourceId,
+    };
+
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <StoreContext.Provider value={mockContext as any}>
+        <TranslateAction
+          text="Source text requiring id"
+          sourceKind="dynamic_text"
+          recordId="rec-req-1"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    // Missing required metadata (source_id) must fail closed as unverifiable
+    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    // Non-persisted on-demand badge is visible
+    expect(screen.getByText("on-demand")).toBeInTheDocument();
+
+    // Missing source_kind when caller specifies sourceKind="audit_narrative"
+    const mockMissingSourceKind = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "ترجمه بدون نوع مبدا",
+      status: "current",
+      source_hash: computeSha256("Source text requiring kind"),
+      source_text: "Source text requiring kind",
+      source_kind: "", // Missing source_kind!
+      source_id: "rec-req-2",
+      persisted: false,
+    });
+
+    rerender(
+      <StoreContext.Provider value={{ ...mockContext, liveTranslate: mockMissingSourceKind } as any}>
+        <TranslateAction
+          text="Source text requiring kind"
+          sourceKind="audit_narrative"
+          recordId="rec-req-2"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+
+    // Missing source_language when caller specifies sourceLang="en"
+    const mockMissingSourceLang = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "", // Missing source_language!
+      translated_text: "ترجمه بدون زبان مبدا",
+      status: "current",
+      source_hash: computeSha256("Source text requiring lang"),
+      source_text: "Source text requiring lang",
+      source_kind: "dynamic_text",
+      source_id: "rec-req-3",
+      persisted: false,
+    });
+
+    rerender(
+      <StoreContext.Provider value={{ ...mockContext, liveTranslate: mockMissingSourceLang } as any}>
+        <TranslateAction
+          text="Source text requiring lang"
+          sourceKind="dynamic_text"
+          recordId="rec-req-3"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+  });
+
+  it("handles target_language validation: unverifiable when missing, stale when mismatched, current when verified", async () => {
+    const user = userEvent.setup();
+    // 1. Missing target_language -> unverifiable
+    const mockMissingTarget = vi.fn().mockResolvedValue({
+      target_lang: "",
+      target_language: "",
+      source_language: "en",
+      translated_text: "بدون زبان مقصد",
+      status: "current",
+      source_hash: computeSha256("Target test text"),
+      source_text: "Target test text",
+      source_kind: "dynamic_text",
+      source_id: "rec-target-1",
+      persisted: false,
+    });
+
+    const mockContext = {
+      state: {
+        appLanguage: "fa",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: {},
+        runEvents: [],
+      },
+      liveTranslate: mockMissingTarget,
+    };
+
+    const { rerender } = render(
+      <StoreContext.Provider value={mockContext as any}>
+        <TranslateAction
+          text="Target test text"
+          sourceKind="dynamic_text"
+          recordId="rec-target-1"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+
+    // 2. Mismatched target_language -> stale (metadata present but targeting German 'de' when UI is 'fa')
+    const mockMismatchedTarget = vi.fn().mockResolvedValue({
+      target_lang: "de",
+      target_language: "de",
+      source_language: "en",
+      translated_text: "Deutscher Text",
+      status: "current",
+      source_hash: computeSha256("Target test text"),
+      source_text: "Target test text",
+      source_kind: "dynamic_text",
+      source_id: "rec-target-1",
+      persisted: false,
+    });
+
+    rerender(
+      <StoreContext.Provider value={{ ...mockContext, liveTranslate: mockMismatchedTarget } as any}>
+        <TranslateAction
+          text="Target test text"
+          sourceKind="dynamic_text"
+          recordId="rec-target-1"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("stale")).toBeInTheDocument();
+
+    // 3. Fully valid, current translation -> current
+    const mockValidCurrent = vi.fn().mockResolvedValue({
+      target_lang: "fa",
+      target_language: "fa",
+      source_language: "en",
+      translated_text: "متن معتبر و به روز",
+      status: "current",
+      source_hash: computeSha256("Target test text"),
+      source_text: "Target test text",
+      source_kind: "dynamic_text",
+      source_id: "rec-target-1",
+      persisted: false,
+    });
+
+    rerender(
+      <StoreContext.Provider value={{ ...mockContext, liveTranslate: mockValidCurrent } as any}>
+        <TranslateAction
+          text="Target test text"
+          sourceKind="dynamic_text"
+          recordId="rec-target-1"
+          sourceLang="en"
+        />
+      </StoreContext.Provider>
+    );
+    await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
+    expect(screen.getByText("current")).toBeInTheDocument();
+  });
+});
+
+describe("conservative run correlation and retrieval UI behavior (Section 3)", () => {
+  it("selects newer run when all runs have valid, comparable timestamps even if older events appear later in array", () => {
+    // Array order: run-newer appears first, run-older appears second
+    const eventsOrder1: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-newer", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:30:00Z" },
+      { kind: "stage_started", run_id: "run-older", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+    ];
+    const res1 = filterEventsByRun(eventsOrder1, undefined);
+    expect(res1.length).toBe(1);
+    expect(res1[0].run_id).toBe("run-newer");
+
+    // Inverted array order: run-older appears first, run-newer appears second
+    const eventsOrder2: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-older", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+      { kind: "stage_started", run_id: "run-newer", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:30:00Z" },
+    ];
+    const res2 = filterEventsByRun(eventsOrder2, undefined);
+    expect(res2.length).toBe(1);
+    expect(res2[0].run_id).toBe("run-newer");
+  });
+
+  it("returns empty array when multiple distinct run IDs exist and all lack timestamps", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "" },
+    ];
+    expect(filterEventsByRun(events, undefined)).toEqual([]);
+    expect(filterEventsByRun(events, "")).toEqual([]);
+  });
+
+  it("returns empty array when multiple distinct run IDs have mixed timestamp availability", () => {
+    // run-A has timestamp, but run-B has empty or whitespace timestamp
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "   " },
+    ];
+    expect(filterEventsByRun(events, undefined)).toEqual([]);
+  });
+
+  it("returns empty array when any run has an invalid or unparseable timestamp", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "invalid-iso-date" },
+    ];
+    expect(filterEventsByRun(events, undefined)).toEqual([]);
+  });
+
+  it("returns empty array when top candidate runs have equal timestamps (contradictory / ambiguous)", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "2026-10-25T14:00:00Z" },
+    ];
+    expect(filterEventsByRun(events, undefined)).toEqual([]);
+  });
+
+  it("strictly isolates events to the specified run_id regardless of timestamps or other runs", () => {
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T10:00:00Z" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "2026-10-25T16:00:00Z" },
+    ];
+    // Asking explicitly for run-A returns only run-A even though run-B is newer
+    const resA = filterEventsByRun(events, "run-A");
+    expect(resA.length).toBe(1);
+    expect(resA[0].run_id).toBe("run-A");
+
+    // Asking explicitly for run-B returns only run-B
+    const resB = filterEventsByRun(events, "run-B");
+    expect(resB.length).toBe(1);
+    expect(resB[0].run_id).toBe("run-B");
+  });
+
+  it("compares different timezone offsets by epoch milliseconds, not string lexicographical order", () => {
+    // 16:00:00+02:00 is 14:00:00 UTC
+    // 14:30:00Z is 14:30:00 UTC (later than 14:00:00 UTC)
+    // String comparison would incorrectly claim "2026-10-25T16:00:00+02:00" > "2026-10-25T14:30:00Z"
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-earlier-tz", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T16:00:00+02:00" },
+      { kind: "stage_started", run_id: "run-later-utc", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:30:00Z" },
+    ];
+    const res = filterEventsByRun(events, undefined);
+    expect(res.length).toBe(1);
+    expect(res[0].run_id).toBe("run-later-utc");
+  });
+
+  it("returns empty array when different timezone offsets represent the exact same absolute epoch time", () => {
+    // 14:00:00Z and 16:00:00+02:00 represent the identical epoch millisecond timestamp
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-utc", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+      { kind: "stage_started", run_id: "run-plus-two", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "2026-10-25T16:00:00+02:00" },
+    ];
+    expect(filterEventsByRun(events, undefined)).toEqual([]);
+  });
+
+  it("returns empty array if any event within a candidate run has a missing or invalid timestamp", () => {
+    // run-A has one valid timestamp and one empty timestamp
+    const events: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "2026-10-25T14:00:00Z" },
+      { kind: "stage_completed", run_id: "run-A", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "2026-10-25T15:00:00Z" },
+    ];
+    expect(filterEventsByRun(events, undefined)).toEqual([]);
+  });
+
+  it("returns all events when all events are untagged (distinctRuns.length === 0)", () => {
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "", stage: "retrieval", operation: "query_preparation", message: "", timestamp: "" },
+      { kind: "status", run_id: "", stage: "retrieval", operation: "candidate_retrieval", message: "", timestamp: "" },
+    ];
+    expect(filterEventsByRun(events, undefined).length).toBe(2);
+  });
+
+  it("never invents successful Retrieval substep states when run correlation is uncertain", () => {
+    // Both runs have events claiming completed substeps, but missing timestamps make correlation uncertain
+    const ambiguousEvents: RunEvent[] = [
+      { kind: "stage_completed", run_id: "run-A", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "stage_completed", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", phase: "completed", message: "", timestamp: "" },
+    ];
+
+    // 1. Stage completed but correlation is uncertain: all substeps MUST be 'unknown'
+    const completedSubsteps = deriveRetrievalSubsteps("completed", ambiguousEvents, undefined);
+    expect(completedSubsteps).toHaveLength(RETRIEVAL_SUBSTEPS.length);
+    for (const step of completedSubsteps) {
+      expect(step.state).toBe("unknown");
+    }
+
+    // 2. No substep is falsely marked completed or current
+    expect(completedSubsteps.some((s) => s.state === "completed")).toBe(false);
+    expect(completedSubsteps.some((s) => s.state === "current")).toBe(false);
+  });
+
+  it("preserves pending/unknown state without active running state when run correlation is uncertain", () => {
+    const ambiguousEvents: RunEvent[] = [
+      { kind: "stage_started", run_id: "run-A", stage: "retrieval", operation: "query_preparation", phase: "started", message: "", timestamp: "" },
+      { kind: "stage_started", run_id: "run-B", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" },
+    ];
+
+    // 1. Active substep cannot be derived when correlation is uncertain
+    const active = deriveActiveRetrievalSubstep(ambiguousEvents, undefined);
+    expect(active).toBeUndefined();
+
+    const activeOp = deriveRetrievalSubstep(ambiguousEvents, undefined);
+    expect(activeOp).toBeUndefined();
+
+    // 2. Stage current with uncertain correlation leaves substeps pending/unknown without running current state
+    const currentSubsteps = deriveRetrievalSubsteps("current", ambiguousEvents, undefined);
+    expect(currentSubsteps).toHaveLength(RETRIEVAL_SUBSTEPS.length);
+    for (const step of currentSubsteps) {
+      expect(step.state).not.toBe("current");
+      expect(step.state).not.toBe("completed");
+    }
   });
 });
 

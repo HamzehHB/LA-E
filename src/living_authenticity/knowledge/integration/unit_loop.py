@@ -271,7 +271,7 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
                      operating_mode="", run_id="", record_id="",
                      human_review_state="", stop_reason="",
                      validation_result="", artifact_sha256="",
-                     proposal=None) -> dict:
+                     proposal=None, narrative_language="en") -> dict:
     """Build the traceability mapping attached to one audit record.
 
     Identifiers and hashes only; never credentials, never raw secrets.
@@ -396,7 +396,8 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
             "human_review_state": human_review_state,
             "artifact_sha256": artifact_sha256,
             "core_relevance": getattr(core, "relevance", "") if core else "",
-            "core_basis": getattr(core, "basis", "") if core else ""}
+            "core_basis": getattr(core, "basis", "") if core else "",
+            "narrative_language": narrative_language or "en"}
 
 
 def _govern_candidate(child, query, proposal, confidence, note, gate,
@@ -410,7 +411,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                       synthesis=None, llm_config=None,
                       audit_writer=None, audit_receipts=None,
                       audit_guard_error="", event_sink=None,
-                      should_cancel=None):
+                      should_cancel=None, audit_language="en"):
     """Govern one candidate: approval, guard re-check, revalidation."""
     from src.living_authenticity.knowledge.governance.audit.clock import (
         local_now_iso,
@@ -468,12 +469,33 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
         child, query, proposal, confidence, unit_result, llm_result)
     import uuid as _uuid
     record_id = "rec-" + _uuid.uuid4().hex[:12]
+    human_state = "approved" if outcome.approved else "rejected"
     base_trace = _trace_for_audit(
         query=query, unit_result=unit_result, llm_result=llm_result,
         prompt_sha256=prompt_sha256, synthesis=synthesis,
         llm_config=llm_config, operating_mode=operating_mode,
         run_id=run_id, record_id=record_id,
-        human_review_state=("approved" if outcome.approved else "rejected"))
+        human_review_state=human_state,
+        narrative_language=audit_language)
+    if should_cancel is not None and should_cancel():
+        _emit("stopped", "cancellation", "run cancelled during approval")
+        audits.append(build_audit_record(
+            request, outcome, None, None, proposal, trace={
+                **base_trace, "outcome": "cancelled",
+                "validation_result": "cancelled",
+                "stop_reason": "run cancelled during approval",
+            }))
+        entries.append(IntegrationUnitEntry(
+            source_file=str(child), query_unit_id=query.id,
+            query_source=query.source, query_position=query.position,
+            proposal_hash=request.proposal_hash,
+            proposal_action=proposal.action,
+            approval_approved=bool(outcome.approved),
+            outcome="cancelled",
+            reason="run cancelled during approval",
+            note_markdown=note.markdown, **display,
+        ))
+        return
     if not live_ok:
         _emit("stopped", "staging_guard", live_reason)
         audits.append(build_audit_record(request, outcome, None, None,
@@ -584,7 +606,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     if execution.executed and execution.artifact_path:
         full_artifact_path = str(
             Path(pinned_staging) / execution.artifact_path)
-    audits.append(record_audit_for_execution(
+    post_record = record_audit_for_execution(
         request, outcome, revalidation, execution, proposal, trace={
             **base_trace,
             "audit_phase": "post_execution",
@@ -595,9 +617,77 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             "execution_timestamp": exec_ts if execution.executed else "",
             "artifact_created_at": exec_ts if execution.executed else "",
             "artifact_path": full_artifact_path,
-        }))
+        })
+    audits.append(post_record)
+    post_receipt = None
+    if audit_writer is not None:
+        from src.living_authenticity.knowledge.governance.audit.persistence import (
+            persist_record_resilient,
+        )
+        post_receipt = persist_record_resilient(
+            audit_writer, post_record, receipts=audit_receipts, history=audits
+        )
+    reason_msg = ""
+    target_p = ""
+    is_q = False
+    is_partial = False
     if execution.executed:
-        state = "executed"
+        if post_receipt and not post_receipt.get("persisted"):
+            from src.living_authenticity.knowledge.governance.execution.executor import (
+                quarantine_artifact,
+            )
+            import dataclasses
+            from src.living_authenticity.knowledge.governance.audit.narrative import (
+                generate_lifecycle_narrative,
+            )
+
+            q_res = quarantine_artifact(pinned_staging, execution.artifact_path)
+            post_receipt["artifact_path"] = execution.artifact_path
+            is_q = bool(getattr(q_res, "success", False) or (isinstance(q_res, str) and q_res and getattr(q_res, "status", "") != "partial_cleanup_failed"))
+            is_partial = getattr(q_res, "status", "") == "partial_cleanup_failed"
+            q_path = str(q_res) if is_q else ""
+            target_p = getattr(q_res, "target_path", "") or q_path
+
+            post_receipt["quarantined"] = is_q
+            post_receipt["quarantine_path"] = target_p if (is_q or is_partial) else ""
+            post_receipt["quarantine_status"] = getattr(q_res, "status", "quarantined" if is_q else "quarantine_failed")
+            if is_partial:
+                post_receipt["source_removed"] = False
+
+            state = "audit_persistence_failed"
+            if is_q:
+                reason_msg = "audit persistence failed: artifact quarantined"
+                emit_msg = "audit persistence failed after execution; artifact quarantined"
+            elif is_partial:
+                reason_msg = "audit persistence failure: partial quarantine"
+                emit_msg = "audit persistence failed after execution; partial quarantine (source cleanup failed)"
+            else:
+                reason_msg = "audit persistence failed; quarantine failed"
+                emit_msg = "audit persistence failed after execution; quarantine failed"
+
+            _emit("stopped", "audit_persistence", emit_msg)
+            # Update the in-memory audit record to keep artifact reference and narrative truthful
+            final_ref = target_p if is_q else execution.artifact_path
+            updated_record = dataclasses.replace(
+                post_record,
+                terminal_outcome="audit_persistence_failed",
+                artifact_reference=final_ref,
+                artifact_path=execution.artifact_path,
+                destination=target_p if (is_q or is_partial) else getattr(post_record, "destination", ""),
+                execution_reason=reason_msg,
+            )
+            updated_narrative = generate_lifecycle_narrative(
+                updated_record,
+                language=getattr(post_record, "narrative_language", "en") or "en",
+            )
+            final_record = dataclasses.replace(updated_record, narrative=updated_narrative)
+            audits[-1] = final_record
+        elif post_receipt and post_receipt.get("emergency"):
+            state = "executed"
+            _emit("warning", "audit_persistence",
+                  "audit recorded in emergency journal")
+        else:
+            state = "executed"
     elif (execution.failed_check == "destination"
             and "no overwrite" in (execution.reason or "")):
         state = "rejected_existing_artifact"
@@ -613,8 +703,17 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
         execution_attempted=bool(execution.attempted),
         execution_permitted=bool(execution.permitted),
         execution_executed=bool(execution.executed),
-        outcome=state, reason=execution.reason,
-        artifact_reference=execution.artifact_path,
+        outcome=state,
+        reason=(
+            reason_msg
+            if state == "audit_persistence_failed"
+            else execution.reason
+        ),
+        artifact_reference=str(
+            (target_p if (is_q or is_partial) else "")
+            if state == "audit_persistence_failed"
+            else execution.artifact_path
+        ) or "",
         note_markdown=note.markdown, **display,
     ))
     if details is not None:
@@ -647,7 +746,8 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                  generator=None, details=None, vault_context=None,
                  operating_mode="", run_id="", audit_writer=None,
                  audit_receipts=None, audit_guard_error="",
-                 event_sink=None, should_cancel=None):
+                 event_sink=None, should_cancel=None,
+                 audit_language="en"):
     """Govern one unit through the mandatory AI synthesis step.
 
     The mandatory synthesis step always runs: synthesis produces 1..N candidates
@@ -714,7 +814,8 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                 record_id=_record_id,
                 human_review_state="not_requested",
                 stop_reason=reason,
-                validation_result="llm_safe_stop")
+                validation_result="llm_safe_stop",
+                narrative_language=audit_language)
             _request = _Request(proposal_hash="",
                                 query_unit_id=query.id,
                                 query_source=query.source,
@@ -785,7 +886,8 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                     human_review_state="acknowledged_non_executable",
                     stop_reason="candidate proposal action is not CREATE",
                     validation_result="held_non_executable",
-                    proposal=proposal)
+                    proposal=proposal,
+                    narrative_language=audit_language)
                 _held_request = _HeldRequest(
                     proposal_hash="", query_unit_id=query.id,
                     query_source=query.source,
@@ -831,5 +933,6 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
             audit_receipts=audit_receipts,
             audit_guard_error=audit_guard_error,
             event_sink=event_sink, should_cancel=should_cancel,
+            audit_language=audit_language,
         )
 

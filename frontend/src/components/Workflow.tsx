@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../state/store";
 import { translate } from "../i18n/resources";
-import { deriveWorkflow, isTerminalSuccess } from "./workflowStages";
+import { deriveWorkflow, isTerminalSuccess, deriveActiveRetrievalSubstep, deriveRetrievalSubsteps } from "./workflowStages";
 
-function eventLine(kind: string, stage: string, message: string): string {
-  const where = stage ? ` [${stage}]` : "";
+function eventLine(kind: string, stage: string, message: string, operation?: string): string {
+  const where = stage ? (operation ? ` [${stage}:${operation}]` : ` [${stage}]`) : "";
   return `${where} ${message || kind}`.trim();
 }
 
@@ -15,6 +15,7 @@ export function CurrentAudit() {
   const [enlarged, setEnlarged] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const events = state.runEvents;
+  const activeSubstep = deriveActiveRetrievalSubstep(events, state.run.run_id, Boolean(state.run.stopped));
 
   const runActive =
     liveAvailable &&
@@ -46,6 +47,15 @@ export function CurrentAudit() {
           <span className="pulsing-radar" aria-hidden="true" />
           <h2>{t("ui.current.title")}</h2>
           <span className="badge ok">{state.run.current_stage || "active"}</span>
+          {state.run.current_stage === "retrieval" && activeSubstep && (
+            <span
+              className={`badge info ${activeSubstep.isRunning ? "running" : activeSubstep.phase === "completed" ? "completed" : "unknown"}`}
+              data-phase={activeSubstep.phase}
+            >
+              {activeSubstep.isRunning ? "▶ " : activeSubstep.phase === "completed" ? "✓ " : "• "}
+              {activeSubstep.operation.replace(/_/g, " ")} {activeSubstep.isRunning ? "(running)" : activeSubstep.phase === "completed" ? "(completed)" : `(${activeSubstep.phase})`}
+            </span>
+          )}
         </div>
         <div className="head-controls">
           {runActive && (
@@ -89,7 +99,7 @@ export function CurrentAudit() {
           {events.map((e, i) => (
             <div key={i} className={`ev ev-${e.kind}`}>
               <span className="ev-time">{e.timestamp ? e.timestamp.slice(11, 19) : ""}</span>
-              <span className="ev-body">{eventLine(e.kind, e.stage, e.message)}</span>
+              <span className="ev-body">{eventLine(e.kind, e.stage, e.message, e.operation)}</span>
             </div>
           ))}
           {state.run.stop_reason && (
@@ -109,6 +119,12 @@ export function Workflow() {
   const stages = deriveWorkflow(state.run, state.runEvents);
   const success = isTerminalSuccess(state.runEvents);
   const isRejected = state.run.stopped || state.run.review_state === "live_rejected" || state.run.review_state === "mock_rejected";
+  const retrievalStage = stages.find((s) => s.key === "retrieval");
+  const retrievalSubsteps = deriveRetrievalSubsteps(
+    retrievalStage?.state ?? "pending",
+    state.runEvents,
+    state.run.run_id,
+  );
 
   return (
     <section aria-label={t("ui.workflow.title")} className="panel workflow-panel">
@@ -120,24 +136,49 @@ export function Workflow() {
           className="timeline"
           data-terminal={success ? "success" : isRejected ? "rejected" : undefined}
         >
-          {stages.map((s) => (
-            <li
-              key={s.key}
-              data-state={s.state}
-              aria-label={`${s.label}: ${t(
-                (s.state === "completed"
-                  ? "ui.stage.completed"
-                  : s.state === "current"
-                    ? "ui.stage.current"
-                    : s.state === "stopped"
-                      ? "ui.stage.stopped"
-                      : "ui.stage.pending") as Parameters<typeof translate>[1]
-              )}`}
-            >
-              <span className="node" aria-hidden="true" />
-              <span className="grp">{s.label}</span>
-            </li>
-          ))}
+          {stages.map((s) => {
+            const showRetrievalSubsteps =
+              s.key === "retrieval" &&
+              (s.state === "current" ||
+               s.state === "stopped" ||
+               retrievalSubsteps.some((sub) => sub.state !== "pending"));
+            return (
+              <li
+                key={s.key}
+                data-state={s.state}
+                className={showRetrievalSubsteps ? "has-substeps" : undefined}
+                aria-label={`${s.label}: ${t(
+                  (s.state === "completed"
+                    ? "ui.stage.completed"
+                    : s.state === "current"
+                      ? "ui.stage.current"
+                      : s.state === "stopped"
+                        ? "ui.stage.stopped"
+                        : "ui.stage.pending") as Parameters<typeof translate>[1]
+                )}`}
+              >
+                <span className="node" aria-hidden="true" />
+                <div className="timeline-content">
+                  <span className="grp">{s.label}</span>
+                  {showRetrievalSubsteps && (
+                    <ol className="timeline-substeps" aria-label="Retrieval Substeps">
+                      {retrievalSubsteps.map((sub) => (
+                        <li
+                          key={sub.key}
+                          className={`substep-pill substep-${sub.state}`}
+                          data-substep={sub.key}
+                          data-state={sub.state}
+                        >
+                          <span className="substep-dot" aria-hidden="true" />
+                          <span className="substep-label">{sub.label}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              </li>
+            );
+          })}
         </ol>
       </div>
     </section>

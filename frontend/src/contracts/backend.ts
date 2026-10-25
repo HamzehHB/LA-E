@@ -158,8 +158,14 @@ export interface IntegrationRunReportDto {
   requires_human_review: true;
 }
 
-/** @category backend-dto — audit storage partition (persistence.py: passed|failed) */
-export type AuditStorageCategory = "passed" | "failed";
+/** @category backend-dto — audit storage partition (persistence.py: passed|failed|errors) */
+export type AuditStorageCategory =
+  | "passed"
+  | "failed"
+  | "errors"
+  | "staging_unreconciled"
+  | "staging_unlinked"
+  | "audit_pending";
 
 /**
  * @category backend-dto — §5 audit-root routing (mirrors persistence.py).

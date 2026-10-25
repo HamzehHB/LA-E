@@ -4,6 +4,7 @@ import type {
   FolderPurpose,
   PendingSyncApprovalInfo,
   RunEvent,
+  TranslateResponse,
   VaultChangeDiff,
   VaultSyncStatusResponse,
 } from "../contracts/transport";
@@ -101,7 +102,13 @@ interface Store {
   liveAccept: () => Promise<void>;
   liveFix: (inputText?: string) => Promise<void>;
   liveStop: () => Promise<void>;
-  liveTranslate: (text: string, target_lang?: "en" | "fa") => Promise<string>;
+  liveTranslate: (
+    text: string,
+    target_lang?: "en" | "fa",
+    source_lang?: string,
+    source_kind?: string,
+    source_id?: string,
+  ) => Promise<TranslateResponse>;
   liveIndexVault: () => Promise<{ indexed: boolean; reason?: string }>;
   liveAuthorizeVaultSync: (vaultRoot?: string) => Promise<{ indexed: boolean; reason?: string; vault_id?: string; status?: string }>;
   liveRevokeVaultSync: () => Promise<{ authorized: boolean; status: string }>;
@@ -132,7 +139,8 @@ interface Store {
   pendingSyncApproval: PendingSyncApprovalInfo | null;
 }
 
-const Ctx = createContext<Store | null>(null);
+export const StoreContext = createContext<Store | null>(null);
+const Ctx = StoreContext;
 
 const THEME_KEY = "lae-theme";
 const WELCOME_KEY = "lae-welcomed";
@@ -400,11 +408,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             : "journal.stagingNotCreated",
           runId: a.run_id || undefined,
           proposalHash: a.proposal_hash || undefined,
+          proposal_hash: a.proposal_hash || undefined,
+          record_id: a.record_id,
           artifactReference: a.artifact_reference || undefined,
           digest: a.digest,
           title: a.title,
           summary: a.summary,
           staging_available: a.staging_available,
+          narrative: a.narrative,
+          narrative_language: a.narrative_language,
+          emergency: a.emergency,
         })),
         recentStaging: data.staging.map((r) => ({
           id: r.record_id,
@@ -420,10 +433,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           stagingNoteKey: null,
           runId: r.run_id || undefined,
           proposalHash: r.proposal_hash || undefined,
+          proposal_hash: r.proposal_hash || undefined,
+          record_id: r.record_id,
           artifactReference: r.artifact_reference || undefined,
           title: r.title,
           excerpt: r.excerpt,
           staging_available: r.staging_available,
+          emergency: r.emergency,
         })),
       }));
     } catch {
@@ -873,16 +889,44 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setLiveError((e as Error)?.message ?? "backend_error");
         }
       },
-      liveTranslate: async (text, target_lang) => {
-        if (!live.available) return text;
+      liveTranslate: async (text, target_lang, source_lang, source_kind, source_id) => {
+        const fallbackTarget = target_lang ?? (state.appLanguage === "fa" ? "fa" : "en");
+        if (!live.available) {
+          return {
+            translated_text: text,
+            target_lang: fallbackTarget,
+            target_language: fallbackTarget,
+            source_language: source_lang,
+            source_text: text,
+            source_kind: source_kind ?? "dynamic_text",
+            source_id: source_id ?? "",
+            status: "unavailable",
+            translator: "disconnected",
+            persisted: false,
+          };
+        }
         try {
           const res = await live.translate({
             text,
-            target_lang: target_lang ?? (state.appLanguage === "fa" ? "fa" : "en"),
+            target_lang: fallbackTarget,
+            source_lang,
+            source_kind: source_kind ?? "dynamic_text",
+            source_id: source_id ?? "",
           });
-          return res.translated_text || text;
+          return res;
         } catch {
-          return text;
+          return {
+            translated_text: text,
+            target_lang: fallbackTarget,
+            target_language: fallbackTarget,
+            source_language: source_lang,
+            source_text: text,
+            source_kind: source_kind ?? "dynamic_text",
+            source_id: source_id ?? "",
+            status: "unavailable",
+            translator: "error",
+            persisted: false,
+          };
         }
       },
       liveIndexVault: async () => {

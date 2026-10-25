@@ -6,12 +6,15 @@ It never approves, authorizes, executes, or mutates knowledge.
 """
 from .outcome import AuditRecord, build_audit_record, record_audit_for_execution
 from .clock import local_now_iso
-from .persistence import (AUDIT_LOG_FILENAME, ERRORS_SUBDIR, FAILED_SUBDIR,
+from .persistence import (AUDIT_LOG_FILENAME, EMERGENCY_LOG_FILENAME, ERRORS_SUBDIR, FAILED_SUBDIR,
                            PASSED_SUBDIR, AuditWriter, audit_storage_category,
-                           persist_record, record_digest, record_to_dict)
+                           persist_record, persist_record_resilient,
+                           record_digest, record_to_dict)
+from .narrative import generate_lifecycle_narrative, build_narrative_translation_record
 
 __all__ = ("AUDIT_LOG_FILENAME", "AuditRecord", "AuditWriter",
-           "ERRORS_SUBDIR", "FAILED_SUBDIR", "PASSED_SUBDIR",
+           "EMERGENCY_LOG_FILENAME", "ERRORS_SUBDIR", "FAILED_SUBDIR", "PASSED_SUBDIR",
            "audit_storage_category", "build_audit_record", "local_now_iso",
-           "persist_record", "record_audit_for_execution", "record_digest",
-           "record_to_dict")
+           "persist_record", "persist_record_resilient",
+           "record_audit_for_execution", "record_digest", "record_to_dict",
+           "generate_lifecycle_narrative", "build_narrative_translation_record")

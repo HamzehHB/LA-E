@@ -8,6 +8,8 @@ supplied contracts.
 """
 from dataclasses import dataclass, field
 
+from .clock import local_now_iso
+
 
 @dataclass(frozen=True)
 class AuditRecord:
@@ -84,6 +86,8 @@ class AuditRecord:
     is_authoritative: bool = False
     requires_human_review: bool = True
     input_hash_source: str = ""
+    narrative: str = ""
+    narrative_language: str = "en"
 
     def __post_init__(self) -> None:
         from .clock import local_now_iso
@@ -230,6 +234,42 @@ def build_audit_record(request, outcome, revalidation=None, execution=None,
             default_errors = (revalidation.reason,) if revalidation.reason else ()
         elif _text("stop_reason"):
             default_errors = (_text("stop_reason"),)
+
+    narr_lang = _text("narrative_language") or "en"
+    narrative_text = _text("narrative")
+
+    if not narrative_text:
+        try:
+            from .clock import local_now_iso
+            from .narrative import NarrativeContext, generate_lifecycle_narrative
+
+            ctx = NarrativeContext(
+                record_id=_text("record_id"),
+                run_id=_text("run_id"),
+                query_unit_id=request.query_unit_id,
+                query_source=request.query_source,
+                query_position=request.query_position,
+                proposal_action=request.proposal_action,
+                proposal_hash=request.proposal_hash,
+                terminal_outcome=_text("outcome") or _text("validation_result"),
+                approval_approved=bool(outcome.approved),
+                revalidation_valid=bool(revalidation.valid) if revalidation is not None else False,
+                revalidation_reason=revalidation.reason if revalidation is not None else "",
+                execution_executed=bool(execution.executed) if execution is not None else False,
+                execution_reason=execution.reason if execution is not None else "",
+                artifact_path=_text("artifact_path"),
+                artifact_reference=execution.artifact_path if execution is not None else "",
+                artifact_sha256=_text("artifact_sha256"),
+                retrieval_strategy=_text("retrieval_strategy"),
+                retrieval_candidates=retrieval_candidates,
+                retrieval_note=_text("retrieval_note"),
+                timestamp=_text("timestamp") or local_now_iso(),
+                narrative_language=narr_lang,
+            )
+            narrative_text = generate_lifecycle_narrative(ctx, language=narr_lang)
+        except Exception:
+            narrative_text = ""
+
     return AuditRecord(
         record_id=_text("record_id"),
         run_id=_text("run_id"),
@@ -292,6 +332,8 @@ def build_audit_record(request, outcome, revalidation=None, execution=None,
         warnings=_str_tuple("warnings"),
         core_relevance=_text("core_relevance"),
         core_basis=_text("core_basis"),
+        narrative=narrative_text,
+        narrative_language=narr_lang,
     )
 
 

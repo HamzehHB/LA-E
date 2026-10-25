@@ -253,12 +253,14 @@ def test_audit_never_claims_success_after_failed_execution(tmp_path, monkeypatch
     """Interrupted execution: no false success in the result, no false
     success in the audit record, approval fact neither invented nor
     erased, and the true revalidation state preserved."""
+    import os
     request, outcome, prop, conf, note, revalidation = _chain()
 
-    def _boom(self, *args, **kwargs):
+    def _boom(*args, **kwargs):
         raise OSError("simulated staging write failure")
 
     monkeypatch.setattr(pathlib.Path, "write_text", _boom)
+    monkeypatch.setattr(os, "write", _boom)
     execution = execute_create(request, outcome, prop, conf, note, tmp_path)
     monkeypatch.undo()
     assert execution.executed is False

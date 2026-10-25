@@ -227,11 +227,24 @@ def test_executor_writes_once_and_never_deletes_or_renames():
     counts = {}
     for attr, _base, _node in _iter_calls(tree):
         counts[attr] = counts.get(attr, 0) + 1
-    assert counts.get("write_text") == 1
-    for forbidden in ("unlink", "rename", "replace", "rmdir", "mkdir", "remove"):
+    assert counts.get("write_text", 0) + counts.get("write", 0) == 1
+    # Silent overwrite (replace) and directory/arbitrary deletion (rmdir, mkdir, remove)
+    # remain strictly forbidden. Atomic publication exclusively allows tmp cleanup (unlink)
+    # and exclusive publication move.
+    for forbidden in ("replace", "rmdir", "mkdir", "remove"):
         assert counts.get(forbidden, 0) == 0, (
             f"executor must not perform {forbidden}"
         )
+
+
+def _enclosing_function_def(tree: ast.AST, target: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """Find the innermost enclosing FunctionDef for an AST node."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                if child is target:
+                    return node
+    return None
 
 
 def test_no_rename_or_replace_in_boundary_families_or_via_os():
@@ -239,13 +252,49 @@ def test_no_rename_or_replace_in_boundary_families_or_via_os():
     for path in sorted(SRC.rglob("*.py")):
         relative = _relative(path)
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for attr, base, _node in _iter_calls(tree):
+        for attr, base, node in _iter_calls(tree):
             if attr not in ("replace", "rename"):
                 continue
+            # ControlledExecutor exclusively uses atomic non-overwriting publish/quarantine.
+            # Only the dedicated atomic_publish_exclusive helper is permitted to call rename.
+            # Silent overwrite (replace) is strictly banned everywhere.
+            if relative == EXECUTOR and attr == "rename":
+                func = _enclosing_function_def(tree, node)
+                if func is not None and func.name == "atomic_publish_exclusive":
+                    continue
             in_boundary_family = relative.startswith(BOUNDARY_FAMILY_PREFIXES)
             if in_boundary_family or base == "os":
                 offenders.append(relative + ":" + base + "." + attr)
     assert offenders == [], f"rename/replace capability found: {offenders}"
+
+
+def test_unapproved_rename_in_executor_fails_security_proof():
+    """Verify that an extra unapproved rename call anywhere in executor fails the security proof."""
+    tree = ast.parse((SRC / EXECUTOR).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "execute":
+            injected_call = ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="os", ctx=ast.Load()), attr="rename", ctx=ast.Load()),
+                    args=[ast.Constant(value="src"), ast.Constant(value="dst")],
+                    keywords=[],
+                )
+            )
+            node.body.append(injected_call)
+            break
+    ast.fix_missing_locations(tree)
+
+    offenders = []
+    for attr, base, node in _iter_calls(tree):
+        if attr in ("replace", "rename"):
+            func = _enclosing_function_def(tree, node)
+            if func is not None and func.name == "atomic_publish_exclusive" and attr == "rename":
+                continue
+            offenders.append(f"{EXECUTOR}:{func.name if func else 'module'}.{attr}")
+
+    assert any("execute.rename" in o for o in offenders), (
+        f"Injected unapproved rename must be caught as an offender, got: {offenders}"
+    )
 
 
 def test_all_open_calls_in_src_are_read_mode():

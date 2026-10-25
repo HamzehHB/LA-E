@@ -15,9 +15,10 @@ class RetrievalResult:
     """Evidence-only retrieval outcome for one query knowledge unit.
 
     ``query_terms`` preserves the normalized query tokens so later stages can
-    see exactly what was searched for. ``corpus_size`` is the number of corpus
-    units examined. ``note`` records relevant limitations or uncertainty, for
-    example when the query has no analyzable content or nothing matched.
+    see exactly what was searched for. ``corpus_size`` is the number of collection
+    items examined (or None if the collection size could not be determined).
+    ``note`` records relevant limitations or uncertainty, for example when the query
+    has no analyzable content, nothing matched, or corpus size is unknown.
     """
 
     query_unit_id: str
@@ -25,7 +26,7 @@ class RetrievalResult:
     query_position: int
     strategy: str = ""
     candidates: tuple[RetrievedCandidate, ...] = ()
-    corpus_size: int = 0
+    corpus_size: int | None = None
     query_terms: tuple[str, ...] = ()
     note: str = ""
     metadata: dict = field(default_factory=dict)

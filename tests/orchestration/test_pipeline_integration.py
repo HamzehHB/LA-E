@@ -130,3 +130,24 @@ def test_entry_point_reaches_integrated_pipeline():
     assert pipeline.stage_order.index("retrieval") < pipeline.stage_order.index("classification")
     assert pipeline.ingestion.classifier is None
 
+
+def test_retriever_internal_type_error_not_retried_or_masked():
+    """When a retriever accepts observer but raises TypeError internally,
+    the error must NOT be masked and retrieve must NOT be called twice.
+    """
+    import pytest
+
+    call_count = 0
+
+    class BuggyRetriever:
+        def retrieve(self, query, corpus=(), observer=None):
+            nonlocal call_count
+            call_count += 1
+            raise TypeError("internal bug inside retriever: unsupported operand type(s)")
+
+    pipe = EvidenceFirstPipeline(retriever=BuggyRetriever())
+    with pytest.raises(TypeError) as excinfo:
+        pipe.run_unit(_unit(), corpus=[_other()])
+
+    assert "internal bug inside retriever" in str(excinfo.value)
+    assert call_count == 1

@@ -216,6 +216,11 @@ registry branch — never by editing the shared interface.
 
 4. Set `audit.root` to the single directory that receives persistent
    audit records (append-only traceability, one JSON line per record).
+   Primary persistence uses buffered stream writes (`durability="written"`).
+   When primary persistence fails, resilient persistence recovers the complete
+   run history into emergency journals (`errors/audit_emergency.jsonl`) with
+   hardware synchronization (`durability="confirmed"` via `os.fsync`), while
+   leaving previously persisted primary records intact.
    It is part of the guarded-root family: it must resolve outside the
    repository and must not overlap the vault, staging, or vector
    database roots. When configured, the audit writer may create the
@@ -443,19 +448,22 @@ page explains that the frontend must be built first.
 Transport surface (JSON + SSE, token header on every non-health route):
 - `GET /api/health`: Discovery and instance check.
 - `GET /api/state`: Snapshot configuration, folder validity, active models, and paused runs.
-- `GET /api/journals`: 1:1 paired recent audits and staging records (excluding `errors/`).
-- `GET /api/events`: SSE stream for sanitized operational run events, numeric confidence scores, and stage states.
+- `GET /api/journals`: 1:1 paired recent audits and staging records (including `passed/`, `failed/`, `errors/audit.jsonl`, and emergency recovery journals `errors/audit_emergency.jsonl`, with quarantine reporting for unreconciled staging artifacts).
+- `GET /api/events`: SSE stream for sanitized operational run events (with discrete stage progression and truthful retrieval substep operations: `query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording` across `started`, `completed`, and `failed` phases), numeric confidence scores, and stage states.
 - `POST /api/config`: Persist paths, LLM settings, and localization to `Config/*.local.yaml`.
 - `POST /api/folders/pick`: Open native OS folder dialog server-side with guard validation.
 - `POST /api/folders/reveal`: Safe file listing of configured directories.
 - `POST /api/vault/index`: Execute initial vault vector baseline indexing via BGE-M3 and LanceDB.
+- `POST /api/vault/sync/authorize`: Authorize persistent vector index synchronization for configured Obsidian Vault.
+- `POST /api/vault/sync/reconcile`: Reconcile and re-index added/modified/removed notes in the dedicated store.
+- `POST /api/vault/sync/revoke`: Revoke authorization for Vault indexing.
 - `POST /api/run`: Submit query input for processing through the 10 backend stages.
 - `POST /api/approve`: Submit explicit human approval or rejection for CREATE proposals.
 - `POST /api/proposal/edit`: Server-side authoritative edit of pending proposal with hash recomputation.
 - `POST /api/run/accept`: Human acknowledgment for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`).
 - `POST /api/run/fix`: Error recovery / paused run resumption with corrected input/parameters.
 - `POST /api/run/stop`: Cleanly terminate a paused or safe-stopped run.
-- `POST /api/translate`: Live bilingual translation (English ↔ Persian) via LLM or deterministic table.
+- `POST /api/translate`: Live bilingual translation (English ↔ Persian) returning structured `TranslationRecord` (`persisted: false`).
 - `POST /api/consent`: Record explicit user consent for cloud provider interactions.
 
 Without a launcher token (for example plain `npm run dev`), the UI stays in fixture/demo mode and performs no backend calls. Run the launcher with:

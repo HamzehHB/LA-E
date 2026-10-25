@@ -65,6 +65,16 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class ApprovalState(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+    RECONCILING = "reconciling"
+    TERMINAL = "terminal"
+
+
 class _Pending:
     """One pending human decision (approval or consent), run-bound."""
 
@@ -79,29 +89,38 @@ class _Pending:
         self.proposal = proposal
         self.note = note
         self.confidence = confidence
+        self.state = ApprovalState.PENDING
+        self._lock = threading.Lock()
         self._event = threading.Event()
         self._result = None
 
     def resolve(self, value) -> bool:
-        if self._event.is_set():
-            return False
-        self._result = value
-        self._event.set()
-        return True
+        with self._lock:
+            if self.state != ApprovalState.PENDING:
+                return False
+            val_str = str(value).lower()
+            if val_str == "approve":
+                self.state = ApprovalState.APPROVED
+                self._result = "approve"
+            elif val_str == "reject":
+                self.state = ApprovalState.REJECTED
+                self._result = "reject"
+            elif val_str == "cancelled":
+                self.state = ApprovalState.CANCELLED
+                self._result = "cancelled"
+            else:
+                self._result = value
+            self._event.set()
+            return True
 
     def wait(self, timeout: float):
         if not self._event.wait(timeout):
-            return None
+            with self._lock:
+                if self.state == ApprovalState.PENDING:
+                    self.state = ApprovalState.TIMED_OUT
+                    self._result = "timeout"
+                    self._event.set()
         return self._result
-
-
-class ApprovalState(str, Enum):
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    CANCELLED = "cancelled"
-    RECONCILING = "reconciling"
-    TERMINAL = "terminal"
 
 
 class _PendingSyncApproval:
@@ -208,6 +227,11 @@ class _PublishingGate:
                 raw = read()
             except Exception:
                 raw = ""
+            if raw == "cancel" or (bool(self._launcher._active_run_id) and self._launcher._active_run_id in self._launcher._cancel_flags):
+                outcome = self._inner.decide(request, "n")
+                self.last_active_proposal = proposal
+                self.last_active_note = note
+                return (request, text, outcome)
             # A pending edit supersedes this request: adopt the edited
             # proposal/note and loop to re-request approval of the new hash.
             edited = self._launcher.consume_pending_edit(
@@ -414,6 +438,13 @@ class Launcher:
         decision = pending.wait(APPROVAL_TIMEOUT_SECONDS)
         with self._lock:
             self._pending_approval = None
+            cancelled = (
+                getattr(pending, "state", None) == ApprovalState.CANCELLED
+                or decision == "cancelled"
+                or (bool(self._active_run_id) and self._active_run_id in self._cancel_flags)
+            )
+        if cancelled:
+            return "cancel"
         if decision in ("approve", "reject"):
             return "y" if decision == "approve" else "n"
         return ""
@@ -424,18 +455,22 @@ class Launcher:
             raise AdapterError("validation_error",
                                "decision must be approve or reject")
         with self._lock:
+            if bool(self._active_run_id) and self._active_run_id in self._cancel_flags:
+                raise AdapterError("conflict", "run has been cancelled")
             pending = self._pending_approval
             if pending is None or pending.key != proposal_hash:
                 raise AdapterError(
                     "validation_error",
                     "no pending approval for this proposal hash")
+            if getattr(pending, "state", None) == ApprovalState.CANCELLED:
+                raise AdapterError("conflict", "approval request was cancelled")
             if (pending.payload.get("query_unit_id")
                     != (query_unit_id or "")):
                 raise AdapterError(
                     "validation_error",
                     "approval does not match the pending request")
             if not pending.resolve(decision):
-                raise AdapterError("validation_error",
+                raise AdapterError("conflict" if getattr(pending, "state", None) in (ApprovalState.CANCELLED, ApprovalState.TIMED_OUT) else "validation_error",
                                    "approval already answered")
         self._sink({"kind": "approval_decided", "stage": "human_review",
                     "message": decision, "proposal_hash": proposal_hash})
@@ -861,6 +896,9 @@ class Launcher:
                         "message": "run paused on error: " + (str(exc) or type(exc).__name__)})
         finally:
             with self._lock:
+                if self._pending_approval and getattr(self._pending_approval, "run_id", "") == run_id:
+                    self._pending_approval.resolve("cancelled")
+                    self._pending_approval = None
                 if self._pending_vault_sync and self._pending_vault_sync.run_id == run_id:
                     self._pending_vault_sync.retire()
                     self._pending_vault_sync = None
@@ -886,6 +924,8 @@ class Launcher:
                 raise AdapterError(
                     "validation_error", "unknown or inactive run_id")
             self._cancel_flags.add(run_id)
+            if self._pending_approval and getattr(self._pending_approval, "run_id", "") == run_id:
+                self._pending_approval.resolve("cancelled")
             if self._pending_vault_sync and self._pending_vault_sync.run_id == run_id:
                 self._pending_vault_sync.resolve("cancelled")
         self._sink({"kind": "status", "stage": "cancellation",
@@ -1698,7 +1738,9 @@ class Launcher:
         Read-only: scans nothing the user did not configure; correlation
         uses record/artifact identifiers, never filenames or positions.
         1:1 paired slots:
-        - Excludes 'errors/'
+        - Reads passed/ and failed/ partitions, plus emergency audit records
+          specifically from errors/audit_emergency.jsonl (unrelated internal
+          error logs remain strictly excluded)
         - Computes digests and newspaper summary
         - Each audit slot is paired with a staging slot (or 'Unavailable' if missing/rejected)
         """
@@ -1706,6 +1748,8 @@ class Launcher:
             resolve_authorized_audit_root,
             resolve_authorized_staging_root,
         )
+        from src.living_authenticity.security.path_boundary import PathBoundary
+
 
         paths = self.paths()
         session_audit = self.session_destination("audit")
@@ -1718,9 +1762,27 @@ class Launcher:
                         resolve_authorized_staging_root(paths))
         audit_items = []
         if audit_root:
-            for category in ("passed", "failed"):
-                log = Path(audit_root) / category / "audit.jsonl"
-                audit_items.extend(self._read_audit_log(log, category))
+            try:
+                boundary = PathBoundary(audit_root)
+            except Exception:
+                boundary = None
+
+            if boundary is not None:
+                for category in ("passed", "failed", "errors"):
+                    log = Path(audit_root) / category / "audit.jsonl"
+                    try:
+                        validated_log = boundary.validate(str(log))
+                    except Exception:
+                        continue
+                    audit_items.extend(self._read_audit_log(validated_log, category))
+
+                emergency_log = Path(audit_root) / "errors" / "audit_emergency.jsonl"
+                try:
+                    validated_emerg = boundary.validate(str(emergency_log))
+                except Exception:
+                    validated_emerg = None
+                if validated_emerg and validated_emerg.is_file():
+                    audit_items.extend(self._read_audit_log(validated_emerg, "errors", is_emergency=True))
 
         audit_items.sort(key=lambda i: i.get("timestamp", ""), reverse=True)
         try:
@@ -1732,19 +1794,33 @@ class Launcher:
         paired_audits = []
         paired_staging = []
 
+        staging_boundary = None
+        if staging_root:
+            try:
+                staging_boundary = PathBoundary(staging_root)
+            except Exception:
+                staging_boundary = None
+
         for item in selected_audits:
             reference = item.get("artifact_reference") or ""
             artifact_p = item.get("artifact_path") or (
                 str(Path(staging_root) / reference)
                 if reference and staging_root else "")
 
-            is_staged = bool(artifact_p and Path(artifact_p).is_file())
+            validated_artifact_p = None
+            if artifact_p and staging_boundary is not None:
+                try:
+                    validated_artifact_p = staging_boundary.validate(artifact_p)
+                except Exception:
+                    validated_artifact_p = None
+
+            is_staged = bool(validated_artifact_p and validated_artifact_p.is_file())
             staging_excerpt = ""
             staging_title = reference or "Unavailable"
 
-            if is_staged:
+            if is_staged and validated_artifact_p is not None:
                 try:
-                    with Path(artifact_p).open("r", encoding="utf-8") as f:
+                    with validated_artifact_p.open("r", encoding="utf-8") as f:
                         lines = [f.readline() for _ in range(10)]
                         staging_excerpt = "".join(lines).strip()[:300]
                 except OSError:
@@ -1756,7 +1832,13 @@ class Launcher:
 
             action = item.get("proposal_action") or "KNOWLEDGE_PROPOSAL"
             outcome = item.get("outcome") or item.get("storage_category") or "evaluated"
-            summary = f"Proposal action {action} reached terminal outcome: {outcome}."
+            is_emergency = bool(item.get("emergency", False))
+            if is_emergency:
+                summary = f"Emergency audit record: action {action} reached terminal outcome: {outcome}."
+                title = f"Emergency Audit: {action}"
+            else:
+                summary = f"Proposal action {action} reached terminal outcome: {outcome}."
+                title = f"Audit: {action}"
             raw_digest = item.get("record_digest") or hashlib.sha256(
                 json.dumps(item, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()
@@ -1765,8 +1847,9 @@ class Launcher:
             audit_slot.update({
                 "staging_available": is_staged,
                 "digest": raw_digest[:16],
-                "title": f"Audit: {action}",
+                "title": title,
                 "summary": summary,
+                "emergency": is_emergency,
             })
 
             staging_slot = {
@@ -1777,23 +1860,28 @@ class Launcher:
                 "storage_category": item.get("storage_category", ""),
                 "outcome": "staged" if is_staged else "unavailable",
                 "artifact_reference": reference if is_staged else "",
-                "artifact_path": artifact_p if is_staged else "",
+                "artifact_path": str(validated_artifact_p) if is_staged and validated_artifact_p else "",
                 "staging_available": is_staged,
                 "title": staging_title,
                 "excerpt": staging_excerpt,
+                "emergency": is_emergency,
             }
 
             paired_audits.append(audit_slot)
             paired_staging.append(staging_slot)
 
         # Check for unreconciled staging artifacts (e.g. terminal audit write failure)
-        if staging_root and Path(staging_root).is_dir():
+        if staging_root and staging_boundary is not None and Path(staging_root).is_dir():
             referenced = {item.get("artifact_reference") for item in selected_audits if item.get("artifact_reference")}
             try:
                 for sf in sorted(Path(staging_root).glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+                    try:
+                        sf_val = staging_boundary.validate(str(sf))
+                    except Exception:
+                        continue
                     if sf.name not in referenced:
                         try:
-                            with sf.open("r", encoding="utf-8") as h:
+                            with sf_val.open("r", encoding="utf-8") as h:
                                 lines = [h.readline() for _ in range(5)]
                                 orphan_excerpt = "".join(lines).strip()[:300]
                         except OSError:
@@ -1873,12 +1961,12 @@ class Launcher:
                 "staging": paired_staging}
 
     @staticmethod
-    def _read_audit_log(log_path, category):
+    def _read_audit_log(log_path, category, is_emergency=False):
         items = []
         if not Path(log_path).is_file():
             return items
         try:
-            with log_path.open("r", encoding="utf-8") as handle:
+            with Path(log_path).open("r", encoding="utf-8") as handle:
                 for line in handle:
                     line = line.strip()
                     if not line:
@@ -1895,13 +1983,16 @@ class Launcher:
                         "proposal_hash": str(record.get("proposal_hash", "")),
                         "timestamp": str(record.get("timestamp", "")),
                         "storage_category": category,
-                        "outcome": str(record.get("terminal_outcome", "")),
+                        "outcome": str(record.get("terminal_outcome", "") or record.get("outcome", "")),
                         "artifact_reference": str(
                             record.get("artifact_reference", "")),
                         "artifact_path": str(record.get("artifact_path", "")),
                         "staging_available": False,
                         "proposal_action": str(record.get("proposal_action", "")),
                         "record_digest": str(record.get("record_digest", "")),
+                        "narrative": str(record.get("narrative", "")),
+                        "narrative_language": str(record.get("narrative_language", "")),
+                        "emergency": bool(is_emergency or record.get("emergency", False)),
                     })
         except OSError:
             return items
@@ -2091,27 +2182,87 @@ class Launcher:
             "audit_language": self._audit_language,
         }}
 
-    def translate_text(self, text: str, target_lang: str = "en", source_lang: str = "") -> dict:
+    def translate_text(
+        self,
+        text: str,
+        target_lang: str = "en",
+        source_lang: str = "",
+        source_kind: str = "dynamic_text",
+        source_id: str = "",
+    ) -> dict:
         """Translate text between en and fa using LLM or deterministic fallback."""
+        import dataclasses
+        from src.living_authenticity.localization.config import normalize_language
+        from src.living_authenticity.localization.present import (
+            build_translation_record,
+            TranslationStatus,
+        )
+
+        from src.living_authenticity.localization.bidi_core import contains_persian
+
+        effective_target = normalize_language(
+            target_lang if target_lang in LANGUAGE_MODES else ("en" if self._app_language == "fa" else "fa")
+        )
+        if source_lang and source_lang in LANGUAGE_MODES:
+            effective_source = normalize_language(source_lang)
+        elif isinstance(text, str) and text.strip():
+            effective_source = "fa" if contains_persian(text) else "en"
+        else:
+            effective_source = "en"
+        kind = source_kind or "dynamic_text"
+        src_id = source_id or ""
+
         if not isinstance(text, str) or not text.strip():
-            return {"translated_text": "", "target_lang": target_lang}
-        if target_lang not in LANGUAGE_MODES:
-            target_lang = "en" if self._app_language == "fa" else "fa"
+            rec = build_translation_record(
+                source_kind=kind,
+                source_id=src_id,
+                source_text=text or "",
+                source_language=effective_source,
+                target_language=effective_target,
+                translated_text="",
+                translator="empty",
+                status=TranslationStatus.UNAVAILABLE,
+            )
+            d = dataclasses.asdict(rec)
+            d["target_lang"] = rec.target_language
+            d["persisted"] = False
+            d["source_text"] = text or ""
+            return d
+
+        if effective_source == effective_target:
+            rec = build_translation_record(
+                source_kind=kind,
+                source_id=src_id,
+                source_text=text,
+                source_language=effective_source,
+                target_language=effective_target,
+                translated_text=text,
+                translator="identity",
+                status=TranslationStatus.CURRENT,
+            )
+            d = dataclasses.asdict(rec)
+            d["target_lang"] = rec.target_language
+            d["persisted"] = False
+            d["source_text"] = text
+            return d
 
         translated = ""
+        translator_name = ""
         try:
             llm_cfg = self.llm_config()
             from src.living_authenticity.llm.registry import build_provider
             provider = build_provider(llm_cfg)
             prompt = (
                 f"You are a professional translator. Translate the following text into "
-                f"{'Persian (Farsi)' if target_lang == 'fa' else 'English'}.\n"
+                f"{'Persian (Farsi)' if effective_target == 'fa' else 'English'}.\n"
                 f"Provide ONLY the translation, without explanation or introductory text:\n\n"
                 f"{text}"
             )
             resp_text = provider.complete(prompt)
             if resp_text:
                 translated = resp_text.strip()
+                p_name = getattr(provider, "name", "llm-provider")
+                translator_name = f"llm-{p_name}"
         except Exception:
             translated = ""
 
@@ -2140,18 +2291,44 @@ class Launcher:
             }
             translations_fa_to_en = {v: k for k, v in translations_en_to_fa.items()}
 
-            if target_lang == "fa":
-                translated = translations_en_to_fa.get(
-                    text.strip(),
-                    f"«{text.strip()}» (ترجمه خودکار در دسترس نیست — مدل زبانی متصل نیست)",
-                )
+            if effective_target == "fa":
+                matched = translations_en_to_fa.get(text.strip())
+                if matched:
+                    translated = matched
+                    translator_name = "static-dictionary-v1"
+                else:
+                    translated = f"«{text.strip()}» (ترجمه خودکار در دسترس نیست — مدل زبانی متصل نیست)"
+                    translator_name = "offline-fallback"
             else:
-                translated = translations_fa_to_en.get(
-                    text.strip(),
-                    f"{text.strip()} (translation unavailable — LLM not connected)",
-                )
+                matched = translations_fa_to_en.get(text.strip())
+                if matched:
+                    translated = matched
+                    translator_name = "static-dictionary-v1"
+                else:
+                    translated = f"{text.strip()} (translation unavailable — LLM not connected)"
+                    translator_name = "offline-fallback"
 
-        return {"translated_text": translated, "target_lang": target_lang}
+        status = (
+            TranslationStatus.CURRENT
+            if (translated and "متصل نیست" not in translated and "not connected" not in translated)
+            else TranslationStatus.UNAVAILABLE
+        )
+
+        rec = build_translation_record(
+            source_kind=kind,
+            source_id=src_id,
+            source_text=text,
+            source_language=effective_source,
+            target_language=effective_target,
+            translated_text=translated,
+            translator=translator_name,
+            status=status,
+        )
+        d = dataclasses.asdict(rec)
+        d["target_lang"] = rec.target_language
+        d["persisted"] = False
+        d["source_text"] = text
+        return d
 
     def accept_proposal(self, run_id: str = "") -> dict:
         """Acknowledge and accept a non-actionable proposal (NEEDS_REVIEW / DO_NOT_IMPORT)."""

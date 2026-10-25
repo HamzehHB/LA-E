@@ -146,6 +146,9 @@ export interface JournalItem {
   title?: string;
   summary?: string;
   excerpt?: string;
+  narrative?: string;
+  narrative_language?: string;
+  emergency?: boolean;
 }
 
 /** @category transport — GET /api/journals response */
@@ -229,11 +232,25 @@ export interface TranslateRequest {
   text: string;
   target_lang?: "en" | "fa";
   source_lang?: string;
+  source_kind?: string;
+  source_id?: string;
 }
 
 export interface TranslateResponse {
   translated_text: string;
   target_lang: string;
+  source_kind?: string;
+  source_id?: string;
+  source_language?: string;
+  target_language?: string;
+  source_text?: string;
+  status?: "current" | "stale" | "missing" | "invalid" | "unavailable" | "failed" | "unverifiable" | string;
+  source_hash?: string;
+  translated_hash?: string;
+  translator?: string;
+  translated_at?: string;
+  version?: string;
+  persisted?: boolean;
 }
 
 /** @category transport — POST /api/folders/reveal */
@@ -318,6 +335,7 @@ export interface RunEvent {
   kind: RunEventKind;
   run_id: string;
   stage: string;
+  operation?: string;
   message: string;
   timestamp: string;
   proposal_hash?: string;
@@ -340,4 +358,5 @@ export interface RunEvent {
   terminal_outcome?: string;
   reason?: string;
   status?: string;
+  phase?: "started" | "completed" | "failed" | "cancelled" | "stopped";
 }
