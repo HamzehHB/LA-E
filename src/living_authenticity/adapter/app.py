@@ -69,6 +69,7 @@ class ApprovalState(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+    ACKNOWLEDGED = "acknowledged"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
     RECONCILING = "reconciling"
@@ -105,6 +106,9 @@ class _Pending:
             elif val_str == "reject":
                 self.state = ApprovalState.REJECTED
                 self._result = "reject"
+            elif val_str == "acknowledge":
+                self.state = ApprovalState.ACKNOWLEDGED
+                self._result = "acknowledge"
             elif val_str == "cancelled":
                 self.state = ApprovalState.CANCELLED
                 self._result = "cancelled"
@@ -181,6 +185,8 @@ class _PublishingGate:
     UI can answer the exact ``proposal_hash``/``query_unit_id`` pair.
     """
 
+    _is_publishing_gate: bool = True
+
     def __init__(self, launcher, strategy: str = "explicit_ui") -> None:
         from src.living_authenticity.knowledge.governance.approval.explicit_gate import (
             ExplicitApprovalGate,
@@ -220,15 +226,18 @@ class _PublishingGate:
             self._launcher.register_approval(
                 request, note, proposal=proposal, confidence=confidence)
             text = self._inner.display(request)
-            read = reader if reader is not None else input
-            if not callable(read):
-                raise TypeError("reader must be callable")
-            try:
-                raw = read()
-            except Exception:
-                raw = ""
+            raw = ""
+            if reader is not None:
+                if not callable(reader):
+                    raise TypeError("reader must be callable")
+                try:
+                    raw = reader()
+                except EOFError:
+                    raw = "eof"
+                except Exception as exc:
+                    raw = f"reader_error:{type(exc).__name__}"
             if raw == "cancel" or (bool(self._launcher._active_run_id) and self._launcher._active_run_id in self._launcher._cancel_flags):
-                outcome = self._inner.decide(request, "n")
+                outcome = self._inner.decide(request, "cancel")
                 self.last_active_proposal = proposal
                 self.last_active_note = note
                 return (request, text, outcome)
@@ -443,8 +452,16 @@ class Launcher:
                 or decision == "cancelled"
                 or (bool(self._active_run_id) and self._active_run_id in self._cancel_flags)
             )
+            timed_out = (
+                getattr(pending, "state", None) == ApprovalState.TIMED_OUT
+                or decision == "timeout"
+            )
         if cancelled:
             return "cancel"
+        if timed_out:
+            return "timeout"
+        if decision == "acknowledge":
+            return "acknowledge"
         if decision in ("approve", "reject"):
             return "y" if decision == "approve" else "n"
         return ""
@@ -462,6 +479,11 @@ class Launcher:
                 raise AdapterError(
                     "validation_error",
                     "no pending approval for this proposal hash")
+            action = pending.payload.get("proposal_action", "")
+            if action != "CREATE" and decision == "approve":
+                raise AdapterError(
+                    "validation_error",
+                    f"proposal action {action} is not executable and cannot be approved")
             if getattr(pending, "state", None) == ApprovalState.CANCELLED:
                 raise AdapterError("conflict", "approval request was cancelled")
             if (pending.payload.get("query_unit_id")
@@ -508,6 +530,11 @@ class Launcher:
             raise AdapterError(
                 "backend_error",
                 "pending proposal is not available for editing")
+        action = getattr(proposal, "action", "")
+        if action != "CREATE":
+            raise AdapterError(
+                "validation_error",
+                f"only CREATE proposals can be edited, got {action}")
         try:
             edited = apply_proposal_edit(
                 proposal, note, title=title, body=body, reason=reason,
@@ -767,6 +794,7 @@ class Launcher:
                                     if isinstance(session_audit, str) else "")
                 if not authorized_audit:
                     authorized_audit = resolve_authorized_audit_root(self.paths())
+                input_audit_persisted = False
                 if authorized_audit:
                     try:
                         writer = AuditWriter(authorized_audit)
@@ -777,8 +805,9 @@ class Launcher:
                             operating_mode=mode_value,
                             input_text=input_text,
                         )
+                        input_audit_persisted = True
                     except Exception:
-                        pass
+                        input_audit_persisted = False
 
                 with self._lock:
                     self._reports[run_id] = {
@@ -792,7 +821,7 @@ class Launcher:
                         "processed": 0,
                         "executed": 0,
                         "held": 0,
-                        "audit_persisted": True,
+                        "audit_persisted": input_audit_persisted,
                         "terminal_outcome": terminal_outcome,
                     }
                 return
@@ -969,25 +998,145 @@ class Launcher:
         if isinstance(report, dict):
             return dict(report)
         units = list(getattr(report, "units", ()))
+        audits = list(getattr(report, "audits", ()))
         receipts = list(getattr(report, "audit_receipts", ()))
-        failed_receipts = [r for r in receipts if not r.get("persisted", True)]
+        executed_count = sum(
+            1 for u in units if getattr(u, "execution_executed", False))
+        held_count = sum(
+            1 for u in units
+            if not getattr(u, "execution_executed", False))
+
+        failed_receipts = [
+            r for r in receipts
+            if not isinstance(r, dict)
+            or not r.get("persisted", False)
+            or r.get("durability") in ("failed", "unconfirmed", "unconfigured")
+        ]
+
+        # Extract and validate identities for expected audit records.
+        # Empty or missing IDs cannot be matched ambiguously.
+        missing_record_ids = []
+        expected_id_counts = {}
+        for rec in audits:
+            rec_id = getattr(rec, "record_id", "") if not isinstance(rec, dict) else rec.get("record_id", "")
+            if not isinstance(rec_id, str) or not rec_id.strip():
+                missing_record_ids.append(rec)
+            else:
+                clean_id = rec_id.strip()
+                expected_id_counts[clean_id] = expected_id_counts.get(clean_id, 0) + 1
+
+        # Extract and validate identities for durable receipts.
+        missing_receipt_ids = []
+        receipt_id_counts = {}
+        surplus_receipts = []
+        for r in receipts:
+            if not isinstance(r, dict):
+                continue
+            r_rec_id = r.get("record_id", "")
+            if not isinstance(r_rec_id, str) or not r_rec_id.strip():
+                missing_receipt_ids.append(r)
+            else:
+                clean_r_id = r_rec_id.strip()
+                if r.get("persisted", False) and r.get("durability") in ("written", "confirmed"):
+                    receipt_id_counts[clean_r_id] = receipt_id_counts.get(clean_r_id, 0) + 1
+                    if clean_r_id not in expected_id_counts:
+                        surplus_receipts.append(r)
+
+        # Bijective checks: no duplicates, no missing receipts, no surplus receipts
+        duplicate_expected_ids = [k for k, count in expected_id_counts.items() if count > 1]
+        duplicate_receipt_ids = [k for k, count in receipt_id_counts.items() if count > 1]
+        unmatched_expected_ids = [k for k in expected_id_counts if k not in receipt_id_counts]
+
+        has_audits = len(audits) > 0 or len(receipts) > 0
+        has_identity_errors = bool(missing_record_ids or missing_receipt_ids or duplicate_expected_ids)
+        has_matching_errors = bool(
+            unmatched_expected_ids
+            or duplicate_receipt_ids
+            or surplus_receipts
+            or len(receipt_id_counts) != len(expected_id_counts)
+        )
+
+        all_accounted_and_persisted = (
+            has_audits
+            and len(audits) > 0
+            and len(failed_receipts) == 0
+            and not has_identity_errors
+            and not has_matching_errors
+            and sum(expected_id_counts.values()) == len(audits)
+            and sum(receipt_id_counts.values()) == len(audits)
+            and len(receipts) == len(audits)
+        )
+        audit_persisted = bool(all_accounted_and_persisted)
+
         audit_warning = ""
         if failed_receipts:
+            first_fail = failed_receipts[0]
+            fail_reason = first_fail.get("reason", "persistence error") if isinstance(first_fail, dict) else "persistence error"
+            durability = first_fail.get("durability", "failed") if isinstance(first_fail, dict) else "failed"
+            if durability == "unconfigured":
+                audit_warning = (
+                    "Audit infrastructure is unconfigured; audit records could "
+                    "not be durably recorded."
+                )
+            elif executed_count > 0:
+                audit_warning = (
+                    f"Staging artifact created, but {len(failed_receipts)} "
+                    f"audit record(s) failed to persist to disk: {fail_reason}"
+                )
+            else:
+                audit_warning = (
+                    f"Proposal held, but {len(failed_receipts)} "
+                    f"audit record(s) failed to persist to disk: {fail_reason}"
+                )
+        elif missing_record_ids or missing_receipt_ids:
             audit_warning = (
-                f"Staging artifact created, but {len(failed_receipts)} audit record(s) "
-                f"failed to persist to disk: {failed_receipts[0].get('reason', 'persistence error')}"
+                "Audit accounting error: expected audit record or persistence receipt "
+                "lacks a valid, unambiguous record identity."
             )
+        elif duplicate_expected_ids:
+            audit_warning = (
+                f"Audit accounting error: ambiguous expected audit records with duplicate "
+                f"record ID(s): {', '.join(sorted(duplicate_expected_ids))}."
+            )
+        elif duplicate_receipt_ids:
+            if unmatched_expected_ids:
+                audit_warning = (
+                    f"{len(unmatched_expected_ids)} expected audit record(s) missing durable persistence receipt, "
+                    f"and duplicate receipt(s) detected for record ID(s): {', '.join(sorted(duplicate_receipt_ids))}."
+                )
+            else:
+                audit_warning = (
+                    f"Audit receipt accounting error: duplicate or surplus persistence receipt(s) "
+                    f"detected for record ID(s): {', '.join(sorted(duplicate_receipt_ids))}; accounting is not unique."
+                )
+        elif unmatched_expected_ids:
+            if executed_count > 0:
+                audit_warning = (
+                    f"Staging artifact created, but {len(unmatched_expected_ids)} "
+                    f"expected audit record(s) missing durable persistence receipt; persistence is incomplete."
+                )
+            else:
+                audit_warning = (
+                    f"{len(unmatched_expected_ids)} expected audit record(s) missing durable "
+                    f"persistence receipt; persistence is incomplete."
+                )
+        elif surplus_receipts:
+            surplus_ids = [r.get("record_id", "") for r in surplus_receipts if isinstance(r, dict)]
+            audit_warning = (
+                f"Audit receipt accounting error: surplus persistence receipt(s) with "
+                f"unmatchable record ID(s): {', '.join(sorted(surplus_ids))}."
+            )
+        elif not has_audits and len(units) > 0:
+            audit_warning = "No audit records were constructed or persisted for this run."
+
         return {
             "run_id": "",
             "accepted": bool(getattr(report, "accepted", False)),
             "reason": str(getattr(report, "rejection_reason", "")),
             "processed": int(getattr(report, "files_processed", 0)),
-            "executed": sum(
-                1 for u in units if getattr(u, "execution_executed", False)),
-            "held": sum(
-                1 for u in units
-                if not getattr(u, "execution_executed", False)),
-            "audit_persisted": len(failed_receipts) == 0,
+            "executed": executed_count,
+            "held": held_count,
+            "audit_persisted": audit_persisted,
             "audit_warning": audit_warning,
         }
 
@@ -2330,27 +2479,86 @@ class Launcher:
         d["source_text"] = text
         return d
 
-    def accept_proposal(self, run_id: str = "") -> dict:
-        """Acknowledge and accept a non-actionable proposal (NEEDS_REVIEW / DO_NOT_IMPORT)."""
+    def accept_proposal(self, run_id: str = "", proposal_hash: str = "") -> dict:
+        """Acknowledge and accept a non-actionable proposal (NEEDS_REVIEW / DO_NOT_IMPORT / non-CREATE).
+
+        Requires a valid, nonempty proposal_hash matching the active pending review.
+        Preserves non-executability, rejects CREATE actions, and deterministically
+        rejects stale, duplicate, or mismatched requests without state mutation.
+        """
+        import string
+
+        if not isinstance(proposal_hash, str) or not proposal_hash.strip():
+            raise AdapterError("validation_error", "proposal_hash is required and cannot be empty")
+        clean_hash = proposal_hash.strip().lower()
+        if len(clean_hash) != 64 or not all(c in string.hexdigits for c in clean_hash):
+            raise AdapterError("validation_error", "proposal_hash must be a valid 64-character hexadecimal hash")
+
+        clean_run_id = run_id.strip() if isinstance(run_id, str) else ""
+
         with self._lock:
+            # Active cancel check
+            if bool(self._active_run_id) and self._active_run_id in self._cancel_flags:
+                raise AdapterError("conflict", "run has been cancelled")
+
             pending = self._pending_approval
-            if pending is not None:
-                action = pending.payload.get("proposal_action", "")
-                if action in ("NEEDS_REVIEW", "DO_NOT_IMPORT"):
-                    pending.resolve("reject")
-                    self._pending_approval = None
-                    self._sink({
-                        "kind": "status",
-                        "stage": "human_review",
-                        "message": f"proposal {action} acknowledged by human",
-                    })
-                    return {"accepted": True, "action": action, "run_id": run_id}
+            if pending is None:
+                if clean_run_id and clean_run_id in self._reports:
+                    raise AdapterError("conflict", "run has already reached a terminal state")
+                if clean_run_id:
+                    raise AdapterError("conflict", "no pending review for this run")
+                raise AdapterError("validation_error", "no pending review awaiting acknowledgment")
+
+            # Check if pending request is already terminal/cancelled/timed out
+            pending_state = getattr(pending, "state", None)
+            if pending_state == ApprovalState.CANCELLED:
+                raise AdapterError("conflict", "review request was cancelled")
+            if pending_state == ApprovalState.TIMED_OUT:
+                raise AdapterError("conflict", "review request timed out")
+            if pending_state != ApprovalState.PENDING:
+                raise AdapterError("conflict", "review already answered or not in pending state")
+
+            # Validate proposal hash match (exact identity)
+            if pending.key.lower() != clean_hash:
+                raise AdapterError("validation_error", "proposal_hash does not match the active proposal")
+
+            # Validate run_id if supplied
+            if clean_run_id and pending.run_id and pending.run_id != clean_run_id:
+                raise AdapterError("conflict", "run_id does not match the pending review run")
+
+            # Keep acknowledgment distinct from approval: CREATE cannot be accepted via accept_proposal
+            action = pending.payload.get("proposal_action", "")
+            if action == "CREATE":
+                raise AdapterError(
+                    "validation_error",
+                    "CREATE proposals require explicit approval via /api/approve"
+                )
+
+            # Resolve pending review atomically
+            if not pending.resolve("acknowledge"):
+                raise AdapterError("conflict", "review already answered or not in pending state")
+
+            prop_hash = pending.key
+            assigned_run_id = clean_run_id or pending.run_id
+            self._pending_approval = None
+
+            self._sink({
+                "kind": "approval_decided",
+                "stage": "human_review",
+                "message": f"acknowledged_{action.lower()}",
+                "proposal_hash": prop_hash,
+            })
             self._sink({
                 "kind": "status",
                 "stage": "human_review",
-                "message": "review findings acknowledged",
+                "message": f"proposal {action} acknowledged by human",
             })
-            return {"accepted": True, "action": "acknowledged", "run_id": run_id}
+            return {
+                "accepted": True,
+                "action": action,
+                "run_id": assigned_run_id,
+                "proposal_hash": prop_hash,
+            }
 
     def fix_paused_run(
         self,

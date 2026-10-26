@@ -98,6 +98,7 @@ export type HumanReviewState =
   | "live_awaiting_review"
   | "live_approved"
   | "live_rejected"
+  | "live_acknowledged"
   | "live_consent_required";
 
 /** @category ui-model — current processing/run view */

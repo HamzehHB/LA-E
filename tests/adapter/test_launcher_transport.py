@@ -1080,3 +1080,1724 @@ def test_journals_staging_path_boundary_enforcement(tmp_path):
     assert "SUPER SECRET DATA" not in staging_slot["excerpt"]
     assert staging_slot["artifact_path"] == ""
 
+
+def test_non_create_proposal_web_governance_path(tmp_path):
+    """End-to-end integration test for non-CREATE proposals in a background/web context.
+
+    Verifies:
+    1. A non-CREATE proposal running in the background web server does not hang on terminal input.
+    2. Emits human_review_required event with canonical proposal_hash and action NEEDS_REVIEW.
+    3. Registers pending_approval on Launcher.
+    4. Approving via /api/approve is blocked (non-executable action cannot be approved).
+    5. Acknowledging via POST /api/run/accept emits approval_decided event and resolves pending review.
+    6. Run completes cleanly (run_completed emitted) with zero staging writes.
+    7. Held audit record is durably persisted to audit/failed/ with matching proposal_hash and
+       human_review_state='acknowledged_non_executable'.
+    """
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def _make_needs_review_unit():
+        query = KnowledgeUnit(
+            id="ku-transport-needs-review", source="chat_input:inp-001",
+            original_text="Ambiguous input text needing human review before staging.",
+            meaning="Ambiguous input text needing human review before staging.",
+            cleaned_text="Ambiguous input text needing human review before staging.",
+            normalized_text="Ambiguous input text needing human review before staging.",
+            position=0,
+        )
+        proposal = Proposal(
+            query_unit_id="ku-transport-needs-review", query_source="chat_input:inp-001",
+            query_position=0, action="NEEDS_REVIEW",
+            title="Needs Review Concept",
+            destination="Notes/NeedsReview.md",
+            reason="Ambiguity detected during analysis",
+            classification_type="Observation",
+        )
+        classification = ClassificationResult(
+            unit_id="ku-transport-needs-review", source="chat_input:inp-001", position=0,
+            proposed_type="Observation",
+            rationale="Ambiguous text categorized as observation",
+        )
+        candidate = _Obj(unit_id="vault-u1", source="vault/note.md",
+                         position=0, overlap_score=2, text="existing note excerpt")
+        retrieval = _Obj(candidates=(candidate,), note="lexical retrieval note")
+        comparison = _Obj(candidate_unit_id="vault-u1", category="related",
+                          shared_terms=("ambiguous", "review"))
+        relation = _Obj(proposals=())
+        core = _Obj(relevance="unresolved", basis="unresolved core relevance")
+        confidence = ConfidenceAssessment(
+            query_unit_id="ku-transport-needs-review", query_source="chat_input:inp-001",
+            query_position=0, proposal_action="NEEDS_REVIEW",
+            level="weak", basis="synthetic weak confidence basis",
+        )
+        filter_outcome = _Obj(verdict="needs_review", basis="synthetic filter review basis")
+
+        class _StubUnitResult:
+            def __init__(self):
+                self.query_unit = query
+                self.proposal = proposal
+                self.classification = classification
+                self.retrieval_result = retrieval
+                self.comparisons = (comparison,)
+                self.relation_result = relation
+                self.core_analysis = core
+                self.confidence = confidence
+                self.filter_outcome = filter_outcome
+
+        return _StubUnitResult()
+
+    class _MockPipeline:
+        def __init__(self, stage_observer=None):
+            self._stage_observer = stage_observer
+            self.ingestion = EvidenceFirstPipeline(stage_observer=stage_observer).ingestion
+
+        def run_ingestion(self, ingestion, corpus=(), core_units=()):
+            class _Result:
+                units = [_make_needs_review_unit()]
+            return _Result()
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=lambda sink: _MockPipeline(stage_observer=sink),
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Needs Review Concept",
+            body="Synthesized candidate body requiring human review.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        # Start a real run through HTTP POST /api/run
+        valid_input = "This is a sufficiently long input that satisfies all length constraints and establishes provenance cleanly."
+        status, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": valid_input, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status == 202, f"expected 202 from /api/run, got {status}: {data}"
+        run_id = json.loads(data)["run_id"]
+
+        # Wait for the worker thread to reach human_review and register pending approval
+        pending = None
+        for _ in range(50):
+            with launcher._lock:
+                pending = launcher._pending_approval
+                if pending is not None:
+                    break
+            time.sleep(0.1)
+        assert pending is not None, "worker thread must register pending approval without hanging on terminal input"
+
+        # Verify the emitted human_review_required event contract
+        review_events = [e for e in launcher.events.since(0) if e.get("kind") == "human_review_required"]
+        assert len(review_events) == 1, f"expected 1 human_review_required event, got {review_events}"
+        rev = review_events[0]
+        assert rev["proposal_action"] == "NEEDS_REVIEW"
+        assert rev["proposal_hash"] != "", "proposal_hash must be a canonical hash, not empty string"
+        assert rev["query_unit_id"] == "ku-transport-needs-review"
+        prop_hash = rev["proposal_hash"]
+
+        # Invariant: Attempting to approve a non-executable proposal via /api/approve MUST fail closed
+        status, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "ku-transport-needs-review", "decision": "approve"},
+            token=launcher.token,
+        )
+        assert status == 400, f"approving non-CREATE proposal must return 400, got {status}: {data}"
+        payload = json.loads(data)
+        assert "cannot be approved" in payload["error"]["message"]
+
+        # Acknowledge the non-executable review findings via POST /api/run/accept
+        status, data = _request(
+            server, "POST", "/api/run/accept",
+            body={"run_id": run_id, "proposal_hash": prop_hash},
+            token=launcher.token,
+        )
+        assert status == 200, f"accept_proposal must return 200, got {status}: {data}"
+        resp = json.loads(data)
+        assert resp["accepted"] is True
+        assert resp["action"] == "NEEDS_REVIEW"
+        assert resp["proposal_hash"] == prop_hash
+
+        # Wait for run to finish cleanly
+        summary = None
+        for _ in range(50):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    summary = launcher._reports[run_id]
+                    break
+            time.sleep(0.1)
+        assert summary is not None, "run must complete cleanly after acknowledgment"
+        assert summary["executed"] == 0, "non-CREATE proposal must not execute"
+        assert summary["held"] == 1, "non-CREATE proposal must be counted as held"
+        assert summary["audit_persisted"] is True, "held audit record must be persisted"
+
+        # Verify approval_decided and run_completed events were emitted
+        decided_events = [e for e in launcher.events.since(0) if e.get("kind") == "approval_decided"]
+        assert len(decided_events) == 1
+        assert decided_events[0]["message"] == "acknowledged_needs_review"
+        assert decided_events[0]["proposal_hash"] == prop_hash
+
+        completed_events = [e for e in launcher.events.since(0) if e.get("kind") == "run_completed"]
+        assert len(completed_events) == 1
+
+        # Verify zero staging writes
+        assert list(staging_dir.iterdir()) == [], "no files should be written to staging for non-CREATE proposals"
+
+        # Verify durable audit record persistence in audit/failed/
+        failed_log = audit_dir / "failed" / "audit.jsonl"
+        assert failed_log.exists(), "held non-executable audit record must be written to audit/failed/audit.jsonl"
+        records = [json.loads(line) for line in failed_log.read_text(encoding="utf-8").strip().splitlines()]
+        held_records = [r for r in records if r.get("proposal_hash") == prop_hash]
+        assert len(held_records) == 1, f"expected held record with proposal_hash {prop_hash}, found: {records}"
+        rec = held_records[0]
+        assert rec["proposal_action"] == "NEEDS_REVIEW"
+        assert rec["terminal_outcome"] == "held_non_executable"
+        assert rec["human_review_state"] == "acknowledged_non_executable"
+        assert rec["approval_approved"] is False
+        assert rec["execution_executed"] is False
+    finally:
+        server.shutdown()
+
+
+def test_non_create_proposal_rejection_and_cancellation(tmp_path):
+    """Verifies rejection and cancellation pathways for non-CREATE proposals."""
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def _make_unit():
+        query = KnowledgeUnit(
+            id="ku-transport-rej", source="chat_input:inp-002",
+            original_text="Ambiguous input text needing rejection test.",
+            meaning="Ambiguous input text needing rejection test.",
+            cleaned_text="Ambiguous input text needing rejection test.",
+            normalized_text="Ambiguous input text needing rejection test.",
+            position=0,
+        )
+        proposal = Proposal(
+            query_unit_id="ku-transport-rej", query_source="chat_input:inp-002",
+            query_position=0, action="DO_NOT_IMPORT",
+            title="Do Not Import Note",
+            destination="Notes/DoNotImport.md",
+            reason="Explicitly marked do not import",
+            classification_type="Observation",
+        )
+        classification = ClassificationResult(
+            unit_id="ku-transport-rej", source="chat_input:inp-002", position=0,
+            proposed_type="Observation", rationale="Categorized as observation",
+        )
+        candidate = _Obj(unit_id="v1", source="vault/v1.md", position=0, overlap_score=1, text="text")
+        retrieval = _Obj(candidates=(candidate,), note="note")
+        comparison = _Obj(candidate_unit_id="v1", category="related", shared_terms=())
+        confidence = ConfidenceAssessment(
+            query_unit_id="ku-transport-rej", query_source="chat_input:inp-002",
+            query_position=0, proposal_action="DO_NOT_IMPORT",
+            level="low", basis="low confidence",
+        )
+        filter_outcome = _Obj(verdict="needs_review", basis="filter basis")
+
+        class _StubUnitResult:
+            def __init__(self):
+                self.query_unit = query
+                self.proposal = proposal
+                self.classification = classification
+                self.retrieval_result = retrieval
+                self.comparisons = (comparison,)
+                self.relation_result = _Obj(proposals=())
+                self.core_analysis = _Obj(relevance="unresolved", basis="basis")
+                self.confidence = confidence
+                self.filter_outcome = filter_outcome
+
+        return _StubUnitResult()
+
+    class _MockPipeline:
+        def __init__(self, stage_observer=None):
+            self._stage_observer = stage_observer
+            self.ingestion = EvidenceFirstPipeline(stage_observer=stage_observer).ingestion
+
+        def run_ingestion(self, ingestion, corpus=(), core_units=()):
+            class _Result:
+                units = [_make_unit()]
+            return _Result()
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=lambda sink: _MockPipeline(stage_observer=sink),
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Do Not Import Note",
+            body="Synthesized body.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        # Test 1: Rejection via /api/approve with decision="reject"
+        valid_input = "This is a sufficiently long input that satisfies all length constraints and establishes provenance cleanly."
+        status, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": valid_input, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status == 202
+        run_id = json.loads(data)["run_id"]
+
+        for _ in range(50):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+        assert launcher._pending_approval is not None
+        prop_hash = launcher._pending_approval.key
+
+        status, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "ku-transport-rej", "decision": "reject"},
+            token=launcher.token,
+        )
+        assert status == 200
+
+        for _ in range(50):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    break
+            time.sleep(0.1)
+        assert run_id in launcher._reports
+
+        failed_log = audit_dir / "failed" / "audit.jsonl"
+        assert failed_log.exists()
+        records = [json.loads(line) for line in failed_log.read_text(encoding="utf-8").strip().splitlines()]
+        rej_records = [r for r in records if r.get("proposal_hash") == prop_hash]
+        assert len(rej_records) == 1
+        assert rej_records[0]["terminal_outcome"] == "rejected"
+        assert rej_records[0]["human_review_state"] == "rejected"
+        assert rej_records[0]["approval_approved"] is False
+
+        # Test 2: Cancellation via /api/run/stop
+        status, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": valid_input, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status == 202
+        run_id_2 = json.loads(data)["run_id"]
+
+        for _ in range(50):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+        assert launcher._pending_approval is not None
+        prop_hash_2 = launcher._pending_approval.key
+
+        # Cancel run via /api/cancel
+        status, data = _request(
+            server, "POST", "/api/cancel",
+            body={"run_id": run_id_2},
+            token=launcher.token,
+        )
+        assert status == 200
+
+        for _ in range(50):
+            with launcher._lock:
+                if run_id_2 in launcher._reports:
+                    break
+            time.sleep(0.1)
+        assert run_id_2 in launcher._reports
+
+        # Verify operational error routing for cancellation (errors/)
+        errors_log = audit_dir / "errors" / "audit.jsonl"
+        assert errors_log.exists()
+        records_err = [json.loads(line) for line in errors_log.read_text(encoding="utf-8").strip().splitlines()]
+        cancel_records = [r for r in records_err if r.get("proposal_hash") == prop_hash_2]
+        assert len(cancel_records) == 1
+        assert cancel_records[0]["terminal_outcome"] == "cancelled"
+        assert cancel_records[0]["human_review_state"] == "cancelled"
+    finally:
+        server.shutdown()
+
+
+def test_non_interactive_web_execution_never_calls_terminal_input(tmp_path, monkeypatch):
+    """Verify web-server and non-interactive paths never invoke builtins.input under any circumstance."""
+    import time
+
+    def _fail_on_input(*args, **kwargs):
+        pytest.fail("builtins.input() was called in web/non-interactive execution")
+
+    monkeypatch.setattr("builtins.input", _fail_on_input)
+
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def _make_unit():
+        query = KnowledgeUnit(
+            id="ku-transport-no-input", source="source.md",
+            original_text="text for no input test",
+            meaning="text for no input test",
+            cleaned_text="text for no input test",
+            normalized_text="text for no input test",
+            position=0,
+        )
+        proposal = Proposal(
+            query_unit_id="ku-transport-no-input",
+            query_source="source.md",
+            query_position=0,
+            action="NEEDS_REVIEW",
+            title="Needs Review Note",
+            destination="destination.md",
+            reason="Ambiguous input text needing human review",
+            classification_type="Observation",
+        )
+        classification = ClassificationResult(
+            unit_id="ku-transport-no-input", source="source.md", position=0,
+            proposed_type="Observation", rationale="basis",
+        )
+        candidate = _Obj(unit_id="vault-u1", source="vault/note.md",
+                         position=0, overlap_score=2, text="existing note excerpt")
+        retrieval = _Obj(candidates=(candidate,), note="retrieval note")
+        comparison = _Obj(candidate_unit_id="vault-u1", category="related", shared_terms=["term"])
+        confidence = ConfidenceAssessment(
+            query_unit_id="ku-transport-no-input", query_source="source.md",
+            query_position=0, proposal_action="NEEDS_REVIEW", level="weak", basis="basis",
+        )
+        filter_outcome = _Obj(verdict="needs_review", basis="filter basis")
+
+        class _StubUnitResult:
+            def __init__(self):
+                self.query_unit = query
+                self.proposal = proposal
+                self.classification = classification
+                self.retrieval_result = retrieval
+                self.comparisons = (comparison,)
+                self.relation_result = _Obj(proposals=())
+                self.core_analysis = _Obj(relevance="unresolved", basis="basis")
+                self.confidence = confidence
+                self.filter_outcome = filter_outcome
+
+        return _StubUnitResult()
+
+    class _MockPipeline:
+        def __init__(self, stage_observer=None):
+            self._stage_observer = stage_observer
+            self.ingestion = EvidenceFirstPipeline(stage_observer=stage_observer).ingestion
+
+        def run_ingestion(self, ingestion, corpus=(), core_units=()):
+            class _Result:
+                units = [_make_unit()]
+            return _Result()
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=lambda sink: _MockPipeline(stage_observer=sink),
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Needs Review Note",
+            body="Synthesized body text.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        valid_input = "Sufficiently long input that satisfies all length constraints and establishes provenance cleanly."
+        status, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": valid_input, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status == 202
+        run_id = json.loads(data)["run_id"]
+
+        for _ in range(50):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+        assert launcher._pending_approval is not None
+        prop_hash = launcher._pending_approval.key
+
+        # Acknowledge review via /api/run/accept
+        status, data = _request(
+            server, "POST", "/api/run/accept",
+            body={"run_id": run_id, "proposal_hash": prop_hash},
+            token=launcher.token,
+        )
+        assert status == 200
+        assert json.loads(data)["accepted"] is True
+
+        for _ in range(50):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    break
+            time.sleep(0.1)
+        assert run_id in launcher._reports
+
+        failed_log = audit_dir / "failed" / "audit.jsonl"
+        assert failed_log.exists()
+        records = [json.loads(line) for line in failed_log.read_text(encoding="utf-8").strip().splitlines()]
+        held_records = [r for r in records if r.get("proposal_hash") == prop_hash]
+        assert len(held_records) == 1
+        assert held_records[0]["terminal_outcome"] == "held_non_executable"
+        assert held_records[0]["human_review_state"] == "acknowledged_non_executable"
+        assert held_records[0]["approval_approved"] is False
+    finally:
+        server.shutdown()
+
+
+def test_review_channel_unavailable_fails_closed_safely(tmp_path):
+    """When review reader is missing in a web/background run, fail closed without hanging."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    query = KnowledgeUnit(
+        id="ku-unavailable", source="source.md",
+        original_text="text for unavailable test",
+        meaning="text for unavailable test",
+        cleaned_text="text for unavailable test",
+        normalized_text="text for unavailable test",
+        position=0,
+    )
+    proposal = Proposal(
+        query_unit_id="ku-unavailable",
+        query_source="source.md",
+        query_position=0,
+        action="NEEDS_REVIEW",
+        title="Unavailable Review Note",
+        destination="dest.md",
+        reason="Ambiguous input",
+        classification_type="Observation",
+    )
+    classification = ClassificationResult(
+        unit_id="ku-unavailable", source="source.md", position=0,
+        proposed_type="Observation", rationale="b",
+    )
+    unit_result = _Obj(
+        query_unit=query,
+        proposal=proposal,
+        classification=classification,
+        retrieval_result=_Obj(candidates=(), note="n"),
+        comparisons=(),
+        relation_result=_Obj(proposals=()),
+        core_analysis=_Obj(relevance="unresolved", basis="b"),
+        confidence=ConfidenceAssessment(
+            query_unit_id="ku-unavailable", query_source="source.md",
+            query_position=0, proposal_action="NEEDS_REVIEW", level="weak", basis="b",
+        ),
+        filter_outcome=_Obj(verdict="needs_review", basis="b"),
+    )
+
+    emitted_events = []
+    entries = []
+    audits = []
+
+    _handle_unit(
+        "child.md", unit_result,
+        gate=None,
+        validator=None,
+        runner=None,
+        pinned_staging="",
+        guarded=(),
+        schema_version="",
+        approval_reader=None,  # Intentionally missing review reader
+        entries=entries,
+        audits=audits,
+        authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        run_id="run-web-unavailable",  # Declares web/background context
+        event_sink=lambda ev: emitted_events.append(ev),
+        interactive=False,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].reason == "review channel unavailable for proposal action NEEDS_REVIEW"
+
+    # Verify observable safe terminal stop was emitted
+    stopped_events = [e for e in emitted_events if e.get("kind") == "stopped" and e.get("stage") == "human_review"]
+    assert len(stopped_events) == 1
+    assert "review channel unavailable" in stopped_events[0].get("message", "")
+
+    # Verify audit record reflects truthful terminal state
+    assert len(audits) == 1
+    assert audits[0].terminal_outcome == "held_non_executable"
+    assert audits[0].human_review_state == "review_channel_unavailable"
+
+
+def test_audit_persistence_failure_is_observable_and_safe(tmp_path):
+    """When audit persistence fails, surface an operational failure without claiming durability."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    query = KnowledgeUnit(
+        id="ku-audit-fail", source="source.md",
+        original_text="text for audit fail test",
+        meaning="text for audit fail test",
+        cleaned_text="text for audit fail test",
+        normalized_text="text for audit fail test",
+        position=0,
+    )
+    proposal = Proposal(
+        query_unit_id="ku-audit-fail",
+        query_source="source.md",
+        query_position=0,
+        action="NEEDS_REVIEW",
+        title="Audit Fail Review Note",
+        destination="dest.md",
+        reason="Ambiguous input",
+        classification_type="Observation",
+    )
+    classification = ClassificationResult(
+        unit_id="ku-audit-fail", source="source.md", position=0,
+        proposed_type="Observation", rationale="b",
+    )
+    unit_result = _Obj(
+        query_unit=query,
+        proposal=proposal,
+        classification=classification,
+        retrieval_result=_Obj(candidates=(), note="n"),
+        comparisons=(),
+        relation_result=_Obj(proposals=()),
+        core_analysis=_Obj(relevance="unresolved", basis="b"),
+        confidence=ConfidenceAssessment(
+            query_unit_id="ku-audit-fail", query_source="source.md",
+            query_position=0, proposal_action="NEEDS_REVIEW", level="weak", basis="b",
+        ),
+        filter_outcome=_Obj(verdict="needs_review", basis="b"),
+    )
+
+    class _FailingWriter:
+        def append(self, record):
+            raise OSError("Disk full: write failed")
+        def append_emergency(self, record, failure_reason=""):
+            raise OSError("Emergency partition also unreachable")
+
+    emitted_warnings = []
+    receipts = []
+    audits = []
+
+    _handle_unit(
+        "child.md", unit_result,
+        gate=None,
+        validator=None,
+        runner=None,
+        pinned_staging="",
+        guarded=(),
+        schema_version="",
+        approval_reader=lambda: "acknowledge",
+        entries=[],
+        audits=audits,
+        authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=_FailingWriter(),
+        audit_receipts=receipts,
+        event_sink=lambda ev: emitted_warnings.append(ev) if ev.get("kind") == "warning" else None,
+        interactive=False,
+    )
+
+    # Observable warning was emitted
+    assert len(emitted_warnings) >= 1
+    assert any("audit_persistence" in w.get("stage", "") for w in emitted_warnings)
+
+    # Failed receipt was recorded with durability="failed"
+    assert len(receipts) >= 1
+    failed_receipt = receipts[0]
+    assert failed_receipt.get("persisted") is False
+    assert failed_receipt.get("durability") == "failed"
+
+
+def test_timeout_review_lifecycle_releases_pending_state_and_emits_event(tmp_path):
+    """When a review times out, release pending state, emit timeout event, and record outcome."""
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def _make_unit():
+        query = KnowledgeUnit(
+            id="ku-timeout-test", source="source.md",
+            original_text="text for timeout test",
+            meaning="text for timeout test",
+            cleaned_text="text for timeout test",
+            normalized_text="text for timeout test",
+            position=0,
+        )
+        proposal = Proposal(
+            query_unit_id="ku-timeout-test",
+            query_source="source.md",
+            query_position=0,
+            action="NEEDS_REVIEW",
+            title="Timeout Review Note",
+            destination="destination.md",
+            reason="Ambiguous input",
+            classification_type="Observation",
+        )
+        classification = ClassificationResult(
+            unit_id="ku-timeout-test", source="source.md", position=0,
+            proposed_type="Observation", rationale="basis",
+        )
+        class _StubUnitResult:
+            def __init__(self):
+                self.query_unit = query
+                self.proposal = proposal
+                self.classification = classification
+                self.retrieval_result = _Obj(candidates=(), note="retrieval note")
+                self.comparisons = ()
+                self.relation_result = _Obj(proposals=())
+                self.core_analysis = _Obj(relevance="unresolved", basis="basis")
+                self.confidence = ConfidenceAssessment(
+                    query_unit_id="ku-timeout-test", query_source="source.md",
+                    query_position=0, proposal_action="NEEDS_REVIEW", level="weak", basis="basis",
+                )
+                self.filter_outcome = _Obj(verdict="needs_review", basis="filter basis")
+
+        return _StubUnitResult()
+
+    class _MockPipeline:
+        def __init__(self, stage_observer=None):
+            self._stage_observer = stage_observer
+            self.ingestion = EvidenceFirstPipeline(stage_observer=stage_observer).ingestion
+
+        def run_ingestion(self, ingestion, corpus=(), core_units=()):
+            class _Result:
+                units = [_make_unit()]
+            return _Result()
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=lambda sink: _MockPipeline(stage_observer=sink),
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Needs Review Note",
+            body="Synthesized body text.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        valid_input = "Sufficiently long input that satisfies all length constraints and establishes provenance cleanly."
+        status, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": valid_input, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status == 202
+        run_id = json.loads(data)["run_id"]
+
+        for _ in range(50):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+        assert launcher._pending_approval is not None
+        prop_hash = launcher._pending_approval.key
+
+        # Simulate timeout on the pending approval
+        with launcher._lock:
+            pending = launcher._pending_approval
+            if pending is not None:
+                pending.resolve("timeout")
+
+        for _ in range(50):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    break
+            time.sleep(0.1)
+        assert run_id in launcher._reports
+
+        failed_log = audit_dir / "failed" / "audit.jsonl"
+        assert failed_log.exists()
+        records = [json.loads(line) for line in failed_log.read_text(encoding="utf-8").strip().splitlines()]
+        timeout_records = [r for r in records if r.get("proposal_hash") == prop_hash]
+        assert len(timeout_records) == 1
+        assert timeout_records[0]["terminal_outcome"] == "timed_out"
+        assert timeout_records[0]["human_review_state"] == "timed_out"
+        assert timeout_records[0]["approval_approved"] is False
+    finally:
+        server.shutdown()
+
+
+def _make_non_create_unit_result():
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    query = KnowledgeUnit(
+        id="ku-integrity-test", source="source.md",
+        original_text="text for decision integrity test",
+        meaning="text for decision integrity test",
+        cleaned_text="text for decision integrity test",
+        normalized_text="text for decision integrity test",
+        position=0,
+    )
+    proposal = Proposal(
+        query_unit_id="ku-integrity-test",
+        query_source="source.md",
+        query_position=0,
+        action="NEEDS_REVIEW",
+        title="Review Decision Integrity Note",
+        destination="destination.md",
+        reason="Ambiguous categorization",
+        classification_type="Observation",
+    )
+    classification = ClassificationResult(
+        unit_id="ku-integrity-test", source="source.md", position=0,
+        proposed_type="Observation", rationale="basis",
+    )
+    return _Obj(
+        query_unit=query,
+        proposal=proposal,
+        classification=classification,
+        retrieval_result=_Obj(candidates=(), note="retrieval note"),
+        comparisons=(),
+        relation_result=_Obj(proposals=()),
+        core_analysis=_Obj(relevance="unresolved", basis="basis"),
+        confidence=ConfidenceAssessment(
+            query_unit_id="ku-integrity-test", query_source="source.md",
+            query_position=0, proposal_action="NEEDS_REVIEW", level="weak", basis="basis",
+        ),
+        filter_outcome=_Obj(verdict="needs_review", basis="filter basis"),
+    )
+
+
+def test_non_create_empty_reader_records_empty_input_held(tmp_path):
+    """Empty reader input is recorded as empty_input, never false acknowledgment."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    receipts = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=receipts,
+        interactive=True,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "empty_input"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+    assert entries[0].execution_executed is False
+    assert entries[0].artifact_reference == ""
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "empty_input"
+    assert audits[0].validation_result == "held_non_executable"
+    assert audits[0].approval_approved is False
+
+
+def test_non_create_reader_exception_records_reader_exception(tmp_path):
+    """Exceptions from reader are recorded as reader_exception, never false acknowledgment."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    def _broken_reader():
+        raise RuntimeError("simulated I/O disconnect")
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=_broken_reader,
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=[],
+        interactive=True,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "reader_exception"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+    assert entries[0].execution_executed is False
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "reader_exception"
+
+
+def test_non_create_eof_records_eof_held(tmp_path):
+    """EOF from reader is recorded as eof, never false acknowledgment."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    def _eof_reader():
+        raise EOFError("input stream closed")
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=_eof_reader,
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=[],
+        interactive=True,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "eof"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "eof"
+
+
+def test_non_create_invalid_decision_records_invalid_decision(tmp_path):
+    """Unrecognized human input is recorded as invalid_decision and held non-executable."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "approve",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=[],
+        interactive=True,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "invalid_decision"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+    assert entries[0].execution_executed is False
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "invalid_decision"
+
+
+def test_non_create_explicit_ack_records_acknowledged(tmp_path):
+    """Explicit human acknowledgment produces acknowledged_non_executable."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "acknowledge",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=[],
+        interactive=True,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "acknowledged_non_executable"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+    assert entries[0].execution_executed is False
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "acknowledged_non_executable"
+
+
+def test_non_create_headless_records_not_requested(tmp_path):
+    """Headless batch run without reader records human_review_state as not_requested."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=None,
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=[],
+        interactive=False,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "not_requested"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+    assert entries[0].execution_executed is False
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "not_requested"
+
+
+def test_non_create_channel_unavailable_records_review_channel_unavailable(tmp_path):
+    """Web run without reader records review_channel_unavailable."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=None,
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=AuditWriter(str(audit_root)),
+        audit_receipts=[],
+        run_id="run-web-channel-test",
+        interactive=False,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].human_review_state == "review_channel_unavailable"
+    assert entries[0].outcome == "held_non_executable"
+    assert entries[0].approval_approved is False
+
+    assert len(audits) == 1
+    assert audits[0].human_review_state == "review_channel_unavailable"
+
+
+def test_held_record_persistence_success(tmp_path):
+    """When held record persistence succeeds, durability is written and audit_persisted is True."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+    from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    receipts = []
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+    writer = AuditWriter(str(audit_root))
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "acknowledge",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=writer,
+        audit_receipts=receipts,
+        interactive=False,
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0]["persisted"] is True
+    assert receipts[0]["durability"] == "written"
+
+    failed_log = audit_root / "failed" / "audit.jsonl"
+    assert failed_log.exists()
+    records = [json.loads(l) for l in failed_log.read_text(encoding="utf-8").strip().splitlines()]
+    assert len(records) == 1
+    assert records[0]["validation_result"] == "held_non_executable"
+
+    launcher = _launcher()
+    rep = IntegrationRunReport(accepted=True, units=tuple(entries), audits=tuple(audits), audit_receipts=tuple(receipts))
+    summary = launcher._report_summary(rep)
+    assert summary["audit_persisted"] is True
+    assert summary["audit_warning"] == ""
+
+
+def test_held_record_persistence_emergency_fallback(tmp_path):
+    """When primary append fails but emergency succeeds, durability is confirmed and audit_persisted is True."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+    from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
+    real_writer = AuditWriter(str(audit_root))
+
+    class _EmergencyFallbackWriter:
+        def append(self, record):
+            raise OSError("Primary write disk error")
+        def append_emergency(self, record, failure_reason=""):
+            return real_writer.append_emergency(record, failure_reason=failure_reason)
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    receipts = []
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "acknowledge",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=_EmergencyFallbackWriter(),
+        audit_receipts=receipts,
+        interactive=False,
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0]["persisted"] is True
+    assert receipts[0]["durability"] == "confirmed"
+    assert receipts[0]["emergency"] is True
+
+    emergency_log = audit_root / "errors" / "audit_emergency.jsonl"
+    assert emergency_log.exists()
+
+    launcher = _launcher()
+    rep = IntegrationRunReport(accepted=True, units=tuple(entries), audits=tuple(audits), audit_receipts=tuple(receipts))
+    summary = launcher._report_summary(rep)
+    assert summary["audit_persisted"] is True
+
+
+def test_held_record_persistence_complete_failure(tmp_path):
+    """When primary and emergency persistence both fail, audit_persisted is False and warning is emitted."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+
+    class _TotallyFailingWriter:
+        def append(self, record):
+            raise OSError("Primary disk full")
+        def append_emergency(self, record, failure_reason=""):
+            raise OSError("Emergency partition offline")
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    receipts = []
+    emitted = []
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "acknowledge",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=_TotallyFailingWriter(),
+        audit_receipts=receipts,
+        event_sink=lambda ev: emitted.append(ev) if ev.get("kind") == "warning" else None,
+        interactive=False,
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0]["persisted"] is False
+    assert receipts[0]["durability"] == "failed"
+    assert any("audit_persistence" in e.get("stage", "") for e in emitted)
+
+    launcher = _launcher()
+    rep = IntegrationRunReport(accepted=True, units=tuple(entries), audits=tuple(audits), audit_receipts=tuple(receipts))
+    summary = launcher._report_summary(rep)
+    assert summary["audit_persisted"] is False
+    assert "Proposal held, but 1 audit record(s) failed to persist to disk" in summary["audit_warning"]
+
+
+def test_held_record_persistence_unconfigured(tmp_path):
+    """When audit infrastructure is unconfigured, receipts record unconfigured and audit_persisted is False."""
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.unit_loop import _handle_unit
+    from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+
+    unit_result = _make_non_create_unit_result()
+    entries = []
+    audits = []
+    receipts = []
+    emitted = []
+
+    _handle_unit(
+        "note.md", unit_result,
+        gate=None, validator=None, runner=None,
+        pinned_staging=str(tmp_path / "staging"), guarded=(), schema_version="",
+        approval_reader=lambda: "acknowledge",
+        entries=entries, audits=audits, authorized_staging="",
+        synthesis=SyntheticSynthesis(title="T", body="B"),
+        audit_writer=None,
+        audit_receipts=receipts,
+        event_sink=lambda ev: emitted.append(ev) if ev.get("kind") == "warning" else None,
+        interactive=False,
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0]["persisted"] is False
+    assert receipts[0]["durability"] == "unconfigured"
+    assert receipts[0]["mode"] == "unconfigured"
+
+    launcher = _launcher()
+    rep = IntegrationRunReport(accepted=True, units=tuple(entries), audits=tuple(audits), audit_receipts=tuple(receipts))
+    summary = launcher._report_summary(rep)
+    assert summary["audit_persisted"] is False
+    assert "Audit infrastructure is unconfigured" in summary["audit_warning"]
+
+
+def test_real_pipeline_runtime_handoff_and_stale_decision_rejection(tmp_path):
+    """Execute end-to-end run with genuine EvidenceFirstPipeline, tracing review handoff,
+    proposal-hash continuity, durable audit record, and rejection of stale/duplicate decisions."""
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    # Use genuine EvidenceFirstPipeline (pipeline_factory=None)
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=None,
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Genuine Qualitative Research Note",
+            body="Synthesized phenomenological observation text.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        # Authentic qualitative research text satisfying length constraints
+        input_text = (
+            "Authentic qualitative research inquiry into experiential self-awareness and "
+            "ontological congruence across empirical modalities, providing sufficient textual depth "
+            "to comfortably exercise extraction, lexical indexing, proposal generation, and governance."
+        )
+
+        status, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": input_text, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status == 202
+        run_id = json.loads(data)["run_id"]
+
+        # Wait for human_review_required event and pending approval registration
+        for _ in range(60):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+
+        assert launcher._pending_approval is not None, "Pending approval was not registered by real pipeline"
+        proposal_hash = launcher._pending_approval.key
+        query_unit_id = launcher._pending_approval.payload.get("query_unit_id", "")
+        action = launcher._pending_approval.payload.get("proposal_action", "")
+        assert proposal_hash, "Pending approval key must be a valid canonical proposal hash"
+
+        # Verify event stream received human_review_required with exact proposal_hash
+        events = launcher.events.since(0)
+        review_req_events = [e for e in events if e.get("kind") == "human_review_required"]
+        assert len(review_req_events) >= 1
+        assert review_req_events[0].get("proposal_hash") == proposal_hash
+
+        # Submit human decision via POST /api/run/accept
+        status_accept, data_accept = _request(
+            server, "POST", "/api/run/accept",
+            body={"run_id": run_id, "proposal_hash": proposal_hash},
+            token=launcher.token,
+        )
+        assert status_accept == 200, f"accept_proposal failed: {status_accept} - {data_accept}"
+        accept_resp = json.loads(data_accept)
+        assert accept_resp["accepted"] is True
+        assert accept_resp["proposal_hash"] == proposal_hash
+
+        # Wait for run to reach terminal completion
+        for _ in range(60):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    break
+            time.sleep(0.1)
+
+        assert run_id in launcher._reports, "Run did not complete after human decision"
+        final_summary = launcher._reports[run_id]
+        assert final_summary["accepted"] is True
+        assert final_summary["held"] == 1
+        assert final_summary["executed"] == 0
+        assert final_summary["audit_persisted"] is True
+        assert final_summary["audit_warning"] == ""
+
+        # Verify approval_decided and run_completed events were emitted
+        all_events = launcher.events.since(0)
+        decided_events = [e for e in all_events if e.get("kind") == "approval_decided"]
+        assert len(decided_events) >= 1
+        assert decided_events[0].get("proposal_hash") == proposal_hash
+
+        completed_events = [e for e in all_events if e.get("kind") == "run_completed"]
+        assert len(completed_events) >= 1
+
+        # Verify durable audit record on disk has exact proposal_hash and query_unit_id continuity
+        failed_log = audit_dir / "failed" / "audit.jsonl"
+        assert failed_log.exists(), "audit/failed/audit.jsonl was not created"
+        records = [json.loads(l) for l in failed_log.read_text(encoding="utf-8").strip().splitlines()]
+        matching_audits = [r for r in records if r.get("proposal_hash") == proposal_hash]
+        assert len(matching_audits) == 1
+        audit_rec = matching_audits[0]
+        assert audit_rec["query_unit_id"] == query_unit_id
+        assert audit_rec["proposal_action"] == action
+        assert audit_rec["approval_approved"] is False
+        assert audit_rec["execution_executed"] is False
+        assert audit_rec["human_review_state"] == "acknowledged_non_executable"
+        assert audit_rec["validation_result"] == "held_non_executable"
+
+        # Verify that duplicate/stale decision is rejected deterministically
+        status_dup, data_dup = _request(
+            server, "POST", "/api/run/accept",
+            body={"run_id": run_id, "proposal_hash": proposal_hash},
+            token=launcher.token,
+        )
+        assert status_dup in (400, 409), f"Duplicate accept must be rejected with 400 or 409, got {status_dup}"
+
+        status_approve_stale, data_approve_stale = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": proposal_hash, "query_unit_id": query_unit_id, "decision": "approve"},
+            token=launcher.token,
+        )
+        assert status_approve_stale in (400, 409), f"Stale approve must be rejected with 400 or 409, got {status_approve_stale}"
+    finally:
+        server.shutdown()
+
+
+def test_accept_proposal_requires_exact_proposal_identity():
+    """Verify accept_proposal enforces exact proposal hash identity and run binding.
+
+    1. Missing proposal_hash is rejected (400).
+    2. Empty/whitespace proposal_hash is rejected (400).
+    3. Malformed proposal_hash is rejected (400).
+    4. Incorrect proposal_hash is rejected (400).
+    5. Correct proposal_hash paired with an unrelated run_id is rejected (409).
+    6. Non-mutating: Failed requests do not resolve or clear pending approval.
+    7. CREATE proposals cannot be accepted via accept_proposal (400).
+    8. Valid matching acknowledgment succeeds (200).
+    9. Duplicate or stale acknowledgment is rejected deterministically (409).
+    """
+    from src.living_authenticity.adapter.app import _Pending, ApprovalState
+
+    launcher, server = _server()
+    try:
+        run_id = "run-identity-test-1"
+        valid_hash = "a" * 64
+        mismatched_hash = "b" * 64
+
+        # Register pending non-CREATE review
+        pending = _Pending(
+            run_id=run_id,
+            key=valid_hash,
+            payload={"proposal_action": "NEEDS_REVIEW", "query_unit_id": "qu-identity-1"},
+        )
+        with launcher._lock:
+            launcher._pending_approval = pending
+
+        # 1. Missing proposal_hash -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id}, token=launcher.token)
+        assert st == 400, f"Missing hash must be 400, got {st}: {data}"
+        assert "required" in json.loads(data)["error"]["message"].lower()
+        # Verify state not mutated
+        assert launcher._pending_approval is pending
+        assert pending.state == ApprovalState.PENDING
+
+        # 2. Empty proposal_hash -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": "   "}, token=launcher.token)
+        assert st == 400, f"Empty hash must be 400, got {st}: {data}"
+        assert launcher._pending_approval is pending
+
+        # 3. Malformed proposal_hash -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": "not-a-valid-hex-hash"}, token=launcher.token)
+        assert st == 400, f"Malformed hash must be 400, got {st}: {data}"
+        assert launcher._pending_approval is pending
+
+        # 4. Incorrect proposal_hash -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": mismatched_hash}, token=launcher.token)
+        assert st == 400, f"Mismatched hash must be 400, got {st}: {data}"
+        assert "does not match" in json.loads(data)["error"]["message"].lower()
+        assert launcher._pending_approval is pending
+
+        # 5. Correct proposal_hash with unrelated run_id -> 409
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": "unrelated-run-999", "proposal_hash": valid_hash}, token=launcher.token)
+        assert st == 409, f"Unrelated run_id must be 409, got {st}: {data}"
+        assert launcher._pending_approval is pending
+
+        # 6. Verify CREATE proposals are rejected via accept_proposal -> 400
+        create_hash = "c" * 64
+        create_pending = _Pending(
+            run_id=run_id,
+            key=create_hash,
+            payload={"proposal_action": "CREATE", "query_unit_id": "qu-create-1"},
+        )
+        with launcher._lock:
+            launcher._pending_approval = create_pending
+
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": create_hash}, token=launcher.token)
+        assert st == 400, f"CREATE action on accept must be 400, got {st}: {data}"
+        assert "explicit approval" in json.loads(data)["error"]["message"].lower()
+
+        # Restore non-CREATE pending
+        with launcher._lock:
+            launcher._pending_approval = pending
+
+        # 7. Valid matching acknowledgment -> 200
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": valid_hash}, token=launcher.token)
+        assert st == 200, f"Valid accept must return 200, got {st}: {data}"
+        resp = json.loads(data)
+        assert resp["accepted"] is True
+        assert resp["action"] == "NEEDS_REVIEW"
+        assert resp["proposal_hash"] == valid_hash
+        assert launcher._pending_approval is None
+        assert pending.state == ApprovalState.ACKNOWLEDGED
+
+        # 8. Duplicate acknowledgment -> 409
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": valid_hash}, token=launcher.token)
+        assert st in (400, 409), f"Duplicate accept must be rejected with 400 or 409, got {st}: {data}"
+
+        # 9. Acknowledgment when run has already reached terminal state -> 409
+        with launcher._lock:
+            launcher._reports[run_id] = {"accepted": True, "executed": 0, "held": 1}
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": valid_hash}, token=launcher.token)
+        assert st == 409, f"Terminal run accept must be 409, got {st}: {data}"
+    finally:
+        server.shutdown()
+
+
+def test_report_summary_accounts_for_every_expected_record_1_to_1():
+    """Verify _report_summary enforces strict, bijective, unique accounting of audit records.
+
+    1. Two expected records with two valid receipts -> audit_persisted=True.
+    2. Two expected records with only one valid receipt -> audit_persisted=False.
+    3. Two expected records with both valid receipts plus an additional duplicate receipt -> audit_persisted=False.
+    4. Duplicate receipts for the same record while another expected record is missing a receipt -> audit_persisted=False.
+    5. Unmatchable or missing record identity -> audit_persisted=False.
+    6. Failed and unconfigured receipts -> audit_persisted=False.
+    """
+    from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+    from src.living_authenticity.knowledge.integration.outcome import IntegrationRunReport
+
+    launcher = _launcher()
+
+    rec1 = AuditRecord(
+        record_id="rec-001",
+        run_id="run-1",
+        query_unit_id="qu-1",
+        proposal_hash="a" * 64,
+        operating_mode="examples",
+        proposal_action="CREATE",
+        terminal_outcome="executed",
+    )
+    rec2 = AuditRecord(
+        record_id="rec-002",
+        run_id="run-1",
+        query_unit_id="qu-2",
+        proposal_hash="b" * 64,
+        operating_mode="examples",
+        proposal_action="NEEDS_REVIEW",
+        terminal_outcome="held_non_executable",
+    )
+
+    receipt1 = {
+        "record_id": "rec-001",
+        "persisted": True,
+        "emergency": False,
+        "mode": "primary",
+        "durability": "written",
+    }
+    receipt2 = {
+        "record_id": "rec-002",
+        "persisted": True,
+        "emergency": False,
+        "mode": "primary",
+        "durability": "written",
+    }
+
+    # Scenario 1: Two expected records with their two valid receipts
+    rep_complete = IntegrationRunReport(
+        accepted=True,
+        files_processed=2,
+        units=(),
+        audits=(rec1, rec2),
+        details=(),
+        audit_receipts=(receipt1, receipt2),
+    )
+    summary_complete = launcher._report_summary(rep_complete)
+    assert summary_complete["audit_persisted"] is True, "All records accounted 1-to-1 must report audit_persisted=True"
+    assert summary_complete["audit_warning"] == ""
+
+    # Scenario 2: Two expected records with only one valid receipt
+    rep_partial = IntegrationRunReport(
+        accepted=True,
+        files_processed=2,
+        units=(),
+        audits=(rec1, rec2),
+        details=(),
+        audit_receipts=(receipt1,),
+    )
+    summary_partial = launcher._report_summary(rep_partial)
+    assert summary_partial["audit_persisted"] is False, "Partial receipts must report audit_persisted=False"
+    assert "missing durable persistence receipt" in summary_partial["audit_warning"]
+    assert "1 expected audit record(s)" in summary_partial["audit_warning"]
+
+    # Scenario 3: Two expected records with both valid receipts plus an additional duplicate receipt
+    receipt1_duplicate = dict(receipt1)
+    rep_surplus_dup = IntegrationRunReport(
+        accepted=True,
+        files_processed=2,
+        units=(),
+        audits=(rec1, rec2),
+        details=(),
+        audit_receipts=(receipt1, receipt2, receipt1_duplicate),
+    )
+    summary_surplus_dup = launcher._report_summary(rep_surplus_dup)
+    assert summary_surplus_dup["audit_persisted"] is False, "Surplus duplicate receipt must report audit_persisted=False"
+    assert "duplicate or surplus persistence receipt" in summary_surplus_dup["audit_warning"]
+
+    # Scenario 4: Duplicate receipts for the same record while another expected record is missing a receipt
+    rep_dup_with_missing = IntegrationRunReport(
+        accepted=True,
+        files_processed=2,
+        units=(),
+        audits=(rec1, rec2),
+        details=(),
+        audit_receipts=(receipt1, receipt1_duplicate),
+    )
+    summary_dup_with_missing = launcher._report_summary(rep_dup_with_missing)
+    assert summary_dup_with_missing["audit_persisted"] is False, "Duplicate receipt cannot mask missing record"
+    assert "missing durable persistence receipt" in summary_dup_with_missing["audit_warning"]
+    assert "duplicate receipt" in summary_dup_with_missing["audit_warning"]
+
+    # Scenario 5: Unmatchable or missing record identity
+    # 5a: Missing record_id on expected record
+    rec_missing_id = AuditRecord(
+        record_id="",
+        run_id="run-1",
+        query_unit_id="qu-empty",
+        proposal_hash="c" * 64,
+        operating_mode="examples",
+        proposal_action="NEEDS_REVIEW",
+        terminal_outcome="held_non_executable",
+    )
+    rep_missing_rec_id = IntegrationRunReport(
+        accepted=True,
+        files_processed=1,
+        units=(),
+        audits=(rec_missing_id,),
+        details=(),
+        audit_receipts=(receipt1,),
+    )
+    summary_missing_rec_id = launcher._report_summary(rep_missing_rec_id)
+    assert summary_missing_rec_id["audit_persisted"] is False
+    assert "lacks a valid, unambiguous record identity" in summary_missing_rec_id["audit_warning"]
+
+    # 5b: Missing record_id on receipt
+    receipt_missing_id = {
+        "record_id": "",
+        "persisted": True,
+        "emergency": False,
+        "mode": "primary",
+        "durability": "written",
+    }
+    rep_missing_receipt_id = IntegrationRunReport(
+        accepted=True,
+        files_processed=1,
+        units=(),
+        audits=(rec1,),
+        details=(),
+        audit_receipts=(receipt_missing_id,),
+    )
+    summary_missing_receipt_id = launcher._report_summary(rep_missing_receipt_id)
+    assert summary_missing_receipt_id["audit_persisted"] is False
+    assert "lacks a valid, unambiguous record identity" in summary_missing_receipt_id["audit_warning"]
+
+    # 5c: Surplus receipt with unmatchable record_id
+    receipt_unmatchable = {
+        "record_id": "rec-unmatchable-999",
+        "persisted": True,
+        "emergency": False,
+        "mode": "primary",
+        "durability": "written",
+    }
+    rep_surplus_unmatchable = IntegrationRunReport(
+        accepted=True,
+        files_processed=1,
+        units=(),
+        audits=(rec1,),
+        details=(),
+        audit_receipts=(receipt1, receipt_unmatchable),
+    )
+    summary_surplus_unmatchable = launcher._report_summary(rep_surplus_unmatchable)
+    assert summary_surplus_unmatchable["audit_persisted"] is False
+    assert "surplus persistence receipt" in summary_surplus_unmatchable["audit_warning"]
+
+    # Scenario 6: Failed and unconfigured receipts
+    # 6a: Failed receipt
+    failed_receipt2 = {
+        "record_id": "rec-002",
+        "persisted": False,
+        "emergency": False,
+        "mode": "primary",
+        "durability": "failed",
+        "reason": "disk quota exceeded",
+    }
+    rep_failed = IntegrationRunReport(
+        accepted=True,
+        files_processed=2,
+        units=(),
+        audits=(rec1, rec2),
+        details=(),
+        audit_receipts=(receipt1, failed_receipt2),
+    )
+    summary_failed = launcher._report_summary(rep_failed)
+    assert summary_failed["audit_persisted"] is False
+    assert "failed to persist to disk" in summary_failed["audit_warning"]
+
+    # 6b: Unconfigured receipt
+    unconfigured_receipt = {
+        "record_id": "rec-001",
+        "persisted": False,
+        "emergency": False,
+        "mode": "unconfigured",
+        "durability": "unconfigured",
+        "reason": "no audit writer configured",
+    }
+    rep_unconfigured = IntegrationRunReport(
+        accepted=True,
+        files_processed=1,
+        units=(),
+        audits=(rec1,),
+        details=(),
+        audit_receipts=(unconfigured_receipt,),
+    )
+    summary_unconfigured = launcher._report_summary(rep_unconfigured)
+    assert summary_unconfigured["audit_persisted"] is False
+    assert "Audit infrastructure is unconfigured" in summary_unconfigured["audit_warning"]

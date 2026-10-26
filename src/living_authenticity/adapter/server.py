@@ -542,10 +542,15 @@ def _make_handler(launcher: Launcher):
             if data is None:
                 data = {}
             run_id = data.get("run_id", "")
+            proposal_hash = data.get("proposal_hash", "")
             try:
-                result = launcher.accept_proposal(run_id=run_id)
+                result = launcher.accept_proposal(run_id=run_id, proposal_hash=proposal_hash)
             except AdapterError as exc:
-                self._error(400, exc.kind, exc.message)
+                status_code = 409 if (exc.kind == "conflict"
+                                      or "already" in exc.message
+                                      or "cancelled" in exc.message
+                                      or "timed out" in exc.message) else 400
+                self._error(status_code, exc.kind, exc.message)
                 return
             self._send_json(200, result)
 

@@ -120,7 +120,7 @@ def test_each_candidate_reaches_review_one_at_a_time(capsys, monkeypatch):
                  pinned_staging="", guarded=(), schema_version="",
                  approval_reader=None, entries=entries, audits=audits,
                  authorized_staging="", synthesis=synthesis,
-                 details=[], vault_context=None)
+                 details=[], vault_context=None, interactive=True)
     assert len(entries) == 2
     assert reads and len(reads) == 2
     assert len(audits) == 2

@@ -449,7 +449,9 @@ export function deriveWorkflow(
       case "completed":
         terminal = true;
         completed.add("audit");
-        completed.add("output");
+        if (executionExecuted) {
+          completed.add("output");
+        }
         break;
       case "run_rejected":
       case "stopped":

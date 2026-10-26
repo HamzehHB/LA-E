@@ -26,6 +26,7 @@ class IntegrationUnitEntry:
     outcome: str = ""
     reason: str = ""
     artifact_reference: str = ""
+    human_review_state: str = ""
 
     # Fields for display/inspection (populated for all proposals, not just CREATE)
     query_text: str = ""

@@ -40,6 +40,7 @@ def _persist_audits(audit_writer, audits, audit_receipts, staging_root=None) -> 
                     "persisted": False,
                     "emergency": False,
                     "mode": "unconfigured",
+                    "durability": "unconfigured",
                     "reason": "no audit writer configured",
                 })
         return False
@@ -136,7 +137,8 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
              vault_context=None, operating_mode="", run_id="",
              audit_writer=None, audit_receipts=None,
              audit_guard_error="", llm_config=None, event_sink=None,
-             should_cancel=None, audit_language="en"):
+             should_cancel=None, audit_language="en",
+             interactive: bool = False):
     """Ingest (unless already ingested), analyse, then govern every unit."""
     def _emit(kind, stage, message):
         if event_sink is not None:
@@ -167,11 +169,12 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
             authorized, synthesis, details=details,
             vault_context=vault_context,
             operating_mode=operating_mode, run_id=run_id,
-             audit_writer=audit_writer,
-             audit_receipts=audit_receipts,
-             audit_guard_error=audit_guard_error, llm_config=llm_config,
-             event_sink=event_sink, should_cancel=should_cancel,
-             audit_language=audit_language,
+            audit_writer=audit_writer,
+            audit_receipts=audit_receipts,
+            audit_guard_error=audit_guard_error, llm_config=llm_config,
+            event_sink=event_sink, should_cancel=should_cancel,
+            audit_language=audit_language,
+            interactive=interactive,
         )
         # Cooperative cancellation boundary between units: once a run is
         # cancelled, no further unit is analysed or governed. The current
@@ -202,7 +205,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                             should_cancel=None,
                             event_sink=None,
                             staging_language: str = "en",
-                            audit_language: str = "en") -> IntegrationRunReport:
+                            audit_language: str = "en",
+                            interactive: bool = False) -> IntegrationRunReport:
     """Run one bounded local-integration pass; return an in-memory report.
 
     Three explicit input shapes, one governance path:
@@ -403,7 +407,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                     audit_guard_error=audit_guard_error,
                     llm_config=llm_config, event_sink=emit,
                     should_cancel=should_cancel,
-                    audit_language=audit_language):
+                    audit_language=audit_language,
+                    interactive=interactive):
             processed = 1
         audits_ok = _persist_audits(audit_writer, audits, audit_receipts, staging_root=pinned)
         # Only fail-closed when audit persistence was explicitly requested.
@@ -478,7 +483,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                     audit_guard_error=audit_guard_error,
                     llm_config=llm_config, event_sink=emit,
                     should_cancel=should_cancel,
-                    audit_language=audit_language):
+                    audit_language=audit_language,
+                    interactive=interactive):
             processed += 1
         else:
             skipped += 1

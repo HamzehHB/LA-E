@@ -79,13 +79,20 @@ class ExplicitApprovalGate(ApprovalGate):
             raise TypeError("request must be an ApprovalRequest")
         approved = parse_approval_input(raw_input)
         stamp = timestamp if isinstance(timestamp, str) and timestamp else _utc_now()
+        val_str = raw_input.strip().lower() if isinstance(raw_input, str) else ""
+        if approved:
+            reason = "explicit human approval"
+        elif val_str == "acknowledge":
+            reason = "acknowledged non-executable"
+        else:
+            reason = "rejected by default"
         return ApprovalOutcome(
             query_unit_id=request.query_unit_id,
             proposal_hash=request.proposal_hash,
             proposal_action=request.proposal_action,
             approved=approved,
             input_value=raw_input if isinstance(raw_input, str) else "",
-            reason=("explicit human approval" if approved else "rejected by default"),
+            reason=reason,
             timestamp=stamp,
             strategy=self._strategy,
             note=(
@@ -97,7 +104,8 @@ class ExplicitApprovalGate(ApprovalGate):
         )
 
     def request_approval(self, query, proposal=None, confidence=None,
-                         reader=None, note=None) -> tuple:
+                         reader=None, note=None,
+                         interactive: bool = False) -> tuple:
         """Display one request, read one input, record one outcome.
 
         ``reader`` is an injected zero-argument callable returning the
@@ -108,13 +116,23 @@ class ExplicitApprovalGate(ApprovalGate):
         """
         request = self.build_request(query, proposal, confidence, note)
         text = self.display(request)
-        read = reader if reader is not None else input
-        if not callable(read):
-            raise TypeError("reader must be callable")
-        try:
-            raw = read()
-        except Exception:
-            raw = ""
+        raw = ""
+        if reader is not None:
+            if not callable(reader):
+                raise TypeError("reader must be callable")
+            try:
+                raw = reader()
+            except EOFError:
+                raw = "eof"
+            except Exception as exc:
+                raw = f"reader_error:{type(exc).__name__}"
+        elif interactive:
+            try:
+                raw = input()
+            except EOFError:
+                raw = "eof"
+            except (OSError, Exception) as exc:
+                raw = f"reader_error:{type(exc).__name__}"
         outcome = self.decide(request, raw)
         return (request, text, outcome)
 

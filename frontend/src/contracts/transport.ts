@@ -298,11 +298,18 @@ export interface VaultSyncStatusResponse {
   error?: string | null;
 }
 
+/** @category transport — POST /api/run/accept request */
+export interface AcceptProposalRequest {
+  proposal_hash: string;
+  run_id?: string;
+}
+
 /** @category transport — POST /api/run/accept */
 export interface AcceptProposalResponse {
   accepted: boolean;
   action: string;
   run_id: string;
+  proposal_hash?: string;
 }
 
 /**

@@ -826,16 +826,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       },
       liveAccept: async () => {
         if (!live.available) return;
+        const proposalHash = liveApproval?.proposal_hash || state.run.proposal_hash;
+        if (!proposalHash) {
+          setLiveError("Missing proposal hash for acknowledgment");
+          return;
+        }
         setLiveError(null);
         try {
-          await live.acceptProposal(state.run.run_id);
+          await live.acceptProposal(proposalHash, state.run.run_id);
           setState((s) => ({
             ...s,
             run: {
               ...s.run,
               accepted: true,
               status: "proposal acknowledged",
-              review_state: "live_approved",
+              review_state: "live_acknowledged",
             },
           }));
           setLiveApproval(null);

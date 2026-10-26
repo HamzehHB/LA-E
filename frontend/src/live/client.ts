@@ -6,6 +6,7 @@
  * UI keeps fixture/demo behavior.
  */
 import type {
+  AcceptProposalRequest,
   AcceptProposalResponse,
   ApproveRequest,
   ApproveResponse,
@@ -68,7 +69,7 @@ export interface LiveClient {
   decideVaultSync(req: VaultSyncDecideRequest): Promise<VaultSyncDecideResponse>;
   startRun(req: RunRequest): Promise<RunResponse>;
   approve(req: ApproveRequest): Promise<ApproveResponse>;
-  acceptProposal(run_id?: string): Promise<AcceptProposalResponse>;
+  acceptProposal(req: AcceptProposalRequest | string, run_id?: string): Promise<AcceptProposalResponse>;
   editProposal(req: EditProposalRequest): Promise<EditProposalResponse>;
   consent(req: ConsentRequest): Promise<ConsentResponse>;
   cancel(req: CancelRequest): Promise<CancelResponse>;
@@ -221,8 +222,9 @@ class FetchLiveClient implements LiveClient {
     return this.post<ApproveResponse>("/api/approve", req);
   }
 
-  acceptProposal(run_id?: string): Promise<AcceptProposalResponse> {
-    return this.post<AcceptProposalResponse>("/api/run/accept", { run_id });
+  acceptProposal(req: AcceptProposalRequest | string, run_id?: string): Promise<AcceptProposalResponse> {
+    const payload = typeof req === "string" ? { proposal_hash: req, run_id } : req;
+    return this.post<AcceptProposalResponse>("/api/run/accept", payload);
   }
 
   editProposal(req: EditProposalRequest): Promise<EditProposalResponse> {

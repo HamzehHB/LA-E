@@ -14,7 +14,7 @@ _LLM_SAFE_REASONS = {
 
 
 def _request_decision(gate, query, proposal, confidence, approval_reader,
-                      note=None, block=None):
+                      note=None, block=None, interactive: bool = False):
     """Request one human decision through the existing approval gate.
 
     Automated callers inject ``approval_reader``; the interactive path
@@ -49,11 +49,13 @@ def _request_decision(gate, query, proposal, confidence, approval_reader,
     request = gate.build_request(query, proposal, confidence, note)
     if not isinstance(request, ApprovalRequest):
         raise TypeError("gate must return an ApprovalRequest")
-    print(block if block is not None else gate.display(request))
-    try:
-        raw = input()
-    except Exception:
-        raw = ""
+    raw = ""
+    if interactive:
+        print(block if block is not None else gate.display(request))
+        try:
+            raw = input()
+        except (EOFError, OSError, Exception):
+            raw = ""
     outcome = gate.decide(request, raw)
     if not isinstance(outcome, ApprovalOutcome):
         raise TypeError("gate must return an ApprovalOutcome")
@@ -237,7 +239,8 @@ def _request_non_create_review(child, query, proposal, candidate, note,
                                unit_result, llm_result,
                                confidence=None, relation=None, core=None,
                                classification=None, filter_outcome=None,
-                               comparisons=()):
+                               comparisons=(), proposal_hash="",
+                               reader=None, interactive: bool = False) -> str:
     """Display one non-executable candidate and record an explicit review.
 
     Strictly review/presentation: the operator sees the rendered note and
@@ -250,20 +253,34 @@ def _request_non_create_review(child, query, proposal, candidate, note,
         render_review_block,
     )
 
-    block = render_review_block(
-        candidate=candidate, proposal=proposal, confidence=confidence,
-        filter_outcome=filter_outcome, retrieval=(
-            unit_result.retrieval_result if unit_result else None),
-        llm_result=llm_result, staged_text=getattr(note, "markdown", ""),
-        destination=proposal.destination, proposal_hash="",
-        query=query, classification=classification,
-        relation=relation, core=core, comparisons=comparisons,
-        non_executable=True)
-    print(block)
-    try:
-        input()
-    except Exception:
-        pass
+    if reader is not None:
+        try:
+            val = reader()
+            return str(val) if val is not None else ""
+        except EOFError:
+            return "eof"
+        except Exception as exc:
+            return f"reader_error:{type(exc).__name__}"
+
+    if interactive:
+        block = render_review_block(
+            candidate=candidate, proposal=proposal, confidence=confidence,
+            filter_outcome=filter_outcome, retrieval=(
+                unit_result.retrieval_result if unit_result else None),
+            llm_result=llm_result, staged_text=getattr(note, "markdown", ""),
+            destination=proposal.destination, proposal_hash=proposal_hash or "",
+            query=query, classification=classification,
+            relation=relation, core=core, comparisons=comparisons,
+            non_executable=True)
+        print(block)
+        try:
+            return input()
+        except EOFError:
+            return "eof"
+        except (OSError, Exception) as exc:
+            return f"reader_error:{type(exc).__name__}"
+
+    return ""
 
 
 def _trace_for_audit(query=None, unit_result=None, llm_result=None,
@@ -411,7 +428,8 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                       synthesis=None, llm_config=None,
                       audit_writer=None, audit_receipts=None,
                       audit_guard_error="", event_sink=None,
-                      should_cancel=None, audit_language="en"):
+                      should_cancel=None, audit_language="en",
+                      interactive: bool = False):
     """Govern one candidate: approval, guard re-check, revalidation."""
     from src.living_authenticity.knowledge.governance.audit.clock import (
         local_now_iso,
@@ -455,7 +473,8 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
           "one explicit decision requested for unit "
           + str(getattr(query, "id", "")))
     request, outcome, proposal, active_note = _request_decision(
-        gate, query, proposal, confidence, approval_reader, note, block)
+        gate, query, proposal, confidence, approval_reader, note, block,
+        interactive=interactive)
     if not isinstance(active_note, GeneratedNote):
         raise TypeError("active_note returned from decision gate must be a GeneratedNote")
     if not isinstance(active_note.markdown, str) or not active_note.markdown.strip():
@@ -666,10 +685,10 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                 emit_msg = "audit persistence failed after execution; quarantine failed"
 
             _emit("stopped", "audit_persistence", emit_msg)
-            # Update the in-memory audit record to keep artifact reference and narrative truthful
+            from typing import Any, cast
             final_ref = target_p if is_q else execution.artifact_path
             updated_record = dataclasses.replace(
-                post_record,
+                cast(Any, post_record),
                 terminal_outcome="audit_persistence_failed",
                 artifact_reference=final_ref,
                 artifact_path=execution.artifact_path,
@@ -680,7 +699,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                 updated_record,
                 language=getattr(post_record, "narrative_language", "en") or "en",
             )
-            final_record = dataclasses.replace(updated_record, narrative=updated_narrative)
+            final_record = dataclasses.replace(cast(Any, updated_record), narrative=updated_narrative)
             audits[-1] = final_record
         elif post_receipt and post_receipt.get("emergency"):
             state = "executed"
@@ -747,7 +766,7 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                  operating_mode="", run_id="", audit_writer=None,
                  audit_receipts=None, audit_guard_error="",
                  event_sink=None, should_cancel=None,
-                 audit_language="en"):
+                 audit_language="en", interactive: bool = False):
     """Govern one unit through the mandatory AI synthesis step.
 
     The mandatory synthesis step always runs: synthesis produces 1..N candidates
@@ -831,42 +850,163 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                                 timestamp="", note="")
             audits.append(_build(_request, _outcome, None, None, proposal,
                                  trace=_trace))
-        except Exception:
-            pass
+        except Exception as exc:
+            _emit("warning", "audit_persistence",
+                  f"failed to construct safe-stop audit record: {exc}")
         return
     _emit("stage_completed", "llm_synthesis", str(getattr(query, "id", "")))
     for candidate_index, candidate in enumerate(llm_result.candidates):
         if proposal.action != "CREATE":
-            _emit("status", "human_review",
-                  "held_non_executable: proposal action is not CREATE")
             note = _rendered_note_for_candidate(
                 query, proposal, unit_result.classification, confidence,
                 candidate, generator)
-            _request_non_create_review(
-                child, query, proposal, candidate, note,
-                unit_result, llm_result,
-                confidence=unit_result.confidence,
-                relation=unit_result.relation_result,
-                core=unit_result.core_analysis,
-                classification=unit_result.classification,
-                filter_outcome=unit_result.filter_outcome,
-                comparisons=unit_result.comparisons)
+            from src.living_authenticity.knowledge.governance.approval.proposal_hash import (
+                canonical_proposal_hash,
+                proposal_payload,
+            )
+            payload = proposal_payload(proposal, confidence, note)
+            prop_hash = canonical_proposal_hash(payload)
+
+            is_publishing_gate = (
+                gate is not None
+                and getattr(gate, "_is_publishing_gate", False) is True
+                and hasattr(gate, "request_approval")
+            )
+            is_web = bool(run_id) or is_publishing_gate
+
+            raw_decision = ""
+            channel_unavailable = False
+            is_headless = False
+
+            if gate is not None and is_publishing_gate and approval_reader is not None:
+                trio = gate.request_approval(
+                    query, proposal, confidence, reader=approval_reader, note=note)
+                outcome = trio[2]
+                raw_decision = str(getattr(outcome, "input_value", "") or "")
+            elif is_web:
+                if gate is not None and hasattr(gate, "request_approval") and approval_reader is not None:
+                    trio = gate.request_approval(
+                        query, proposal, confidence, reader=approval_reader, note=note)
+                    outcome = trio[2]
+                    raw_decision = str(getattr(outcome, "input_value", "") or "")
+                elif approval_reader is not None:
+                    raw_decision = _request_non_create_review(
+                        child, query, proposal, candidate, note,
+                        unit_result, llm_result,
+                        confidence=unit_result.confidence,
+                        relation=unit_result.relation_result,
+                        core=unit_result.core_analysis,
+                        classification=unit_result.classification,
+                        filter_outcome=unit_result.filter_outcome,
+                        comparisons=unit_result.comparisons,
+                        proposal_hash=prop_hash,
+                        reader=approval_reader,
+                        interactive=False)
+                else:
+                    channel_unavailable = True
+            elif interactive:
+                raw_decision = _request_non_create_review(
+                    child, query, proposal, candidate, note,
+                    unit_result, llm_result,
+                    confidence=unit_result.confidence,
+                    relation=unit_result.relation_result,
+                    core=unit_result.core_analysis,
+                    classification=unit_result.classification,
+                    filter_outcome=unit_result.filter_outcome,
+                    comparisons=unit_result.comparisons,
+                    proposal_hash=prop_hash,
+                    reader=approval_reader,
+                    interactive=True)
+            else:
+                is_headless = True
+                raw_decision = ""
+
+            cancelled = (
+                (should_cancel is not None and should_cancel())
+                or raw_decision == "cancel"
+            )
+            timed_out = raw_decision == "timeout"
+            dec_norm = raw_decision.strip().lower()
+            rejected = dec_norm in ("n", "no", "reject")
+            acknowledged = dec_norm in ("acknowledge", "ack", "a")
+            is_eof = raw_decision == "eof"
+            is_reader_err = raw_decision.startswith("reader_error") or raw_decision == "reader_exception"
+            is_empty = (not is_headless and not channel_unavailable and raw_decision == "")
+
+            if cancelled:
+                human_review_state = "cancelled"
+                outcome_status = "cancelled"
+                stop_reason = "run cancelled during review"
+                _emit("stopped", "cancellation", "run cancelled during review")
+            elif timed_out:
+                human_review_state = "timed_out"
+                outcome_status = "timed_out"
+                stop_reason = "human review timed out"
+                _emit("stopped", "human_review", "human review timed out")
+            elif rejected:
+                human_review_state = "rejected"
+                outcome_status = "rejected"
+                stop_reason = f"candidate proposal action {proposal.action} rejected by human"
+                _emit("status", "human_review", f"proposal {proposal.action} rejected by human")
+            elif channel_unavailable:
+                human_review_state = "review_channel_unavailable"
+                outcome_status = "held_non_executable"
+                stop_reason = f"review channel unavailable for proposal action {proposal.action}"
+                _emit("stopped", "human_review", stop_reason)
+            elif is_headless:
+                human_review_state = "not_requested"
+                outcome_status = "held_non_executable"
+                stop_reason = "candidate proposal action is not CREATE"
+                _emit("status", "human_review", f"held_non_executable: proposal action is {proposal.action}")
+            elif is_eof:
+                human_review_state = "eof"
+                outcome_status = "held_non_executable"
+                stop_reason = "human review input stream closed (EOF)"
+                _emit("stopped", "human_review", stop_reason)
+            elif is_reader_err:
+                human_review_state = "reader_exception"
+                outcome_status = "held_non_executable"
+                stop_reason = f"human review reader error: {raw_decision}"
+                _emit("stopped", "human_review", stop_reason)
+            elif acknowledged:
+                human_review_state = "acknowledged_non_executable"
+                outcome_status = "held_non_executable"
+                stop_reason = "candidate proposal action is not CREATE"
+                _emit("status", "human_review", f"held_non_executable: proposal action is {proposal.action}")
+            elif is_empty:
+                human_review_state = "empty_input"
+                outcome_status = "held_non_executable"
+                stop_reason = "human review completed without decision (empty input)"
+                _emit("status", "human_review", stop_reason)
+            else:
+                human_review_state = "invalid_decision"
+                outcome_status = "held_non_executable"
+                stop_reason = f"unrecognized human review input for non-CREATE proposal: {raw_decision}"
+                _emit("status", "human_review", stop_reason)
+
             display = _entry_display_fields(
                 child, query, proposal, confidence, unit_result, llm_result)
             entries.append(IntegrationUnitEntry(
                 source_file=str(child), query_unit_id=query.id,
                 query_source=query.source, query_position=query.position,
-                proposal_hash="", proposal_action=proposal.action,
-                approval_approved=False, outcome="held_non_executable",
-                reason="candidate proposal action is not CREATE",
+                proposal_hash=prop_hash, proposal_action=proposal.action,
+                approval_approved=False, outcome=outcome_status,
+                reason=stop_reason,
                 proposal_title=candidate.title,
                 proposal_body=candidate.body,
                 proposed_type=candidate.suggested_type,
                 proposal_reason=candidate.reason,
                 uncertainty=candidate.uncertainty,
                 note_markdown=getattr(note, "markdown", ""),
+                human_review_state=human_review_state,
                 **display,
             ))
+            import uuid as _uuid_held
+            _held_id = "rec-" + _uuid_held.uuid4().hex[:12]
+            from src.living_authenticity.knowledge.governance.audit.persistence import (
+                persist_record_resilient,
+            )
+            held_record = None
             try:
                 from src.living_authenticity.knowledge.governance.audit.outcome import (
                     build_audit_record as _build_held,
@@ -875,21 +1015,20 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                     ApprovalOutcome as _HeldOutcome,
                     ApprovalRequest as _HeldRequest,
                 )
-                import uuid as _uuid_held
-                _held_id = "rec-" + _uuid_held.uuid4().hex[:12]
+                from .outcome import IntegrationUnitDetail
                 _held_trace = _trace_for_audit(
                     query=query, unit_result=unit_result,
                     llm_result=llm_result, prompt_sha256=_digest,
                     synthesis=synthesis, llm_config=llm_config,
                     operating_mode=operating_mode, run_id=run_id,
                     record_id=_held_id,
-                    human_review_state="acknowledged_non_executable",
-                    stop_reason="candidate proposal action is not CREATE",
-                    validation_result="held_non_executable",
+                    human_review_state=human_review_state,
+                    stop_reason=stop_reason,
+                    validation_result=outcome_status,
                     proposal=proposal,
                     narrative_language=audit_language)
                 _held_request = _HeldRequest(
-                    proposal_hash="", query_unit_id=query.id,
+                    proposal_hash=prop_hash, query_unit_id=query.id,
                     query_source=query.source,
                     query_position=query.position,
                     proposal_action=proposal.action,
@@ -898,18 +1037,80 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                     reason=getattr(candidate, "reason", ""),
                     confidence_level=getattr(confidence, "level", "")
                     if confidence is not None else "",
-                    strategy="", note="")
+                    strategy=getattr(gate, "name", "explicit_gate") if gate else "explicit_gate",
+                    note="Non-executable proposal held for review; not authorization or execution.",
+                    is_authoritative=False,
+                    requires_human_review=True)
                 _held_outcome = _HeldOutcome(
-                    approved=False, proposal_hash="",
+                    approved=False, proposal_hash=prop_hash,
                     query_unit_id=query.id,
                     proposal_action=proposal.action,
-                    input_value="", reason="held_non_executable",
-                    strategy="", timestamp="", note="")
-                audits.append(_build_held(
+                    input_value=raw_decision,
+                    reason=stop_reason,
+                    strategy=getattr(gate, "name", "explicit_gate") if gate else "explicit_gate",
+                    timestamp="",
+                    note="Single-proposal human review record; not authorization or execution.",
+                    is_authoritative=False,
+                    requires_human_review=True)
+                held_record = _build_held(
                     _held_request, _held_outcome, None, None, proposal,
-                    trace=_held_trace))
-            except Exception:
-                pass
+                    trace=_held_trace)
+                audits.append(held_record)
+                if details is not None:
+                    details.append(IntegrationUnitDetail(
+                        source_file=str(child),
+                        query_unit=query,
+                        retrieval=unit_result.retrieval_result if unit_result else None,
+                        comparisons=unit_result.comparisons if unit_result else (),
+                        relation=unit_result.relation_result if unit_result else None,
+                        core=unit_result.core_analysis if unit_result else None,
+                        classification=unit_result.classification if unit_result else None,
+                        proposal=proposal,
+                        confidence=confidence,
+                        filter_outcome=unit_result.filter_outcome if unit_result else None,
+                        llm_result=llm_result,
+                        prompt_sha256=_digest,
+                        candidate_index=candidate_index,
+                        human_decision=_held_outcome,
+                        revalidation=None,
+                        execution=None,
+                        audit=held_record,
+                        note_markdown=getattr(note, "markdown", ""),
+                    ))
+            except Exception as build_exc:
+                _emit("warning", "audit_persistence",
+                      f"failed to construct held audit record: {build_exc}")
+
+            if held_record is not None:
+                try:
+                    res = persist_record_resilient(
+                        audit_writer, held_record, receipts=audit_receipts, history=audits
+                    )
+                    if not res.get("persisted", False):
+                        _emit("warning", "audit_persistence",
+                              f"failed to persist held audit record: {res.get('reason', 'persistence error')}")
+                except Exception as persist_exc:
+                    err_receipt = {
+                        "record_id": _held_id,
+                        "persisted": False,
+                        "emergency": False,
+                        "durability": "failed",
+                        "reason": f"audit persistence exception: {persist_exc}",
+                    }
+                    if audit_receipts is not None:
+                        audit_receipts.append(err_receipt)
+                    _emit("warning", "audit_persistence",
+                          f"audit persistence exception: {persist_exc}")
+            else:
+                err_receipt = {
+                    "record_id": _held_id,
+                    "persisted": False,
+                    "emergency": False,
+                    "durability": "failed",
+                    "reason": "failed to construct held audit record",
+                }
+                if audit_receipts is not None:
+                    audit_receipts.append(err_receipt)
             continue
         note = _rendered_note_for_candidate(
             query, proposal, unit_result.classification, confidence,
@@ -934,5 +1135,6 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
             audit_guard_error=audit_guard_error,
             event_sink=event_sink, should_cancel=should_cancel,
             audit_language=audit_language,
+            interactive=interactive,
         )
 
