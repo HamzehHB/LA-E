@@ -18,38 +18,41 @@ Architecture
 - [Knowledge Schema](Knowledge-Schema.yaml) — the canonical knowledge representation schema.
 - [Coding Agent Access](Coding-Agent-Access.md) — filesystem and data-access boundaries.
 
+Architecture Logic at a Glance:
+- **INPUT & INGESTION:** What has been received, and how is it prepared for processing without losing meaning?
+- **RETRIEVAL & COMPARISON:** What relevant evidence exists, and what similarities, differences, or contradictions does the input have with those candidates?
+- **RELATION ANALYSIS & CORE ANALYSIS:** What defensible relationships exist, and how does the input relate to the central conceptual Core of the project's knowledge?
+- **CLASSIFICATION, PROPOSAL, CONFIDENCE & KNOWLEDGE FILTER:** What is the nature of the input, what action is proposed, and what mathematical confidence bounds, filter rules, and uncertainties exist?
+- **LLM SYNTHESIS:** How can the evidence and analyses be dynamically synthesized into a structured summary without granting decision authority to the model?
+- **HUMAN REVIEW & EXPLICIT APPROVAL (UNIFIED):** What is the human inspecting, and to what exact proposal version is execution permission granted?
+- **REVALIDATION & CONTROLLED EXECUTION:** Are all conditions still valid right before write, and is the authorized operation performed in a strictly controlled manner?
+- **AUDIT & OUTPUT:** What happened, why did it happen, and what is the final result?
+
 Current Status
 
-The project is currently focused on building its foundational infrastructure.
+The project is currently focused on building and operating its foundational human-governed Knowledge Management infrastructure.
 
 Implemented foundations include:
 
 - Python project and package structure
 - Centralized configuration and path management
-- Text ingestion and parsing foundation
-- Semantic chunking
+- Authoritative `Input` evaluation gate (`knowledge/input/processor.py`: source selection currently restricted to interactive `chat_input`, type detection currently restricted to `text` with an extensible foundation for future document/media formats, structural & substantive validation, stable `inp-<hash[:12]>` source identification, and initial safety checks)
+- 8-substage `Ingestion` and parsing foundation (`reader_selection`, `reading`, `cleaning` with zero deletion of substantive content, `normalization`, `parsing`, `metadata_extraction`, `chunking`, and `extraction` with provenance)
+- Semantic and structural chunking (supporting 1-to-many independent knowledge-unit extraction and lexical/semantic/future-hybrid retrieval readiness)
 - Dependency management
 - Testing infrastructure
 - Project documentation and governance
 - Separation of source code from persistent data
-- Deterministic analytical stages (classification, retrieval,
-  comparison, relation detection, core analysis, proposal,
-  confidence) plus a proposed Obsidian note representation
-  (Generated Note ≠ Authoritative Note; representation does not
-  execute CREATE)
+- Deterministic analytical stages (`retrieval`, candidate-by-candidate `comparison`, causal-comparative `relation` analysis, `core` analysis against the repository's single active `Core` note with dynamic retrieval priority weighting and archive transition for superseded Core versions, evidence-informed `classification`, `proposal` type selection [`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`], and multi-factor mathematical `confidence` calculation) plus a proposed Obsidian note representation (`Generated Note ≠ Authoritative Note`; representation does not execute `CREATE`)
 - Integrated evidence-first analytical pipeline composing those
   stages in contractual order (retrieval before classification)
-  with inspectable intermediate results, plus a Knowledge Filter
+  with inspectable intermediate results, plus an algorithmic multi-signal `Knowledge Filter`
   as an analytical boundary signal (non-authoritative; no approval,
   authorization, or execution)
-- Explicit human approval gate, fresh revalidation of the exact
-  approved proposal, one-shot controlled CREATE execution into a
-  staging root only, and an observational audit/traceability record
-  built from those same lifecycle objects (audit authorizes and
-  executes nothing)
+- Unified **Human Review & Explicit Approval** gate (presenting proposals and evidence for all actions to the human; explicit acknowledgment for `NEEDS_REVIEW` / `DO_NOT_IMPORT`; explicit approval, rejection, or server-side proposal editing with SHA-256 hash replacement [$H_0 \to H_1$] for `CREATE`), fresh 7-check `Revalidation` of the exact approved proposal (including single-target / no-duplicate output enforcement), one-shot `Controlled Execution` (`CREATE` into an isolated staging root only), continuous live `Current Audit` + persistent `Audit` traceability (audit authorizes and executes nothing), and structured `Output` assembly
 - A mandatory formal LLM synthesis stage (`living_authenticity/llm/`)
-  after the Knowledge Filter and before human review: deterministic
-  bounded context, strict result contract, per-candidate governance.
+  after the Knowledge Filter and before unified human review: deterministic
+  bounded context, mandatory local model invocation via `Ollama` or privacy-gated Cloud API (`consent_required`), strict result contract, and per-candidate governance.
   Without a usable provider the affected unit stops safely
   (`llm_safe_stop`) instead of proceeding — LLM output is never
   authorization.
@@ -135,20 +138,24 @@ Implemented foundations include:
   with explicit lifecycle phases (`started`, `completed`, `failed`) and preserved
   vector-distance evidence.
 - Canonical bilingual lifecycle narrative generation (English and Persian)
-  and traceable translation records (`build_narrative_translation_record`):
+  and traceable translation records (`build_narrative_translation_record`),
+  coordinated with the independent `Knowledge Language` domains (`app`, `staging`, `audit` in `en`/`fa`)
+  so `Audit` and `Staging` outputs honor their selected domain language alongside universal on-demand `Translate`:
   strict fallback provenance attribution (`"template-fallback"` on custom
   translator failures, never falsely claiming `"custom-translator"`),
   custom notes preservation, stale detection (`is_narrative_translation_stale`),
   and explicit `persisted: false` markers for on-demand UI presentations.
 - An inspectable vault manifest/freshness contract
-  (`snapshot_vault`, `diff_manifests`, `verify_index_freshness`) plus an
-  explicit `synchronize_index` action — vault-derived state stays
+  (`snapshot_vault`, `diff_manifests`, `verify_index_freshness`) plus
+  human-gated 3-way Vault vector reconciliation (`VaultSyncSession` and `synchronize_index`:
+  when authorized by the human, indexing newly added notes, replacing embeddings for modified files,
+  and deleting embeddings for removed files; when declined, querying against the existing index) — vault-derived state stays
   inspectable and synchronized only by explicit operator action, never
   by a hidden background watcher.
 - An LLM provider/model discovery and selection contract
   (`llm/discovery.py`): read-only local model discovery, local-first
-  default, cloud as an explicit choice, validated selection states for a
-  future UI; no downloads, no credential exposure, mandatory gate
+  default, cloud as an explicit choice, and validated selection states wired into the
+  launcher UI; no downloads, no credential exposure, mandatory gate
   unchanged.
 - An artifact lifecycle matrix documenting, for every pipeline state,
   what exists in memory, what persists, and when a staging artifact does
@@ -166,15 +173,15 @@ Implemented foundations include:
     and model configuration dropdowns (`Database` with retrieval strategy selection, `AI`, `Knowledge Language`).
   - First-time onboarding flows for initial vault vector indexing, LanceDB setup,
     and audit directory provisioning (`passed/`, `failed/`, `errors/`).
-  - In-place Composer with bottom dock, character/letter boundary feedback,
+  - In-place Composer with bottom dock, substantive input boundary feedback,
     and user-selectable retrieval strategy switcher (Lexical, Semantic, disabled Hybrid).
-  - 17-node chronological workflow timeline tracking live pipeline stage states.
-  - Upper constellation band with 13 connected stars and DeepThink `Current Audit`
-    overlay streaming sanitized operational events during active runs.
-  - Processing Result view with numeric confidence score (`0.00`–`1.00`),
-    confidence band, proposal type, human review actions (`Approve`,
-    `Edit proposal`, `Reject`, `Accept`), pause/fix/stop error recovery,
-    and bilingual translation (English ↔ Persian).
+  - 17-node chronological workflow timeline tracking live pipeline stage and substage states (with `Human Review` and `Explicit Approval` operating as a unified governance boundary).
+  - Upper constellation band with 13 connected stars and DeepThink-style `Current Audit`
+    overlay streaming continuous, verifiable analytical reasoning during active runs (and pausing/resuming in sync with human review).
+  - Processing Result view with multi-factor numeric confidence score (`0.00`–`1.00`),
+    confidence band, proposal type (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), unified human review actions (`Approve`,
+    `Edit proposal`, `Reject`, `Accept`), actionable pause/fix/stop error recovery (with zero hallucinated cold-starts),
+    and on-demand bilingual translation (`Translate`: English ↔ Persian).
   - 1:1 paired newspaper journals for Audits (passed, failed, and errors partitions) and Staging
     with 5s synchronized rotation, digests, and scrollable "View All" historical modal.
   - Run the full environment via: `python -m src.living_authenticity.adapter`.

@@ -3,12 +3,10 @@
 Three INDEPENDENT language domains (English `en` / Persian `fa` only):
 
 * `app` (APP / UI / PROCESS presentation language)
-* `staging` (STAGING NOTE output language for newly generated content)
-* `audit` (AUDIT human-readable presentation language)
+* `staging` (STAGING NOTE output language in which newly generated staging content and proposals are written and recorded)
+* `audit` (AUDIT human-readable language in which persistent audit narratives and live DeepThink-style `Current Audit` reasoning traces are written and recorded)
 
-Changing one domain never changes another. Knowledge language follows the
-source knowledge itself unless `staging` is explicitly configured
-otherwise; app/audit languages never translate source knowledge.
+Changing one domain never changes another. Across all 17 workflow stages (16 unified operational stages from `Input` through `Output`), `Audit` and `Staging` are coordinated with the active `Knowledge Language` configuration so that `Audit` records/streams and `Staging` notes are written and persisted directly in their selected domain language (`en` or `fa`) while preserving source provenance. Alongside domain authoring, an interactive on-demand **`Translate`** layer (`POST /api/translate`) overlays all `Audit`, `Staging`, `Current Audit`, and `ProcessingResult` surfaces so any item can be translated between English and Persian without mutating authoritative provenance.
 
 ## Configuration
 
@@ -17,7 +15,7 @@ Optional gitignored `Config/localization.local.yaml` overrides each domain
 independently. `Config/settings.py::load_languages` validates values and
 rejects anything outside `en`/`fa`. The same three settings are exposed
 as `--app-language` / `--staging-language` / `--audit-language` CLI flags
-for the future UI (three separate controls, one per journal/domain).
+and as three independent controls in the launcher UI (`TopNav.tsx` Settings popover for `app` and `Knowledge Language` dropdown for `staging` and `audit`).
 
 ## Resources
 
@@ -58,10 +56,12 @@ The audit subsystem provides canonical bilingual narrative generation (`src.livi
 
 ## UI implementation
 
-The UI exposes independent controls backed by the launcher API:
-1. **App Presentation Language:** Configured via the Settings gear popover (`⚙`), toggling between English and Persian. Updates `dir="rtl"` / `dir="ltr"` and `lang` on `document.documentElement` and persists to `Config/localization.local.yaml`.
-2. **Knowledge Language:** Configured via the top-header `Knowledge Language` dropdown menu, with separate selections for `Staging Language` and `Audit Language`. Persists via `POST /api/config`.
-3. **Live Translation Actions (`TranslateAction`):** Inline controls on proposals, notes, and journal excerpts send requests to `POST /api/translate`, querying the active LLM provider or using the deterministic offline bilingual mapping table.
+The UI exposes independent controls backed by the launcher API and synchronized across every workflow stage:
+1. **App Presentation Language (`language.app`):** Configured via the Settings gear popover (`⚙`), toggling between English and Persian. Updates `dir="rtl"` / `dir="ltr"` and `lang` on `document.documentElement` and persists to `Config/localization.local.yaml`.
+2. **Knowledge Language (`language.staging` & `language.audit`):** Configured via the top-header `Knowledge Language` dropdown menu, with separate selections for `Staging Language` and `Audit Language`. Persists via `POST /api/config` and is passed on `POST /api/run` so that:
+   - `Staging` note drafts and executed artifacts are written and recorded in the selected `Staging Language`.
+   - Persistent `Audit` lifecycle narratives and the live DeepThink-style `Current Audit` thought stream (which runs continuously across all stages and pauses/resumes in sync with the unified `Human Review & Explicit Approval` stage) are written and recorded in the selected `Audit Language`.
+3. **Live Translation Actions (`TranslateAction` / Universal `Translate` Overlay):** Inline `Translate` controls on proposals (`ProcessingResult`), `Current Audit`, `Recent Audits`, and `Recent Staging` journal excerpts send requests to `POST /api/translate`, querying the active LLM provider or falling back to deterministic template localization (`"template-fallback"`).
    - For audit narratives, passes `source_kind="audit_narrative"` and `source_id=record_id`.
-   - The UI evaluates `source_hash` against current active text and displays a `[stale]` indicator if the underlying content changed since translation was fetched.
+   - The UI evaluates `source_hash` against current active text and displays a `[stale]` indicator if the underlying content (such as an edited proposal) changed since translation was fetched.
 Validation, resource parity, and translation lifecycle stay strictly in the backend.

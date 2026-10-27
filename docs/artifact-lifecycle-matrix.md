@@ -11,26 +11,27 @@ Correlation: run_id / record_id chain.
 
 | # | State | Memory | Persisted | Audit | Staging | Vault | Exec | UI shows |
 |---|-------|--------|-----------|-------|---------|-------|------|----------|
-| 1 | Input accepted | ingestion+units | P | yes | no | no | no | proposal preview |
-| 2 | Empty/skipped input | skip counts | P run-level | yes | no | no | no | skipped: reason |
-| 3 | Retrieval candidate | RetrievalResult | P hashes | yes | no | no | no | considered vs used |
-| 4 | NEEDS_REVIEW | entry held | P | yes | no | no | no | review + ack |
-| 5 | DO_NOT_IMPORT | entry held | P | yes | no | no | no | not imported: reason |
-| 6 | CREATE rejected | entry+outcome | P | yes | NO | no | attempted only | rejected: reason |
-| 7 | CREATE approved | approval+revalidation | P | yes | pending | no | pending | approved |
-| 8 | LLM unavailable | safe-stop entry | P | yes llm_unavailable | no | no | no | stopped: unavailable |
-| 9 | LLM malformed | safe-stop entry | P | yes llm_invalid_output | no | no | no | stopped: invalid output |
-| 10 | LLM/privacy/validation failure | safe-stop entry | P | yes | no | no | no | stopped: reason |
-| 11 | Revalidation failure | entry+check | P | yes | no | no | no | revalidation failed |
-| 12 | Execution failure | entry+reason | P | yes | no | no | attempted+failed | write failed |
-| 13 | Unsupported action | held_non_executable | P | yes | no | no | no | not executable in 0.1 |
-| 14 | Successful staging execution | entry+receipt | P+S | yes linked | YES hash.md | NO | executed | staged: file + hash |
-| 15 | Vault unavailable | run rejection | P run-level | yes | no | no | no | vault unreadable |
-| 16 | Index unavailable/stale | staleness report | P | yes | no | no | no | index stale: reindex |
+| 1 | Input accepted ($\ge 50$ letters, valid `chat_input` text) | provenance+ingestion+units | P | yes | no | no | no | live DeepThink trace + proposal preview |
+| 2 | Empty/skipped/rejected or $<50$-letter (`NEEDS_CLARIFICATION`) input | evaluation+skip counts (no raw text persisted) | P run-level (`failed/`) | yes | no | no | no | rejected/clarification + `Fix / Retry / Stop` |
+| 3 | Retrieval candidate & ephemeral input embeddings | `RetrievalResult` + `TemporaryEmbeddingCache` (wiped at run end) | P hashes & cache receipt | yes | no | no | no | considered vs used + substep pills |
+| 4 | `NEEDS_REVIEW` (Unified Human Review) | entry held + review request | P (`failed/`) | yes | no | no | no | full proposal review card + `Acknowledge` / `Reject` |
+| 5 | `DO_NOT_IMPORT` (Unified Human Review) | entry held + review request | P (`failed/`) | yes | no | no | no | full proposal review card (not imported: reason) + `Acknowledge` / `Reject` |
+| 6 | `CREATE` rejected (Unified Human Review & Approval) | entry+outcome | P (`failed/`) | yes | NO | no | attempted only | rejected: reason |
+| 7 | `CREATE` edited ($H_0 \to H_1$) & approved (Unified Human Review & Approval) | superseded $H_0$ + approval($H_1$)+7-check revalidation | P (pre-exec checkpoint in `failed/`) | yes | pending | no | pending | edited/approved ($H_1$) |
+| 8 | LLM unavailable | safe-stop entry | P | yes `llm_unavailable` | no | no | no | stopped: unavailable + `Fix / Retry / Stop` |
+| 9 | LLM malformed | safe-stop entry | P | yes `llm_invalid_output` | no | no | no | stopped: invalid output + `Fix / Retry / Stop` |
+| 10 | LLM/privacy/validation failure | safe-stop entry | P | yes | no | no | no | stopped: reason + `Fix / Retry / Stop` |
+| 11 | Revalidation failure (any of 7 checks, incl. duplicate-target prevention) | entry+check | P (`failed/`) | yes | no | no | no | revalidation failed |
+| 12 | Execution failure | entry+reason | P (`failed/`) | yes | no | no | attempted+failed | write failed |
+| 13 | Unsupported action (`UPDATE`/`MERGE`/`ARCHIVE` mapped to review) | held_non_executable | P (`failed/`) | yes | no | no | no | not executable in 0.1 (review + ack) |
+| 14 | Successful staging execution | entry+receipt | P+S (`passed/`) | yes linked | YES `<proposal_hash>.md` | NO | executed | staged: file + hash |
+| 15 | Vault unavailable | run rejection | P run-level | yes | no | no | no | vault unreadable + recovery |
+| 16 | Index unavailable/stale (Human-Gated 3-Way Vault Sync) | staleness/diff report (`added`/`modified`/`removed`) | P (+ isolated vector store update ONLY if human authorizes) | yes | no | no | no | sync prompt (approve: reconcile DB; reject: query existing DB) |
 | 17 | Pre-execution audit persistence failure | in-memory only | run aborts | attempted+failed | no | no | NO | audit unavailable: stopped |
-| 18 | Post-execution primary persistence failure, emergency journaling succeeds | entry+receipt | P (emergency) | yes linked (durability: confirmed) | YES hash.md | NO | executed | staged: file + hash (emergency audit) |
-| 19 | Post-execution audit persistence failure (both primary & emergency fail), artifact quarantined | entry+quarantine receipt | P run-level rejected | failed (durability: failed) | QUARANTINED (.unreconciled/) | NO | executed + quarantined | rejected: audit persistence failure (quarantined) |
-| 20 | Post-execution audit persistence failure, partial quarantine (source cleanup failed) | entry+quarantine receipt | P run-level rejected | failed (durability: failed) | PARTIAL (.unreconciled/ + staging/) | NO | executed + partial quarantine | rejected: audit persistence failure (partial quarantine) |
+| 18 | Post-execution primary persistence failure, emergency journaling succeeds | entry+receipt | P (emergency) | yes linked (`durability: confirmed`) | YES `<proposal_hash>.md` | NO | executed | staged: file + hash (emergency audit) |
+| 19 | Post-execution audit persistence failure (both primary & emergency fail), artifact quarantined | entry+quarantine receipt | P run-level rejected | failed (`durability: failed`) | QUARANTINED (`.unreconciled/`) | NO | executed + quarantined | rejected: audit persistence failure (quarantined) |
+| 20 | Post-execution audit persistence failure, partial quarantine (source cleanup failed) | entry+quarantine receipt | P run-level rejected | failed (`durability: failed`) | PARTIAL (`.unreconciled/` + `staging/`) | NO | executed + partial quarantine | rejected: audit persistence failure (partial quarantine) |
+| 21 | On-demand UI translation (`POST /api/translate`) | `TranslationRecord` (`persisted: false`, `source_hash` bound) | NO (memory/UI only) | no | no | no | no | translated view (`en` $\leftrightarrow$ `fa`) + `[stale]` badge on edit |
 
 Rules: rejected/held paths persist under the `failed` storage category
 with `artifact: none`; unhandled runtime execution faults persist under `errors`;
@@ -69,6 +70,10 @@ Post-Execution Audit Durability and Quarantine Rules:
      - Non-overwriting guarantee: if the target destination already exists, quarantine refuses to overwrite it and reports a collision error (`FileExistsError`), preserving both files intact.
      - Path-confinement: source and destination must resolve strictly inside the authorized staging root. Absolute external paths, traversal components (`..`), and escaping symlinks are rejected.
      - Full vs. Partial Quarantine: on POSIX systems where hard-linking is followed by `os.unlink(source)`, if unlinking fails after the destination link is created, `quarantine_artifact` returns `status="partial_cleanup_failed"` without destructive rollback. Both copies remain inspectable on disk, and the runner truthfully records `"audit persistence failure: partial quarantine"` (row 20). When source removal succeeds, status is `"quarantined"` and the runner records `"audit persistence failure: artifact quarantined"` (row 19).
+
+Continuous Live `Current Audit`, Unified Review Synchronization, and Knowledge Language Rules:
+- **Live DeepThink-Style `Current Audit` Continuity:** Across Stages 1–17, the backend streams live, verifiable analytical reasoning steps to `Current Audit` in memory (`M`). During the unified **Human Review & Explicit Approval** stage (rows 4–7), `Current Audit` pauses in sync with the human review state (`human_review_required`) and resumes continuously once the human decision (`approval_decided`) is recorded.
+- **Knowledge Language Authoring & Ephemeral `Translate`:** Persistent `Audit` narratives (`P`) and `Staging` artifacts (`S`) are written and recorded directly in their selected domain languages (`language.audit` and `language.staging` in `en` or `fa`). On-demand translations (`POST /api/translate`, row 21) exist strictly in memory (`persisted: false`) with SHA-256 `source_hash` binding and never mutate `P`, `S`, or `V`.
 
 The UI Recent Audits journal displays operational records from `passed/` and `failed/`,
 and also surfaces records from `errors/audit.jsonl` and emergency records from `errors/audit_emergency.jsonl` tagged with

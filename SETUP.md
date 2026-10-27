@@ -87,6 +87,14 @@ python -m venv Venv
 Venv\Scripts\activate
 ```
 
+### Upgrade environment packaging tools
+
+`pip-tools` excludes core packaging utilities (`pip` and `setuptools`) from compiled `.txt` manifests as unsafe packages. Baseline environment tooling must be updated to secure versions (addressing `GHSA-xmj3-9gf7-h52w` and `PYSEC-2026-3721`):
+
+```powershell
+python -m pip install --upgrade pip "setuptools>=84.1.0"
+```
+
 ### Install dependencies
 
 ```bash
@@ -224,16 +232,16 @@ registry branch — never by editing the shared interface.
    It is part of the guarded-root family: it must resolve outside the
    repository and must not overlap the vault, staging, or vector
    database roots. When configured, the audit writer may create the
-   root and its category subroots if missing; it never creates anything
+   root and its category subroots (`passed/`, `failed/`, and `errors/`) if missing; it never creates anything
    outside that boundary. Leaving it unset keeps audit records in
    memory only. Optional `audit.passed` and `audit.failed` select
    independently where successful vs unsuccessful terminal records are
    stored; each must resolve inside `audit.root` (defaults:
-   `<audit.root>/passed` and `<audit.root>/failed`). Storage category
+   `<audit.root>/passed`, `<audit.root>/failed`, and `<audit.root>/errors`). Storage category
    `failed` includes intentional safety holds/rejections and is not
-   synonymous with a system error — richer lifecycle outcomes remain
-   on the audit record. A future UI will expose these as folder picks
-   without editing YAML manually.
+   synonymous with a system error (operational execution faults and cancellations are partitioned under `errors/`) — richer lifecycle outcomes remain
+   on the audit record. The launcher UI exposes these directories as native OS folder picks (`POST /api/folders/pick` and `POST /api/config`)
+   without requiring manual YAML editing.
 
 5. Run the test suite (see [Testing](#testing)) to verify your configuration
    loads correctly.
@@ -357,14 +365,21 @@ Notes:
 
 * `--max-files` defaults to `1` and bounds source, corpus, and Core files
   alike; each additional file is an explicit operator decision.
-* Every extracted knowledge unit is governed independently: the proposal
-  is displayed, then human review, explicit approval (default No), fresh
-  revalidation, controlled execution, audit record.
+* Every extracted knowledge unit is governed independently through the
+  unified **Human Review & Explicit Approval** boundary: the complete
+  proposal, evidence, and uncertainties are displayed for all actions
+  (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), followed by explicit human
+  acknowledgment (for non-CREATE) or explicit approval / hash-rebinding
+  proposal edit ($H_0 \to H_1$) (default No for `CREATE`), fresh 7-check
+  revalidation (including single-target / no-duplicate output verification),
+  controlled execution, continuous audit record, and final output assembly.
 * `--embed` uses the configured local embedding model
   (`Config/models.yaml` + `Config/paths.local.yaml`) and an isolated
   LanceDB vector database. `--vector-db` is required with `--embed`, must
   resolve outside the repository, and is refused when it resolves to the
-  configured production vector database.
+  configured production vector database. Active query chunks are embedded
+  into a run-scoped `TemporaryEmbeddingCache` that stays in memory only for
+  that run and is wiped immediately afterward.
 * The corpus is indexed into that isolated database as retrieval context.
   A vector store is a retrieval index, never an authoritative knowledge
   store, and a vector result is evidence only — never identity,
@@ -372,16 +387,22 @@ Notes:
 * Indexing is refused when the isolated database is not empty. Storing
   the same corpus twice would accumulate duplicate rows and change the
   retrieval evidence while the inputs stayed identical, so the operator
-  either reuses the existing index (omit `--corpus-root`) or supplies a
-  fresh empty `--vector-db` directory.
+  either reuses the existing index (omit `--corpus-root`), uses the
+  human-authorized Vault reconciliation contract (which adds new note
+  embeddings, replaces modified note embeddings, and removes deleted note
+  embeddings), or supplies a fresh empty `--vector-db` directory.
 * The staging root is validated before anything is read: explicit,
   existing, real directory, not a symlink, outside the repository. Inside
   persistent-data roots it is accepted only when it resolves identically
   to the single config-declared `staging.root`; every other
   persistent-data location, and every other child of `data.root`, remains
   rejected.
-* With no `--core-root`, Core relevance stays unresolved and proposals
-  resolve conservatively to `NEEDS_REVIEW`. That is correct behaviour.
+* The `Core` class holds a single active reference note representing the
+  central research thesis of the repository (carrying the highest default
+  analytical and retrieval weight, while previous Core versions move to
+  `Archive`). With no `--core-root` or when Core is unresolved, proposals
+  never hallucinate a cold-start bypass and resolve conservatively to
+  `NEEDS_REVIEW` (or safe-stop for human resolution in the UI).
 * This is not a vault migration and not an authoritative write. `CREATE`
   means creation into the isolated staging area only.
 
@@ -408,14 +429,18 @@ Besides `--source-root`, the CLI also accepts:
   every candidate (retrieval, comparison, relation, core, classification,
   proposal, confidence, filter, LLM synthesis), not just the summary line.
 
-### Personal Vault vs. Examples mode
+### Personal Vault vs. Examples mode (Vault Mode vs. Test Mode)
 
 The project distinguishes two operating modes (`knowledge/modes.py`):
-**Personal Vault mode**, which resolves the Vault configured in
-`Config/paths.local.yaml`, and **Examples mode**, which uses only the
-synthetic material under `examples/` and fails closed rather than ever
-resolving a configured personal Vault. The active mode is recorded on
-every audit record produced during that run.
+Example files and designated test-specific files belong strictly to
+**TEST MODE** (`examples`), which uses only the synthetic material under
+`examples/` and fails closed rather than ever resolving a configured personal
+Vault. **VAULT MODE** (`personal_vault`) means the user selects folders
+through the frontend and the application is intended to process the user's
+own data from those selected folders. While the current implementation provides
+root directory configuration and fail-closed path validation, end-to-end
+processing of arbitrary user vaults remains an ongoing integration goal.
+The active mode is recorded on every audit record produced during that run.
 
 ---
 
@@ -447,24 +472,27 @@ page explains that the frontend must be built first.
 
 Transport surface (JSON + SSE, token header on every non-health route):
 - `GET /api/health`: Discovery and instance check.
-- `GET /api/state`: Snapshot configuration, folder validity, active models, and paused runs.
+- `GET /api/state`: Snapshot configuration, folder validity, active models, Knowledge Language settings (`app`, `staging`, `audit`), and paused runs.
 - `GET /api/journals`: 1:1 paired recent audits and staging records (including `passed/`, `failed/`, `errors/audit.jsonl`, and emergency recovery journals `errors/audit_emergency.jsonl`, with quarantine reporting for unreconciled staging artifacts).
-- `GET /api/events`: SSE stream for sanitized operational run events (with discrete stage progression and truthful retrieval substep operations: `query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording` across `started`, `completed`, and `failed` phases), numeric confidence scores, and stage states.
-- `POST /api/config`: Persist paths, LLM settings, and localization to `Config/*.local.yaml`.
+- `GET /api/events`: SSE stream for live DeepThink-style `Current Audit` analytical traces and sanitized operational run events across the 17-step (16 unified-stage) workflow—including the 5 `Input` validation/provenance checks, the 8 discrete `Ingestion` sub-stages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `metadata_extraction`, `chunking`, `extraction`), the discrete `Retrieval` operations (`query_preparation`, strategy/method validation, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording` across `started`, `completed`, and `failed` phases), multi-factor mathematical confidence scores (`0.00`–`1.00`), and synchronized wait/resume during unified `Human Review & Explicit Approval`.
+- `GET /api/vault/sync/status`: Inspect current Vault vector index authorization and freshness state (`unauthorized`, `fresh`, `stale`, `revoked`).
+- `POST /api/config`: Persist paths, LLM settings, and per-domain localization (`app`, `staging`, `audit`) to `Config/*.local.yaml`.
 - `POST /api/folders/pick`: Open native OS folder dialog server-side with guard validation.
 - `POST /api/folders/reveal`: Safe file listing of configured directories.
 - `POST /api/vault/index`: Execute initial vault vector baseline indexing via BGE-M3 and LanceDB.
 - `POST /api/vault/sync/authorize`: Authorize persistent vector index synchronization for configured Obsidian Vault.
-- `POST /api/vault/sync/reconcile`: Reconcile and re-index added/modified/removed notes in the dedicated store.
+- `POST /api/vault/sync/reconcile`: Perform 3-way Vault reconciliation (indexing added notes, replacing modified note embeddings, and deleting removed note embeddings in the dedicated store).
+- `POST /api/vault/sync/decide`: Record explicit human operator approval or rejection when pre-retrieval Vault changes are detected (`sync_approval_required`).
 - `POST /api/vault/sync/revoke`: Revoke authorization for Vault indexing.
-- `POST /api/run`: Submit query input for processing through the 10 backend stages.
-- `POST /api/approve`: Submit explicit human approval or rejection for CREATE proposals.
-- `POST /api/proposal/edit`: Server-side authoritative edit of pending proposal with hash recomputation.
-- `POST /api/run/accept`: Human acknowledgment for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`).
+- `POST /api/run`: Submit interactive chat input (`chat_input` text in current scope, with extensible foundation for future file/media formats) for processing through the full 17-step (16 unified-stage) backend pipeline (`Input` → `Ingestion` → `Retrieval` → `Comparison` → `Relation Analysis` → `Core Analysis` → `Classification` → `Proposal Type` → `Confidence` → `Knowledge Filter` → `LLM Synthesis` → `Unified Human Review & Explicit Approval` → `Revalidation` → `Controlled Execution` → `Audit` → `Output`).
+- `POST /api/cancel`: Request cooperative cancellation of an active in-flight run at the next safe boundary.
+- `POST /api/approve`: Submit explicit human approval or rejection for `CREATE` proposals bound to `proposal_hash` and `query_unit_id`.
+- `POST /api/proposal/edit`: Server-side authoritative edit of pending `CREATE` proposal with SHA-256 hash recomputation ($H_0 \to H_1$, superseding prior hash without file corruption).
+- `POST /api/run/accept`: Human acknowledgment for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`) bound to `run_id` and `proposal_hash`.
 - `POST /api/run/fix`: Error recovery / paused run resumption with corrected input/parameters.
 - `POST /api/run/stop`: Cleanly terminate a paused or safe-stopped run.
-- `POST /api/translate`: Live bilingual translation (English ↔ Persian) returning structured `TranslationRecord` (`persisted: false`).
-- `POST /api/consent`: Record explicit user consent for cloud provider interactions.
+- `POST /api/translate`: Live on-demand bilingual translation (English ↔ Persian) across `Audit`, `Staging`, and proposal views, returning a structured `TranslationRecord` (`persisted: false`, with `source_hash` staleness detection).
+- `POST /api/consent`: Record explicit per-call user consent for cloud provider interactions.
 
 Without a launcher token (for example plain `npm run dev`), the UI stays in fixture/demo mode and performs no backend calls. Run the launcher with:
 

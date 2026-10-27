@@ -15,10 +15,6 @@ placeholder page explains the frontend must be built first.
 Without a launcher token (plain `vite dev`), the UI stays in
 fixture/demo mode and performs no backend calls.
 
-Trust: per-launch random token injected into the served page; required on
-every non-health route (see folder-selection/launcher analysis). Loopback
-`127.0.0.1` only.
-
 ## GET /api/health
 
 - Purpose: instance discovery; detect already-running launcher; reject foreign occupant.
@@ -40,12 +36,13 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 
 ## POST /api/run
 
-- Purpose: start one bounded integration run over text input (implemented).
-- Request: `{ input_text, source_mode: "personal_vault"|"examples", app_language, staging_language, audit_language }`
-- Response: `{ run_id, accepted, reason }`
+- Purpose: start one bounded integration run over interactive chat text input (`chat_input` active in current scope; extensible foundation for future document/media formats) across the 17-step (16 unified-stage) workflow.
+- Request: `{ input_text, source_mode: "personal_vault"|"examples", retrieval_mode?: "lexical"|"semantic", app_language?: "en"|"fa", staging_language?: "en"|"fa", audit_language?: "en"|"fa", source_type?: "chat_input", input_id?: string }`
+- Response (HTTP 202): `{ run_id, accepted, reason, retrieval_mode, app_language, staging_language, audit_language, source_type }`
+- Input Evaluation Boundary: `process_input` validates the 5 Input sub-stages (source selection, type detection, structural bounds + $\ge 50$-letter substance threshold `DEFAULT_MIN_LETTERS = 50`, source identification `inp-<hash[:12]>`, and safety checks) before scheduling downstream ingestion.
 - Errors: validation / configuration / unavailable guards as typed kinds.
 - Auth: token required. Run IDs correlate all later events/approvals/journals.
-- Sync: asynchronous — returns run_id immediately; progress via `/api/events`.
+- Sync: asynchronous — returns `run_id` immediately; live DeepThink-style progress streamed via `/api/events`.
 - Destinations: the run prefers this launch's UI-validated session
   staging/audit selections (set via `/api/folders/pick`, memory only)
   and falls back to the config-declared locations; all values are
@@ -53,12 +50,15 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 
 ## POST /api/approve
 
-- Purpose: record one explicit human decision bound to one proposal hash.
+- Purpose: record one explicit human decision (`approve` or `reject`) bound to one `proposal_hash` in the unified **Human Review & Explicit Approval** stage.
 - Request: `{ proposal_hash, query_unit_id, decision: "approve"|"reject" }`
 - Response: `{ proposal_hash, approved, reason }`
-- Errors: stale hash → revalidation failure kind; unknown hash → validation error.
+- Eligibility & Errors:
+  - Only `CREATE` proposals may be approved for execution; attempting to `approve` a non-CREATE proposal (`NEEDS_REVIEW`, `DO_NOT_IMPORT`) returns HTTP 400 `validation_error` (non-CREATE proposals are acknowledged via `POST /api/run/accept` or rejected).
+  - Stale/unknown hash or mismatched `query_unit_id` → HTTP 400 `validation_error`.
+  - Cancelled, timed-out, or already-answered approval → HTTP 409 `conflict`.
 - Auth: token required. Only explicit UI decision; never inferred from confidence/classification/filter.
-- Sync: synchronous decision record; execution/revalidation remain backend-gated in the integration layer.
+- Sync: synchronous decision record; 7-check revalidation and controlled execution remain backend-gated in the integration layer.
 
 ## POST /api/proposal/edit
 
@@ -131,33 +131,55 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 - Auth: token required.
 - Sync: synchronous.
 
+## GET /api/vault/sync/status
+
+- Purpose: inspect current Vault persistent vector index authorization and freshness status without mutating the index.
+- Request: none (token header required).
+- Response: `{ authorized: boolean, status: "unauthorized"|"authorizing"|"sync_in_progress"|"fresh"|"stale"|"change_detected"|"revoked"|"error", vault_id: string, vault_root: string, vector_db_path: string, stored_vectors: number, diff?: { added: string[], modified: string[], removed: string[], stale: boolean } }`.
+- Auth: token required.
+- Sync: synchronous.
+
 ## POST /api/vault/sync/authorize
 
 - Purpose: explicitly authorize persistent vector indexing for the configured Vault.
-- Request: `{ vault_path?: string }`.
-- Response: `{ status: "authorized" | "already_authorized", vault_id: string, path: string }`.
+- Request: `{ vault_root?: string }`.
+- Response: `{ authorized: boolean, status: string, vault_id: string, vault_root: string, vector_db_path: string, ... }`.
 - Auth: token required.
 - Sync: synchronous authorization; executes initial sync.
 
 ## POST /api/vault/sync/reconcile
 
-- Purpose: explicitly reconcile and re-synchronize added, modified, or removed notes into the dedicated Vault vector store.
-- Request: `{ vault_id?: string, strategy?: "incremental" }`.
-- Response: `{ status: "fresh" | "stale", synced_count: number, removed_count: number }`.
+- Purpose: explicitly reconcile and re-synchronize added, modified, or removed notes in the dedicated Vault vector store (`vault_<sha256[:12]>`):
+  1. **Added Notes:** Generates embeddings for newly added Vault `.md` files and stores them in the isolated database.
+  2. **Modified Notes:** Generates fresh embeddings for modified files and replaces their outdated vectors in the database.
+  3. **Deleted Notes:** Removes vectors corresponding to files deleted from the Vault.
+- Request: `{}` (uses active authorized Vault session).
+- Response: `{ status: "fresh" | "stale", added_count: number, modified_count: number, removed_count: number, stored_vectors: number }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/vault/sync/decide
+
+- Purpose: record the explicit human operator decision (`approve` or `reject`) when pre-retrieval Vault changes are detected during a semantic run (`sync_approval_required` SSE event).
+  - If `approve`: performs 3-way Vault reconciliation (indexing added notes, replacing modified file embeddings, and deleting removed file embeddings) before executing candidate retrieval against the updated database.
+  - If `reject`: leaves the persistent vector database untouched, preserves its stale status truthfully, and proceeds with candidate retrieval against the existing database using the run's temporary input embeddings (`TemporaryEmbeddingCache`).
+- Request: `{ run_id: string, vault_id: string, decision: "approve" | "reject" }`.
+- Response: `{ status: "ok", run_id: string, vault_id: string, decision: string }`.
+- Errors: HTTP 400 `validation_error` (missing fields or invalid decision); HTTP 404 `not_found` (no pending sync approval for `run_id`); HTTP 422 `unprocessable_entity` (`vault_id` mismatch); HTTP 409 `conflict` (already decided/cancelled).
 - Auth: token required.
 - Sync: synchronous.
 
 ## POST /api/vault/sync/revoke
 
 - Purpose: explicitly revoke authorization for Vault synchronization and stop all index sync actions.
-- Request: `{ vault_id?: string }`.
-- Response: `{ status: "revoked", vault_id: string }`.
+- Request: `{}`.
+- Response: `{ authorized: false, status: "revoked", vault_id: string }`.
 - Auth: token required.
 - Sync: synchronous.
 
 ## POST /api/folders/reveal
 
-- Purpose: safe file listing of a configured destination directory (staging, audit, etc.) for UI inspection without executing or executing outside files.
+- Purpose: safe file listing of a configured destination directory (staging, audit, etc.) for UI inspection without executing or opening outside files.
 - Request: `{ purpose: "staging" | "audit" | "vault" | "vector_db" }`.
 - Response: `{ purpose: string, path: string, files: Array<{ name: string, is_dir: boolean, size: number, modified: string }> }`.
 - Auth: token required.
@@ -166,16 +188,28 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 ## POST /api/vault/index
 
 - Purpose: execute vault vector baseline indexing using BGE-M3 and LanceDB in the isolated vector store folder.
-- Request: none (uses configured vault and database paths).
+- Request: `{}` (uses configured vault and database paths).
 - Response: `{ indexed: boolean, reason?: string }`.
+- Auth: token required.
+- Sync: synchronous.
+
+## POST /api/consent
+
+- Purpose: answer one pending per-call cloud privacy consent request (`consent_required` SSE event) bound to the exact prompt digest (`consent_id`) before dispatching a non-local LLM synthesis request.
+- Request: `{ consent_id: string, decision: "approve" | "reject" }`.
+- Response: `{ consent_id: string, approved: boolean }`.
+- Errors: HTTP 409/400 `validation_error` on unknown or already-answered `consent_id`.
 - Auth: token required.
 - Sync: synchronous.
 
 ## POST /api/run/accept
 
-- Purpose: explicit human review acknowledgment for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`). Acknowledges the proposal without triggering file creation.
-- Request: `{ run_id: string }`.
-- Response: `{ status: "acknowledged", run_id: string }`.
+- Purpose: explicit human review acknowledgment in the unified **Human Review & Explicit Approval** stage for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`). Acknowledges human inspection of the proposal and resumes the pipeline to terminal Audit/Output without triggering file creation.
+- Request: `{ proposal_hash: string, run_id?: string }` (`proposal_hash` must be a valid 64-character hex SHA-256 digest matching the active pending review).
+- Response: `{ accepted: true, action: string, run_id: string, proposal_hash: string }`.
+- Errors:
+  - HTTP 400 `validation_error`: missing, non-64-hex, or mismatched `proposal_hash`, or if the pending proposal is `CREATE` (`CREATE` proposals require `/api/approve`).
+  - HTTP 409 `conflict`: run already completed, cancelled, timed out, already answered, or `run_id` mismatch.
 - Auth: token required.
 - Sync: synchronous.
 
@@ -217,10 +251,12 @@ every non-health route (see folder-selection/launcher analysis). Loopback
 
 - Purpose: stream run-scoped operational events for the Current Audit view and workflow timeline.
 - Envelope: `{ kind, run_id, stage, substage?, operation?, phase?, message, timestamp, confidence_score?, confidence_score_band?, classification_type?, proposal_hash?, candidate_count?, unit_count? }`.
-- Kinds: `run_started|stage_started|stage_completed|status|warning|error|stopped|human_review_required|approval_decided|revalidation_result|execution_result|run_completed|run_rejected`.
-- Stages and Operations:
-  - `ingestion`: discrete substages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `chunking`, `metadata_extraction`, `extraction`).
-  - `retrieval`: discrete operations (`query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording`) with explicit phases `started`, `completed`, and `failed`.
+- Kinds: `run_started|stage_started|stage_completed|status|warning|error|stopped|human_review_required|approval_decided|consent_required|sync_approval_required|revalidation_result|execution_result|run_completed|run_rejected`.
+- Stages, Sub-Stages, and Live `Current Audit` Continuity:
+  - Streams continuous, verifiable DeepThink-style analytical progress across all 17 stages (16 unified operational stages), respecting the selected `Audit` and `Staging` Knowledge Languages (`en`/`fa`).
+  - `ingestion`: 8 discrete substages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `chunking`, `metadata_extraction`, `extraction`).
+  - `retrieval`: discrete operations (`query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording`) with explicit phases `started`, `completed`, and `failed`, plus ephemeral `TemporaryEmbeddingCache` cleanup receipts and human-gated Vault sync events (`sync_approval_required`).
+  - `human_review` (Unified Human Review & Explicit Approval): emits `human_review_required` for all proposal actions (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), pausing the live `Current Audit` stream in sync with human inspection/editing and resuming continuously upon `approval_decided`.
 - Rejection and Quarantine: When audit persistence fails post-execution, terminal rejection events explicitly report `"audit persistence failure: artifact quarantined"` or `"audit persistence failure: partial quarantine"`.
 - Client Correlation, Filtering, and Substep Lifecycle Contract:
   - Clients MUST strictly filter incoming SSE events by the active `run_id` (`filterEventsByRun(events, run.run_id)`). When `run_id` is omitted, events must NEVER be selected solely because they occur later in the array.

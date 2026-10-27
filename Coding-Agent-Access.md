@@ -155,3 +155,12 @@ This applies even when the motivation is troubleshooting, verification, or worki
 
 > Coding-agent capability is not permission to access production data.  
 > Minimum necessary access. Explicit scoped approval. Never the whole tree by default.
+---
+
+## 12. Operating Modes: Example Fixtures vs. Personal Vault Data
+
+The project distinguishes between two core operating modes (`knowledge/modes.py`):
+1. **TEST MODE (`examples`):** Example files and designated test-specific files belong strictly to **TEST MODE**. It operates exclusively on synthetic, public-safe example fixtures located within the repository (e.g., under `examples/bounded_local_integration/` and designated test output directories) and is designed for testing, offline evaluation, and automated test suites.
+2. **VAULT MODE (`personal_vault`):** In **VAULT MODE**, the user selects folders through the frontend, and the application is intended to process the user's own data from those selected folders (such as the personal Obsidian vault and persistent databases, configured via `POST /api/folders/pick` and `POST /api/config`). In the current implementation, the backend provides root directory configuration and fail-closed path boundary validation, while granular subfolder selection, cold-start vault bootstrapping, and end-to-end personal vault workflow verification remain ongoing integration goals.
+
+Coding agents must never mix these modes, substitute production user data into example test runs without explicit user approval, or attempt to resolve personal vault paths when operating in test/examples mode.

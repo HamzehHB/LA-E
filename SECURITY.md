@@ -20,42 +20,60 @@ Facts verified against the repository at this checkpoint:
 * Git history **does** contain historical machine-specific filesystem paths
   (former `Config/paths.yaml` versions and an older workspace file). This is a
   documented residual risk (§5). No history rewriting is performed by agents.
-* Application code performs network calls only inside
-  `src/living_authenticity/llm/` via stdlib `urllib`/`http` (local or
-  configured endpoint, privacy gate on resolved host, no streaming,
-  credentials from environment only, audit stores prompt hash only).
+* Application code performs outbound network calls only inside
+  `src/living_authenticity/llm/` via stdlib `urllib`/`http` (local `Ollama` or
+  configured cloud endpoint, per-call privacy consent gate on resolved non-local host, no streaming,
+  credentials from environment only, audit stores prompt hash only), while the local launcher
+  (`src/living_authenticity/adapter/server.py`) binds strictly to loopback `127.0.0.1` with
+  per-launch in-memory `X-LAE-Token` authentication and Origin/Host verification.
   No dynamic code execution (`eval`/`exec`), no shell-out
   (`subprocess`/`os.system`), and no deserialization of untrusted data.
-* The analytical pipeline is analysis-only: it performs no authoritative writes
-  to knowledge. Exactly **three** narrowly scoped write surfaces exist, with
-  disjoint roots (staging and audit proved by
+* The `Input` stage (`knowledge/input/processor.py`) enforces an authoritative entry gate:
+  it restricts active interactive input to `chat_input` text (while laying the extensible foundation
+  for future document/media formats), validates operating mode (`personal_vault` or `examples`),
+  enforces UTF-8 encoding, `MAX_TEXT_BYTES = 1_000_000`, control-character rejection, noise filtering,
+  and substantive content thresholds, and records only `input_id` and SHA-256 `input_hash`
+  (never persisting raw private input text to audit logs).
+* The analytical pipeline (`Ingestion` through `Retrieval`, `Comparison`, `Relation Analysis`,
+  `Core Analysis`, `Classification`, `Proposal Type`, `Confidence`, `Knowledge Filter`, and `LLM Synthesis`)
+  is strictly analysis-only: it performs no authoritative writes to knowledge. Exactly **three** narrowly
+  scoped write surfaces exist, with disjoint roots (staging and audit proved by
   `tests/security/test_execution_write_surface.py`; vector isolation proved by
   vector eligibility tests):
   1. **ControlledExecutor** (`knowledge/governance/execution/`) writes exactly
-     one approved + revalidated `CREATE` artifact (`<proposal_hash>.md`) into
+     one approved + 7-check revalidated `CREATE` artifact (`<proposal_hash>.md`, or the updated
+     canonical hash $H_1$ when edited by the human via `apply_proposal_edit`) into
      an explicitly supplied staging root confined by `PathBoundary`, with no
-     overwrite and no authoritative-vault placement;
+     overwrite, single-target / no-duplicate output enforcement, and no authoritative-vault placement.
+     If both primary and emergency post-execution audit persistence fail, `quarantine_artifact`
+     moves the artifact into `.unreconciled/` (or sibling `.unreconciled.<filename>`, preserving the
+     no-mkdir AST invariant) with strict path confinement and no overwrite;
   2. **AuditWriter** (`knowledge/governance/audit/persistence.py`) appends
      append-only JSONL records under the config-declared `audit.root`,
      partitioned into configurable `passed` / `failed` / `errors` subroots (defaults
      `<audit.root>/passed`, `<audit.root>/failed`, `<audit.root>/errors`; `passed/` holds
      ONLY the executed-CREATE terminal record, `failed/` holds every
-     other terminal record including pre-execution checkpoints; `errors/` holds execution faults).
+     other terminal record including pre-execution checkpoints and non-CREATE acknowledgments;
+     `errors/` holds operational execution faults, cancellations, and `os.fsync`-confirmed emergency
+     recovery journals `errors/audit_emergency.jsonl`).
      Directory creation (`ensure_directories`) uses `os.makedirs(..., exist_ok=True)` strictly inside `persistence.py`.
      It never overwrites, deletes, or renames existing records and never writes to vault, staging,
      index, or any other root. Credential-like keys are stripped recursively
      before persistence. When an audit root is configured, the required
      pre-execution audit append must succeed before staging execution;
   3. **Vector/index subsystem** may write only its own derived LanceDB index
-     under an explicitly supplied, isolated vector root (never the production
-     vector database, never vault/staging/audit). Indexing is explicit
-     operator action only — no watcher and no background reindex.
+     under an explicitly supplied, isolated vector root (`vault_<sha256[:12]>` per authorized Vault;
+     never the production vector database, never vault/staging/audit). Indexing and 3-way Vault
+     reconciliation (indexing added notes, replacing modified note vectors, and deleting removed note
+     vectors) execute strictly via explicit human operator action — no watcher and no background reindex.
+     Run-scoped query embeddings (`TemporaryEmbeddingCache`) exist strictly in memory for the active
+     run only and are wiped on every exit path (`finally:`).
   Local YAML configuration persistence (`Config/*.local.yaml`) is executed strictly
   in `Config/settings.py` (outside the `src/` tree), preserving the static AST invariant
   that no filesystem mutation operations exist in application logic outside `executor.py` and `persistence.py`.
   Current executable action scope is `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` — everything else is future work.
 * Private configuration and private documents are physically outside the
-  tracked tree: `Config/paths.local.yaml`, `Config/llm.local.yaml`,
+  tracked tree: `Config/paths.local.yaml`, `Config/llm.local.yaml`, `Config/localization.local.yaml`,
   `.project/`, `.clinerules/`,
   `Venv/`, `.env`, and `Logs/*` are all covered by `.gitignore` and verified
   with `git check-ignore`. `Config/paths.local.yaml` and
@@ -96,8 +114,13 @@ Facts verified against the repository at this checkpoint:
   The isolation guard is checked before any indexing occurs.
 * The formal LLM stage is mandatory architecture: a disabled,
   unreachable, or invalid provider stops the affected unit safely
-  (`llm_safe_stop`, no candidate, no approval, no execution) instead
-  of bypassing synthesis. The vault stays read-only and bounded.
+  (`llm_safe_stop`, no candidate, no approval, no execution, surfacing actionable
+  in-UI recovery) instead of bypassing synthesis. Following synthesis, the unified
+  **Human Review & Explicit Approval** gate presents all proposals (`CREATE`, `NEEDS_REVIEW`,
+  `DO_NOT_IMPORT`) to the human, requiring explicit acknowledgment (`Accept`) for non-CREATE
+  outcomes and explicit hash-bound approval (`Approve`) for `CREATE`. On-demand bilingual
+  translations (`POST /api/translate`) are presentation-only (`persisted: false`) and never
+  alter authoritative content or approval hashes. The vault stays read-only and bounded.
 * Example inputs under `examples/` are synthetic and fictitious; they
   contain no real knowledge, no real machine path, and no credentials.
 

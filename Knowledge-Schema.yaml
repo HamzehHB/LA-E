@@ -72,41 +72,48 @@ invariants:
       - "Analytical output is not automatically authoritative knowledge."
       - "A proposal is not an executed change."
       - "Approval is distinct from confidence."
-      - "Execution must correspond to an explicitly approved action."
+      - "Human Review and Explicit Approval operate as a unified governance boundary: every proposal (CREATE, NEEDS_REVIEW, DO_NOT_IMPORT) is presented to the human for inspection, while execution requires explicit human approval bound to the exact proposal_hash."
+      - "Human editing of a CREATE proposal recomputes a new canonical proposal_hash (H0 -> H1 via supersedes:H0) without corrupting state and requires fresh explicit approval of H1."
+      - "Execution must correspond to an explicitly approved and revalidated action."
 
   meaning_preservation:
     requirements:
-      - "Cleaning must not silently alter substantive meaning."
+      - "Cleaning must remove only technical noise and must never silently delete or alter substantive or important content."
       - "Normalization must preserve intended meaning."
       - "Interpretation must remain distinguishable from source content."
       - "Meaningful ambiguity must remain visible."
+      - "Knowledge language domains (Audit and Staging) record content in their selected domain language (en or fa) while preserving source provenance, and on-demand translations (Translate) remain non-authoritative presentation records."
 
   provenance:
     required: true
     requirements:
-      - "Knowledge must remain traceable to its origin whenever origin is available."
+      - "Knowledge must remain traceable to its origin whenever origin is available (via stable input_id, SHA-256 input_hash, and unit provenance)."
       - "Derived knowledge must retain traceability to the knowledge from which it was derived."
       - "Unknown provenance must not be fabricated."
+      - "Raw private input text and credentials must never be leaked into persistent audit logs."
 
   no_silent_data_loss:
     requirements:
-      - "Meaningful information must not be silently discarded."
-      - "Rejected or non-imported knowledge should remain explainable when relevant."
+      - "Meaningful information must not be silently discarded at any stage (Input, Ingestion, Cleaning, Extraction, Analysis, Synthesis, or Execution)."
+      - "Rejected or non-imported knowledge should remain explainable and auditable when relevant."
       - "Archival must remain distinguishable from deletion."
       - "Merge operations must preserve meaningful distinctions."
 
   retrieval_integrity:
     requirements:
-      - "Retrieved candidates must correspond to actual knowledge objects."
+      - "Retrieved candidates must correspond to actual knowledge objects with canonical identity keys (<source>:<position>:<unit_id>)."
       - "Identifiers must never be fabricated."
       - "Paths must never be fabricated."
       - "Retrieval results are candidates for analysis, not decisions."
+      - "Run-scoped input chunk embeddings must stay strictly in a temporary in-memory cache (TemporaryEmbeddingCache) for the duration of the active run only and be wiped immediately afterward."
+      - "Persistent Vault vector index synchronization (adding new note embeddings, replacing modified file embeddings, and deleting removed file embeddings) requires explicit human authorization; if declined, retrieval queries the existing index without mutation."
 
   relation_integrity:
     requirements:
       - "Relations require actual source and target objects."
       - "Similarity alone does not establish a relation."
       - "Relation targets must be verified."
+      - "Comparison (correlational content/similarity/difference/contradiction assessment) and Relation Analysis (causal-comparative and structural relationship assessment) must remain methodologically distinct."
 
   identity_integrity:
     requirements:
@@ -119,13 +126,16 @@ invariants:
       - "Uncertainty must be represented when materially relevant."
       - "Insufficient evidence must not be converted into false certainty."
       - "Ambiguous cases should normally resolve to NEEDS_REVIEW."
+      - "Missing prerequisites or stage errors must trigger a deterministic Safe Stop with actionable frontend recovery (Fix / Retry / Stop) rather than hallucinated cold-start assumptions."
 
   core_integrity:
     requirements:
       - "Core represents approved theoretical reference knowledge."
-      - "Core must be resolved from actual approved knowledge."
-      - "Core must not be assumed from hardcoded model knowledge."
-      - "Potential Core conflicts must remain visible."
+      - "The Core class is the unique knowledge class that always holds a single active note representing the central research anchor of the repository at that time."
+      - "When the active Core note is updated or replaced through human-governed action, the previous Core note transitions to the Archive class."
+      - "While the active Core note can itself be challenged by new evidence, it carries the highest analytical weight and receives dynamic default priority weighting in Vault retrieval."
+      - "Core must be resolved from actual approved knowledge and must never be fabricated or assumed from hardcoded model memory."
+      - "Potential Core conflicts must remain visible and require human review."
       - "Core changes require explicit human governance."
 
 
@@ -149,9 +159,19 @@ knowledge_types:
   definitions:
 
     Core:
-      description: "Approved foundational or governing theoretical knowledge."
+      description: >
+        Approved foundational or governing theoretical knowledge. Core is the
+        sole class that always holds a single active note serving as the central
+        research thesis of the repository at that point in time. It carries the
+        highest analytical weight and dynamic default retrieval priority while
+        remaining open to scholarly challenge; when updated or replaced, the
+        previous Core note transitions to Archive.
       authoritative: true
       special_status: true
+      single_active_note_invariant: true
+      challengeable: true
+      default_dynamic_retrieval_weighting: "highest"
+      superseded_transition_target: "Archive"
 
     Concept:
       description: "A conceptual, theoretical, or abstract knowledge object."
@@ -182,9 +202,27 @@ knowledge_types:
       authoritative: true
 
     Archive:
-      description: "Previously authoritative knowledge retained for historical or traceability purposes."
+      description: >
+        Previously authoritative knowledge (including superseded Core notes)
+        retained for historical or traceability purposes.
       authoritative: true
       deletion_equivalent: false
+      receives_superseded_core_notes: true
+
+  classification_stage:
+    description: >
+      Evidence-informed categorization stage executed after Retrieval, Comparison,
+      Relation Analysis, and Core Analysis. Classification proposes a knowledge
+      type without gating upstream retrieval or authorizing execution.
+    sub_stages:
+      - id: "classification_evidence_collection"
+        description: "Collects upstream structural, comparative, relational, and Core evidence relevant to determining the knowledge class."
+      - id: "classification_assessment"
+        description: "Evaluates collected evidence against canonical classification criteria."
+      - id: "classification_uncertainty_assessment"
+        description: "Identifies ambiguity among competing candidate classes so uncertain units are not forced into a category."
+      - id: "classification_result_recording"
+        description: "Records the proposed type, rationale, and certainty/uncertainty in ClassificationResult and Audit."
 
   open_questions:
     independent_note_type: false
@@ -204,7 +242,7 @@ knowledge_unit:
 
   definition: >
     A knowledge unit is the smallest independently analyzable meaningful
-    unit extracted from an input.
+    unit extracted from an input during Ingestion.
 
   cardinality:
     per_input:
@@ -216,8 +254,10 @@ knowledge_unit:
     - "One input may contain one knowledge unit."
     - "One input may contain multiple independent knowledge units."
     - "Independent units must be analyzed separately."
-    - "Extraction must preserve provenance."
-    - "Extraction must preserve original meaning."
+    - "Chunking supports both (1) decomposing a single input into multiple independent knowledge units/outputs when distinct ideas exist, and (2) preparing bounded segments for lexical, semantic, and future hybrid retrieval."
+    - "Extraction must preserve provenance (input_id, input_hash, source, and position)."
+    - "Extraction must preserve original meaning; Cleaning must never delete substantive content."
+    - "During Ingestion extraction, proposed_type remains unresolved until the downstream Classification stage runs after evidence analysis."
 
   fields:
 
@@ -230,9 +270,29 @@ knowledge_unit:
       type: "provenance"
       required: true
 
+    input_id:
+      type: "string"
+      required: false
+      description: "Stable identifier of the originating input (inp-<sha256[:12]>)."
+
+    input_hash:
+      type: "string"
+      required: false
+      description: "SHA-256 hex digest of the raw originating input bytes."
+
+    position:
+      type: "integer"
+      required: false
+      description: "Zero-based ordinal position of the unit within the source."
+
     original_text:
       type: "string"
       required: true
+
+    cleaned_text:
+      type: "string"
+      required: false
+      description: "Text after technical noise removal (preserving all substantive content)."
 
     normalized_text:
       type: "string"
@@ -395,9 +455,11 @@ folder_structure:
     authoritative: false
 
   "01 Core":
-    purpose: "Approved Core knowledge."
+    purpose: "Approved Core knowledge (always holds a single active central research note; superseded Core notes move to 99 Archive)."
     authoritative: true
     canonical_type: "Core"
+    max_active_notes: 1
+    superseded_destination: "99 Archive"
 
   "02 Observation":
     purpose: "Observation knowledge."
@@ -439,7 +501,7 @@ folder_structure:
     authoritative: false
 
   "99 Archive":
-    purpose: "Archived knowledge."
+    purpose: "Archived knowledge (including previous Core notes replaced by newer approved Core versions)."
     authoritative: true
     canonical_type: "Archive"
 
@@ -455,17 +517,39 @@ provenance:
     origin_type:
       type: "string"
       required: true
-      description: "Type of originating material."
+      description: "Type of originating material (currently 'chat_input'; extensible foundation for future authorized file/media sources)."
 
     origin_id:
       type: "string"
       required: false
-      description: "Actual identifier of the originating object, when available."
+      description: "Actual identifier of the originating object (e.g. input_id 'inp-<hash[:12]>'), when available."
+
+    input_hash:
+      type: "string"
+      required: false
+      description: "Pure 64-character SHA-256 hex digest over raw input bytes."
+
+    input_hash_source:
+      type: "string"
+      allowed_values: ["input_provenance", "unit_content_fallback"]
+      required: false
+      description: "Distinguishes full source input hash from unit-level content hash fallback."
 
     origin_path:
       type: "string"
       required: false
       description: "Actual path of the originating object, when available."
+
+    operating_mode:
+      type: "string"
+      allowed_values: ["personal_vault", "examples"]
+      required: false
+      description: "Operating mode under which the input was evaluated."
+
+    run_id:
+      type: "string"
+      required: false
+      description: "Run identifier correlating all stage events, approvals, and audit records."
 
     original_text:
       type: "string"
@@ -486,6 +570,13 @@ provenance:
       required: false
       description: "Meaningful transformation applied to the source."
 
+  cryptographic_digests:
+    input_hash: "SHA-256 over raw input bytes (identifies source submission without storing raw private text in audit logs)."
+    proposal_hash: "Canonical SHA-256 over proposal_payload(proposal, confidence, note) binding human approval and revalidation to exact content."
+    evidence_hash: "SHA-256 over pipe-separated retrieved unit IDs cited as evidence."
+    prompt_hash: "SHA-256 over the bounded prompt sent to LLM synthesis."
+    artifact_sha256: "SHA-256 over the written Staging Markdown file bytes."
+
   rules:
     - "Only actual identifiers may be recorded."
     - "Unknown information must remain unknown."
@@ -497,6 +588,26 @@ provenance:
 # ============================================================================
 
 relations:
+
+  methodological_paradigm: >
+    Relation Analysis evaluates whether a defensible directional, structural,
+    or causal-comparative relationship exists between the input and existing
+    knowledge. Whereas Comparison operates like a correlational analysis
+    (measuring content overlap, similarity, and differences), Relation Analysis
+    operates like a causal-comparative analysis (weighing evidence for and
+    against specific relational claims).
+
+  sub_stages:
+    - id: "relation_candidate_identification"
+      description: "Identifies retrieved items that plausibly hold a relationship with the input so analysis focuses on relevant options."
+    - id: "relationship_evidence_analysis"
+      description: "Examines corroborating and conflicting evidence for a potential relationship so relations are never inferred merely from similarity."
+    - id: "relation_type_assessment"
+      description: "Determines the specific directional relationship type (e.g. supports, depends_on, challenges) so distinct relations are not confused."
+    - id: "uncertainty_assessment"
+      description: "Identifies ambiguity and insufficient evidence so tentative relations are never presented as established facts."
+    - id: "relation_result_recording"
+      description: "Records the relation analysis outcome, supporting evidence, and uncertainty into RelationDetectionResult and Audit."
 
   canonical_types:
 
@@ -609,9 +720,31 @@ relation_status:
 comparison:
 
   purpose: >
-    Determine whether a knowledge unit represents existing knowledge,
-    modifies existing knowledge, should be integrated with existing knowledge,
-    or represents meaningful independent knowledge.
+    Compare the input unit against each retrieved candidate individually to
+    identify similarities, meaningful differences, and potential contradictions,
+    determining whether the unit represents existing knowledge, modifies existing
+    knowledge, or contributes meaningful independent knowledge.
+
+  sub_stages:
+    - id: "candidate_by_candidate_comparison"
+      description: "Compares each retrieved candidate separately against the input so the outcome of one candidate is never generalized to others."
+    - id: "content_comparison"
+      description: "Examines substantive meaning and content of both items rather than superficial formatting."
+    - id: "similarity_assessment"
+      description: "Quantifies the degree of similarity using explicit criteria without assuming similarity implies identity."
+    - id: "difference_identification"
+      description: "Identifies unique or divergent information between the two items so meaningful differences are not hidden under similarity."
+    - id: "contradiction_detection"
+      description: "Detects incompatible claims or conflicting information before any action is proposed."
+    - id: "comparison_evidence_recording"
+      description: "Records comparison findings, shared terms, distinct tokens, and category into ComparisonResult and Audit."
+
+  outcome_categories:
+    - "identical_content"
+    - "possible_duplicate"
+    - "related_but_distinct"
+    - "distinct"
+    - "insufficient_evidence"
 
   dimensions:
 
@@ -815,7 +948,27 @@ core:
 
   definition: >
     Core represents approved foundational or governing theoretical knowledge
-    used as the current reference for the system.
+    used as the current central reference for the system. Core is the sole
+    knowledge class that always holds a single active note in the repository;
+    when updated or replaced through human governance, the previous Core note
+    moves to Archive.
+
+  sub_stages:
+    - id: "core_schema_resolution"
+      description: "Resolves the authoritative Core structure and folder ('01 Core') from this canonical schema so Core identification relies on a single reference contract."
+    - id: "relevant_core_context_identification"
+      description: "Selects the relevant conceptual sections of the active Core note for contextual evaluation."
+    - id: "core_relevance_analysis"
+      description: "Analyzes the semantic relationship between the input unit and Core concepts to clarify its significance for the central knowledge structure."
+    - id: "conflict_or_uncertainty_detection"
+      description: "Identifies incompatibilities, challenges, and unresolved ambiguities so conceptual tensions with Core are never overlooked."
+    - id: "core_analysis_result_recording"
+      description: "Records the relevance outcome, evidentiary basis, and uncertainties into CoreAnalysisResult and Audit."
+
+  architectural_invariants:
+    single_active_note: "Only one active note exists in the Core class at any time, representing the central research anchor of the repository; superseded Core notes move to Archive."
+    dynamic_retrieval_weighting: "In Vault vector retrieval, the active Core note and its embeddings receive dynamic default higher priority weighting, automatically tracking updates when the Core note or its vectors change."
+    no_hallucinated_cold_start: "Cold-start or missing-Core states must never be masked by hallucination; any stage error or missing prerequisite halts in a deterministic Safe Stop with actionable Fix / Retry / Stop controls in the frontend UI."
 
   possible_relationships:
     - "supports_core"
@@ -826,6 +979,11 @@ core:
     - "contrasts_with_core"
     - "no_meaningful_core_relation"
     - "potential_core_conflict"
+    - "insufficient_evidence"
+
+  runtime_relevance_levels:
+    - "potentially_relevant"
+    - "no_observed_relevance"
     - "insufficient_evidence"
 
   requirements:
@@ -888,14 +1046,56 @@ conflict_status:
 confidence:
 
   definition: >
-    Analytical confidence in the validity of a proposed interpretation,
-    classification, comparison, relation, or action.
+    Analytical confidence measuring how strongly the collected evidence and
+    analyses support a proposed interpretation, classification, comparison,
+    relation, or action, and how much epistemic uncertainty remains.
+
+  sub_stages:
+    - id: "evidence_sufficiency_assessment"
+      description: "Evaluates how sufficient and complete the evidence across Retrieval, Comparison, Relation Analysis, Core Analysis, and Classification is to support the result."
+    - id: "uncertainty_assessment"
+      description: "Identifies ambiguities, contradictions, and analytical limitations so confidence is never inflated beyond reality."
+    - id: "confidence_calculation_or_assessment"
+      description: "Computes both the multi-factor numeric confidence score C in [0.00, 1.00] and the ordinal strength level."
+    - id: "confidence_result_recording"
+      description: "Records the numeric score, ordinal level, evidentiary basis, and uncertainty tuple into ConfidenceAssessment and Audit."
 
   range:
     minimum: 0.0
     maximum: 1.0
 
   default_threshold: 0.60
+
+  ordinal_levels:
+    - "sufficiently_supported"
+    - "weak"
+    - "contradictory_or_unresolved"
+    - "insufficient_evidence"
+
+  mathematical_formulation:
+    equation: "C = clip_[0,1]( (w_E * S_evidence + w_D * S_distinct + w_K * S_class + w_R * S_core) * prod_{g in G}(1 - lambda_g) - Phi_conflict )"
+    pillars:
+      evidence_completeness:
+        symbol: "S_evidence"
+        weight: 0.30
+        description: "Completeness of analytical evidence across classification, retrieval candidates, comparisons, relations, and Core analysis."
+      comparative_distinctness:
+        symbol: "S_distinct"
+        weight: 0.25
+        description: "Clarity and non-contradiction of candidate comparison outcomes."
+      classification_certainty:
+        symbol: "S_class"
+        weight: 0.25
+        description: "Certainty of the evidence-informed classification (is_certain vs is_resolved vs unresolved)."
+      core_resolution_stability:
+        symbol: "S_core"
+        weight: 0.20
+        description: "Resolution stability of Core relevance analysis."
+    uncertainty_decay_and_ceilings:
+      no_evidence_ceiling: 0.00
+      contradictory_or_insufficient_ceiling: 0.45
+      recorded_gap_ceiling: 0.75
+      sufficiently_supported_floor: 0.85
 
   bands:
 
@@ -915,11 +1115,11 @@ confidence:
     - "Confidence is analytical, not authoritative."
     - "High confidence does not authorize execution."
     - "Low confidence should normally trigger review."
-    - "Confidence should be supported by reasoning and evidence."
+    - "Confidence should be supported by reasoning, mathematical breakdown, and evidence."
 
 
 # ============================================================================
-# 17. ACTION OBJECT
+# 17. ACTION OBJECT, PROPOSAL TYPE, KNOWLEDGE FILTER & LLM SYNTHESIS
 # ============================================================================
 
 action:
@@ -933,11 +1133,40 @@ action:
     - "NEEDS_REVIEW"
     - "NO_ACTION"
 
+  current_scope_operational_actions:
+    - "CREATE"
+    - "NEEDS_REVIEW"
+    - "DO_NOT_IMPORT"
+
+  proposal_type_sub_stages:
+    - id: "evidence_and_analysis_consolidation"
+      description: "Consolidates results from Retrieval, Comparison, Relation Analysis, Core Analysis, and Classification into a coherent evidentiary picture."
+    - id: "action_eligibility_assessment"
+      description: "Evaluates whether consolidated evidence and system rules permit proposing a supported action."
+    - id: "proposal_action_selection"
+      description: "Selects CREATE, NEEDS_REVIEW, or DO_NOT_IMPORT (mapping future actions to NEEDS_REVIEW in current scope)."
+    - id: "proposed_content_generation"
+      description: "Prepares the proposed Markdown note content (GeneratedNote) in the selected Staging language (en or fa) for human inspection."
+    - id: "proposed_destination_identification"
+      description: "Identifies the recommended destination path as inert data for pre-execution inspection without granting write permission."
+    - id: "proposal_identity_and_hash_recording"
+      description: "Computes and records the canonical SHA-256 fingerprint (proposal_hash) binding subsequent approval to this exact proposal."
+
   fields:
 
     proposed_action:
       type: "action_type"
       required: true
+
+    proposal_hash:
+      type: "string"
+      required: false
+      description: "Canonical SHA-256 content hash over the proposal and generated note payload."
+
+    supersedes:
+      type: "string"
+      required: false
+      description: "Previous proposal_hash (H0) replaced when a human edits a CREATE proposal to produce H1."
 
     target_id:
       type: "string"
@@ -1002,6 +1231,9 @@ proposal_status:
     rejected:
       description: "Proposal was explicitly rejected."
 
+    acknowledged:
+      description: "Non-executable proposal (NEEDS_REVIEW or DO_NOT_IMPORT) was inspected and acknowledged by the human."
+
     executed:
       description: "Approved proposal was executed."
 
@@ -1012,11 +1244,80 @@ proposal_status:
       description: "Proposal cannot safely proceed without further review."
 
 
+knowledge_filter:
+
+  definition: >
+    Algorithmic multi-signal boundary evaluation examining the input state and
+    analytical results against system rules and constraints to determine
+    continuation or restriction signals.
+
+  sub_stages:
+    - id: "filter_input_assessment"
+      description: "Verifies the integrity and completeness of all analytical inputs received by the filter."
+    - id: "boundary_and_eligibility_signal_evaluation"
+      description: "Evaluates cross-stage boundary constraints (identity/duplication overlap, comparative contradiction, Core tension/conflict, and confidence thresholds)."
+    - id: "filter_outcome_determination"
+      description: "Determines the filter verdict (pass_to_review, hold_for_review, or do_not_import)."
+    - id: "filter_reason_recording"
+      description: "Records the exact boundary rationale into FilterOutcome and Audit."
+
+  verdicts:
+    - "pass_to_review"
+    - "hold_for_review"
+    - "do_not_import"
+
+
+llm_synthesis:
+
+  definition: >
+    Mandatory, non-authoritative AI synthesis stage running after the Knowledge
+    Filter and before Unified Human Review & Explicit Approval. Combines
+    evidence, analyses, and uncertainties into structured candidate drafts
+    without granting decision or execution authority to the model.
+
+  sub_stages:
+    - id: "bounded_context_preparation"
+      description: "Prepares strictly necessary, authorized, and size-bounded context for the model."
+    - id: "evidence_and_uncertainty_packaging"
+      description: "Packages retrieval evidence, comparative differences, Core analysis, and explicit uncertainties alongside context."
+    - id: "llm_request"
+      description: "Dispatches the bounded request to a mandatory local model runner (e.g. Ollama) or a configured Cloud API with environment-only credentials and per-call human privacy consent."
+    - id: "structured_output_validation"
+      description: "Validates that the model response adheres strictly to the expected candidate schema and bounds; failure triggers llm_safe_stop."
+    - id: "synthesis_result_recording"
+      description: "Records the validated candidate output, prompt_sha256 digest, and provider/model metadata into LLMSynthesisResult and Audit."
+
+
 # ============================================================================
-# 18. HUMAN REVIEW
+# 18. UNIFIED HUMAN REVIEW & EXPLICIT APPROVAL
 # ============================================================================
 
 human_review:
+
+  definition: >
+    Unified governance stage merging Human Review (Stage 12) and Explicit
+    Approval (Stage 13). Presents analytical results, evidence, uncertainties,
+    and the exact proposal to the human in all cases (CREATE, NEEDS_REVIEW,
+    DO_NOT_IMPORT), distinguishes review acknowledgment for non-CREATE outcomes
+    from explicit execution approval for CREATE, supports human proposal editing
+    with canonical hash replacement (H0 -> H1), and synchronizes live Current
+    Audit wait/resume continuity.
+
+  unified_sub_stages:
+    - id: "candidate_and_exact_proposal_presentation"
+      description: "Presents the input, proposed action, proposed class, confidence, destination, and exact Markdown draft for all proposal types."
+    - id: "proposal_and_evidence_inspection"
+      description: "Displays supporting reasons, retrieval candidates, comparison findings, relation analysis, and Core analysis."
+    - id: "uncertainty_inspection"
+      description: "Exposes all known ambiguities and limitations so the human is aware of unresolved issues."
+    - id: "approval_eligibility_check"
+      description: "Verifies whether the proposal is eligible for execution approval (CREATE) vs review acknowledgment (NEEDS_REVIEW, DO_NOT_IMPORT)."
+    - id: "human_decision_input_and_explicit_approval"
+      description: "Captures explicit human decision (Approve, Edit Proposal, or Reject for CREATE; Acknowledge/Accept or Reject for non-CREATE)."
+    - id: "approval_to_proposal_binding"
+      description: "Binds approval to the exact proposal_hash; when edited by the human, replaces H0 with recomputed H1 (supersedes:H0) without file corruption."
+    - id: "human_decision_and_approval_state_recording"
+      description: "Records the human review state and approval binding into ApprovalOutcome and Audit while resuming the live Current Audit stream."
 
   review_object:
 
@@ -1086,6 +1387,21 @@ human_review:
       required: false
       default: null
 
+    proposal_hash:
+      type: "string"
+      required: false
+      description: "Exact SHA-256 proposal_hash to which this decision is bound."
+
+    supersedes_hash:
+      type: "string"
+      required: false
+      description: "Prior proposal_hash superseded by a human proposal edit, when applicable."
+
+    human_review_state:
+      type: "string"
+      allowed_values: ["approved", "rejected", "acknowledged_non_executable", "cancelled", "timed_out"]
+      required: false
+
     user_note:
       type: "string"
       required: false
@@ -1120,19 +1436,47 @@ human_review:
       required: false
 
   rules:
-    - "Approval must be explicit."
-    - "Approval must be human."
-    - "Approval must be recorded."
+    - "Every proposal outcome (CREATE, NEEDS_REVIEW, DO_NOT_IMPORT) must be presented to the human in the unified review stage."
+    - "Acknowledgment (Accept) of NEEDS_REVIEW or DO_NOT_IMPORT records human inspection without authorizing execution."
+    - "Approval for CREATE must be explicit, human, recorded, and bound to the exact proposal_hash."
     - "Approval applies only to its defined scope."
     - "AI cannot approve its own proposal."
-    - "Material changes to an approved proposal require renewed approval."
+    - "Material changes or human edits to a proposal recompute proposal_hash (H0 -> H1) and require renewed explicit approval of H1."
+    - "Live Current Audit must wait in sync during human review and resume continuously upon human decision."
 
 
 # ============================================================================
-# 19. AUDIT
+# 19. AUDIT, OUTPUT & KNOWLEDGE LANGUAGE
 # ============================================================================
 
 audit:
+
+  definition: >
+    Continuous traceability spine synchronizing across every stage from Input
+    to Output. Connects all sub-stages within each stage, bridges adjacent
+    workflow stages, streams live DeepThink-style analytical reasoning to
+    Current Audit, and persists append-only records to AuditWriter without
+    ever granting approval or execution authority.
+
+  sub_capabilities:
+    - id: "input_and_provenance_recording"
+      description: "Records input metadata, source type, input_id, and input_hash (never raw private text)."
+    - id: "analysis_and_proposal_recording"
+      description: "Records retrieval candidates, comparisons, relations, Core analysis, classification, and final proposal."
+    - id: "confidence_and_filter_outcome_recording"
+      description: "Records the multi-factor confidence assessment and Knowledge Filter verdict."
+    - id: "llm_result_recording"
+      description: "Records LLM provider/model metadata, prompt_sha256, and synthesis outcome."
+    - id: "human_review_recording"
+      description: "Records human inspection and review state (human_review_state)."
+    - id: "approval_state_recording"
+      description: "Records explicit approval or rejection and its binding to proposal_hash."
+    - id: "revalidation_recording"
+      description: "Records the 7 pre-execution revalidation check results."
+    - id: "execution_result_recording"
+      description: "Records ControlledExecutor outcome, artifact_path, and artifact_sha256 distinct from proposal state."
+    - id: "error_or_failure_recording"
+      description: "Records safe stops, validation rejections, emergency fsync receipts, and artifact quarantine events."
 
   event:
 
@@ -1150,6 +1494,16 @@ audit:
 
     input_id:
       type: "string"
+      required: false
+
+    input_hash:
+      type: "string"
+      required: false
+      description: "SHA-256 hex digest of raw input bytes."
+
+    input_hash_source:
+      type: "string"
+      allowed_values: ["input_provenance", "unit_content_fallback"]
       required: false
 
     knowledge_unit_ids:
@@ -1196,6 +1550,11 @@ audit:
       required: false
       description: "Canonical hash binding the record to one exact proposal, across approval, revalidation, and execution."
 
+    evidence_hash:
+      type: "string"
+      required: false
+      description: "SHA-256 digest over pipe-separated retrieval candidate unit IDs used as evidence."
+
     revalidation_result:
       type: "string"
       required: false
@@ -1225,6 +1584,33 @@ audit:
       required: false
       description: "Hash of the prompt/context supplied to the LLM. The prompt content itself is never persisted."
 
+    narrative_language:
+      type: "string"
+      allowed_values: ["en", "fa"]
+      required: false
+      description: "Selected Audit knowledge language in which the lifecycle narrative is generated and recorded."
+
+    durability:
+      type: "string"
+      allowed_values: ["written", "confirmed", "unconfirmed", "failed", "unconfigured"]
+      required: false
+      description: "Persistence durability state ('written' for primary stream write; 'confirmed' for os.fsync emergency recovery)."
+
+    emergency:
+      type: "boolean"
+      required: false
+      description: "True when the record was recovered via errors/audit_emergency.jsonl."
+
+    quarantined:
+      type: "boolean"
+      required: false
+      description: "True when a staged artifact was moved to .unreconciled/ due to post-execution audit persistence failure."
+
+    quarantine_status:
+      type: "string"
+      allowed_values: ["quarantined", "partial_cleanup_failed", "quarantine_failed"]
+      required: false
+
     errors_warnings:
       type: "array"
       items: "string"
@@ -1232,9 +1618,15 @@ audit:
 
     storage_category:
       type: "string"
-      allowed_values: ["passed", "failed"]
+      allowed_values: ["passed", "failed", "errors"]
       required: false
-      description: "Terminal storage category for a persisted record. 'passed' is reserved for an approved CREATE whose staging artifact was actually written; every other terminal record (including an approved-and-revalidated pre-execution state, any hold, rejection, or safe stop) is 'failed'. This is a storage-location distinction, not a judgment that the record represents a system error."
+      description: >
+        Terminal storage partition for a persisted record. 'passed' is reserved
+        exclusively for an approved CREATE whose staging artifact was actually
+        written and durably audited; 'failed' holds non-executed terminal
+        records (validation rejections, clarifications, holds, human rejections,
+        and pre-execution checkpoints); 'errors' holds operational execution
+        faults, cancellations, and emergency recovery journals.
 
   rules:
     - "Audit events should be append-oriented."
@@ -1242,9 +1634,61 @@ audit:
     - "Rejected actions should remain distinguishable."
     - "Failed actions should remain distinguishable."
     - "Audit history must not be silently altered to conceal prior events."
-    - "A record belongs in a 'passed' storage location only when its execution actually created the staging artifact it references; every other terminal record, including an approved and revalidated proposal that did not yet execute, belongs in 'failed'."
+    - "A record belongs in a 'passed' storage location only when its execution actually created the staging artifact it references; every other terminal record belongs in 'failed' or 'errors'."
     - "Non-executed, rejected, held, and safe-stopped candidates must still produce a persisted audit record; absence of an artifact is itself traceable information, not an absence of audit."
-    - "Prompt and evidence content supplied to or produced by an LLM may be referenced by hash for traceability; raw prompt content and credentials must never be persisted in the audit record."
+    - "If both primary and emergency post-execution audit persistence fail after a staging file is written, the artifact must be quarantined into .unreconciled/ without overwrite."
+    - "Prompt and evidence content supplied to or produced by an LLM may be referenced by hash for traceability; raw prompt content, raw private input text, and credentials must never be persisted in the audit record."
+
+
+output_stage:
+
+  definition: >
+    Final stage (Stage 17) assembling and presenting the truthful end-to-end
+    outcome of the run while keeping analysis, proposal, human review, explicit
+    approval, revalidation, and actual execution strictly distinct.
+
+  sub_capabilities:
+    - id: "final_status_assembly"
+      description: "Consolidates stage outcomes (processed, executed, held, terminal_outcome, and bijective audit receipt verification) into a coherent view."
+    - id: "processing_result_presentation"
+      description: "Displays the analytical outcome and recorded human decisions to the researcher."
+    - id: "staging_artifact_reference"
+      description: "Provides the exact path, filename (<proposal_hash>.md), and SHA-256 digest when a Staging artifact was created."
+    - id: "audit_reference"
+      description: "Links the run_id, record_id, and digest to the persistent Audit journal."
+    - id: "error_or_stop_explanation"
+      description: "Explains the exact cause of any validation error, clarification need, or safe stop, exposing Fix / Retry / Stop controls."
+
+
+knowledge_language_and_translation:
+
+  domains:
+    app:
+      supported: ["en", "fa"]
+      description: "UI presentation language."
+    staging:
+      supported: ["en", "fa"]
+      description: "Knowledge language in which Staging note drafts and artifacts are written and recorded."
+    audit:
+      supported: ["en", "fa"]
+      description: "Knowledge language in which Audit narratives and live Current Audit traces are written and recorded."
+
+  translation_record:
+    description: >
+      Immutable, non-authoritative on-demand translation record returned by
+      /api/translate (Translate overlay across Audit, Staging, Current Audit,
+      and Processing Result). Never mutates source provenance or approval hashes.
+    fields:
+      record_id: "string"
+      source_id: "string"
+      source_kind: "audit_narrative | dynamic_text"
+      source_language: "en | fa"
+      target_language: "en | fa"
+      source_hash: "SHA-256 hex digest of the canonical source text"
+      translated_text: "string"
+      translator: "provider identifier or 'template-fallback'"
+      lifecycle_state: "current | stale | unavailable"
+      persisted: false
 
 
 # ============================================================================
@@ -1281,6 +1725,166 @@ pipeline:
     - "EXECUTE_APPROVED_ACTION"
     - "RECORD_AUDIT_EVENT"
 
+  unified_runtime_stages:
+
+    stage_01_input:
+      question: "What has been received and is it safe and valid to enter processing?"
+      sub_stages:
+        - "input_source_selection"
+        - "input_type_detection"
+        - "input_validation"
+        - "source_identification"
+        - "initial_safety_checks"
+
+    stage_02_ingestion:
+      question: "How is the accepted input cleaned, structured, chunked, and extracted into KnowledgeUnits without losing meaning?"
+      sub_stages:
+        - "reader_selection"
+        - "reading"
+        - "cleaning"
+        - "normalization"
+        - "parsing"
+        - "metadata_extraction"
+        - "chunking"
+        - "provenance_recording"
+
+    stage_03_retrieval:
+      question: "What relevant prior evidence exists in the knowledge base?"
+      pre_retrieval_mechanisms:
+        - "ephemeral_input_embedding_cache"
+        - "human_gated_3_way_vault_vector_sync"
+      sub_stages:
+        - "query_preparation"
+        - "retrieval_method_selection"
+        - "candidate_retrieval"
+        - "relevance_assessment"
+        - "candidate_identification"
+        - "retrieval_evidence_recording"
+
+    stage_04_comparison:
+      question: "What similarities, differences, or contradictions does the input have against each retrieved candidate?"
+      sub_stages:
+        - "candidate_by_candidate_comparison"
+        - "content_comparison"
+        - "similarity_assessment"
+        - "difference_identification"
+        - "contradiction_detection"
+        - "comparison_evidence_recording"
+
+    stage_05_relation_analysis:
+      question: "What defensible causal-comparative or structural relationships exist with prior knowledge?"
+      sub_stages:
+        - "relation_candidate_identification"
+        - "relationship_evidence_analysis"
+        - "relation_type_assessment"
+        - "uncertainty_assessment"
+        - "relation_result_recording"
+
+    stage_06_core_analysis:
+      question: "How does the input relate to the repository's single active Core note, and is there any conflict or ambiguity?"
+      sub_stages:
+        - "core_schema_resolution"
+        - "relevant_core_context_identification"
+        - "core_relevance_analysis"
+        - "conflict_or_uncertainty_detection"
+        - "core_analysis_result_recording"
+
+    stage_07_classification:
+      question: "What proposed knowledge class best fits the unit based on the upstream evidence?"
+      sub_stages:
+        - "classification_evidence_collection"
+        - "classification_assessment"
+        - "classification_uncertainty_assessment"
+        - "classification_result_recording"
+
+    stage_08_proposal_type:
+      question: "What operational action (CREATE, NEEDS_REVIEW, DO_NOT_IMPORT), draft content, destination, and proposal_hash are proposed?"
+      sub_stages:
+        - "evidence_and_analysis_consolidation"
+        - "action_eligibility_assessment"
+        - "proposal_action_selection"
+        - "proposed_content_generation"
+        - "proposed_destination_identification"
+        - "proposal_identity_and_hash_recording"
+
+    stage_09_confidence:
+      question: "How strongly does the mathematical multi-factor evidence formula support the proposal, and what uncertainties remain?"
+      sub_stages:
+        - "evidence_sufficiency_assessment"
+        - "uncertainty_assessment"
+        - "confidence_calculation_or_assessment"
+        - "confidence_result_recording"
+
+    stage_10_knowledge_filter:
+      question: "What algorithmic boundary and eligibility signals apply to continuing or holding the proposal?"
+      sub_stages:
+        - "filter_input_assessment"
+        - "boundary_and_eligibility_signal_evaluation"
+        - "filter_outcome_determination"
+        - "filter_reason_recording"
+
+    stage_11_llm_synthesis:
+      question: "How are the evidence, analyses, and uncertainties synthesized into a structured candidate draft by the local/cloud LLM?"
+      sub_stages:
+        - "bounded_context_preparation"
+        - "evidence_and_uncertainty_packaging"
+        - "llm_request"
+        - "structured_output_validation"
+        - "synthesis_result_recording"
+
+    stages_12_and_13_unified_human_review_and_explicit_approval:
+      question: "What is the human inspecting across all proposal outcomes, and to what exact proposal_hash is execution permission granted?"
+      sub_stages:
+        - "candidate_and_exact_proposal_presentation"
+        - "proposal_and_evidence_inspection"
+        - "uncertainty_inspection"
+        - "approval_eligibility_check"
+        - "human_decision_input_and_explicit_approval"
+        - "approval_to_proposal_binding"
+        - "human_decision_and_approval_state_recording"
+
+    stage_14_revalidation:
+      question: "Are proposal identity, content/hash, single-target non-duplication, destination safety, provenance, approval binding, and state still valid right before execution?"
+      sub_stages:
+        - "proposal_identity_validation"
+        - "proposal_content_and_hash_validation"
+        - "target_validation"
+        - "destination_validation"
+        - "provenance_validation"
+        - "approval_binding_validation"
+        - "current_state_and_eligibility_validation"
+
+    stage_15_controlled_execution:
+      question: "Is the approved and revalidated CREATE action written once into the isolated Staging boundary and verified?"
+      sub_stages:
+        - "execution_eligibility_check"
+        - "controlled_destination_validation"
+        - "controlled_write"
+        - "result_verification"
+        - "execution_receipt_recording"
+
+    stage_16_audit:
+      question: "How is every step of the reasoning chain continuously streamed to live Current Audit and durably recorded in Audit?"
+      sub_stages:
+        - "input_and_provenance_recording"
+        - "analysis_and_proposal_recording"
+        - "confidence_and_filter_outcome_recording"
+        - "llm_result_recording"
+        - "human_review_recording"
+        - "approval_state_recording"
+        - "revalidation_recording"
+        - "execution_result_recording"
+        - "error_or_failure_recording"
+
+    stage_17_output:
+      question: "What is the final assembled status, artifact reference, audit reference, or actionable recovery explanation presented to the user?"
+      sub_stages:
+        - "final_status_assembly"
+        - "processing_result_presentation"
+        - "staging_artifact_reference"
+        - "audit_reference"
+        - "error_or_stop_explanation"
+
   semantic_boundary:
 
     analysis_phase:
@@ -1310,21 +1914,21 @@ pipeline:
         a destination, or modifies Core.
 
     approval_phase:
-      purpose: "Human evaluation of the proposal."
+      purpose: "Unified human evaluation of all proposals and explicit hash-bound approval of executable proposals."
       authoritative_write:
         allowed: false
 
     execution_phase:
-      condition: "Explicit approval exists."
+      condition: "Explicit approval exists and all 7 pre-execution revalidation checks pass."
       requirements:
         - "Validate approval."
-        - "Revalidate the exact approved proposal immediately before execution; a material change invalidates the approval."
+        - "Revalidate the exact approved proposal immediately before execution (identity, content/hash, single-target non-duplication, destination, provenance, approval binding, and state); an unapproved change invalidates the approval."
         - "Validate action."
-        - "Validate target."
-        - "Validate scope."
+        - "Validate target (preventing duplicate outputs from a single unit)."
+        - "Validate scope and controlled destination boundary."
         - "Preserve provenance."
         - "Preserve meaning."
-        - "Record audit event."
+        - "Verify written artifact and record execution receipt and audit event."
 
 
 # ============================================================================
@@ -1333,50 +1937,60 @@ pipeline:
 
 validation:
 
+  input_stage:
+
+    - "Input source must match an explicitly enabled source (currently 'chat_input'; extensible foundation for future authorized sources)."
+    - "Input type must match an explicitly enabled type (currently 'text' in chat; extensible foundation for Word, PDF, YAML, audio, and image)."
+    - "Input text must be valid UTF-8, within size bounds (<= 1,000,000 bytes), free of disallowed control characters or repetition noise, and meet the substantive minimum threshold (>= 50 letters)."
+    - "Operating mode ('personal_vault' or 'examples') and initial path safety boundaries must be verified prior to ingestion."
+
   structural:
 
     - "Required fields must exist."
     - "Enum values must be canonical."
     - "Identifiers must be structurally valid."
-    - "Confidence must be within the defined range."
+    - "Confidence must be within the defined range [0.0, 1.0]."
 
   provenance:
 
-    - "Origin must be represented."
+    - "Origin must be represented (input_id, input_hash, source)."
     - "Derived-from references must resolve when present."
     - "Unknown provenance must not be fabricated."
 
   retrieval:
 
     - "Referenced objects must actually exist."
-    - "Identifiers must resolve."
+    - "Identifiers must resolve using canonical identity keys (<source>:<position>:<unit_id>)."
     - "Paths must resolve when supplied."
     - "No guessed target may enter an authoritative proposal."
+    - "Temporary input embeddings must be cleaned up at the end of every run."
 
   relations:
 
     - "Source must resolve."
     - "Target must resolve."
     - "Relation type must be canonical."
-    - "Justification must exist."
+    - "Justification must exist and be grounded in causal-comparative/structural evidence rather than mere similarity."
 
   comparison:
 
+    - "Each retrieved candidate must be compared individually against the input."
     - "Duplicate decisions must not rely exclusively on similarity."
     - "Merge decisions must account for meaningful distinctions."
     - "Novelty must consider actual retrieved candidates."
 
   core:
 
-    - "Core references must resolve to approved Core knowledge."
+    - "Core references must resolve to the single active approved Core note in '01 Core'."
     - "Potential Core conflicts must remain visible."
     - "Core changes must not occur through ordinary analytical processing."
 
-  approval:
+  approval_and_revalidation:
 
     - "Approval must exist before execution."
     - "Approved action must match executed action."
-    - "Execution must remain within approved scope."
+    - "Proposal identity, content hash (proposal_hash), single-target non-duplication, destination safety, provenance, and approval binding must all be revalidated immediately prior to execution."
+    - "Execution must remain within approved scope and write only to the isolated Staging boundary."
 
   safety:
 

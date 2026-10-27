@@ -12,21 +12,21 @@
 The Input stage is the single authoritative entry gate of the LivingAuthenticity Knowledge Management loop. It provides an ergonomic, zero-latency in-UI chat composer for the researcher, backed by rigorous backend validation, noise detection, privacy guards, and an interactive recovery workflow.
 
 ```text
-[Composer UI] (In-place, UTF-8 byte check, draft preservation)
+[Composer UI] (In-place, UTF-8 byte & >=50-letter check, draft preservation)
      │
      ▼ POST /api/run
 [Adapter Layer] (Synchronous schema validation, token check)
      │
      ▼ process_input()
-[Input Processor]
-     ├── Source Selection ('chat_input')
-     ├── Operating Mode ('personal_vault' / 'examples')
-     ├── Type & Encoding (UTF-8, <= 1MB, no raw control chars)
-     ├── Noise Boundaries (Punctuation-only, spam, fragment noise)
-     └── Clarification Detection (Ambiguous single tokens)
+[Input Processor — 5 Canonical Sub-Stages]
+     ├── 1. Input Source Selection ('chat_input' active; extensible foundation)
+     ├── 2. Input Type Detection ('text' active; extensible foundation for Word/PDF/YAML/audio/image)
+     ├── 3. Input Validation (UTF-8, <= 1MB, no control chars, >= 50 authentic letters, noise filter)
+     ├── 4. Source Identification (stable input_id 'inp-<hash[:12]>' & SHA-256 input_hash)
+     └── 5. Initial Safety Checks ('personal_vault' / 'examples' mode & path boundaries)
      │
      ├─► ACCEPTED ────────────► Hand-off to Ingestion & Retrieval
-     ├─► NEEDS_CLARIFICATION ─► Halt, Partition to failed/ audit, Surface Clarification in UI
+     ├─► NEEDS_CLARIFICATION ─► Halt (< 50 letters / insufficient substance), Partition to failed/ audit, Surface Clarification in UI
      ├─► REJECTED ────────────► Halt, Partition to failed/ audit, Surface Error in UI
      └─► STOPPED ─────────────► Halt, Partition to failed/ audit, Surface Stopped in UI
 ```
@@ -40,43 +40,46 @@ The Input stage is the single authoritative entry gate of the LivingAuthenticity
 * **Exact Placeholder:**
   * English: `Type or paste here (text only — no uploads yet)`
   * Persian: `متن را اینجا بنویسید یا بچسبانید (فقط متن — بدون بارگذاری فایل)`
-* **Immediate Local Feedback:** Pure client-side UTF-8 byte calculation and character count badges without latency. Submissions exceeding 1,000,000 bytes or containing only whitespace are blocked client-side.
+* **Immediate Local Feedback:** Pure client-side UTF-8 byte calculation and letter/character count badges without latency. Submissions exceeding 1,000,000 bytes, containing only whitespace, or having fewer than 50 authentic letters (`DEFAULT_MIN_LETTERS = 50`) are flagged client-side while keeping backend validation authoritative.
 * **Offline Draft Retention:** If the backend launcher is disconnected, the composer retains the typed text intact (no wiping) and surfaces an actionable connection banner and recovery panel.
 
 ---
 
 ## 3. Backend-Authoritative Evaluation Boundary
 
-Client-side checks never substitute for backend authority. Every input submitted to `/api/run` is independently evaluated by `process_input()`:
+Client-side checks never substitute for backend authority. Every input submitted to `/api/run` is independently evaluated by `process_input()` across the **5 canonical Input sub-stages**:
 
-### Evaluation Attributes
-* **Input Identification:** Computes deterministic SHA-256 hash (`content_hash`) and assigns stable `input_id` (`inp-<hash[:12]>`).
-* **Source Selection:** Rejects any interactive source other than `chat_input`.
-* **Mode Verification:** Ensures source mode is strictly `personal_vault` or `examples`.
-* **Structural Bounds:** Enforces UTF-8 compliance, reject null bytes / unescaped ASCII control codes, and caps size at `MAX_TEXT_BYTES = 1_000_000`.
+### The 5 Input Sub-Stages & Evaluation Attributes
+1. **Input Source Selection:** Specifies whether input comes from an approved source to prevent unintended processing of unrelated sources. Currently rejects any interactive source other than `chat_input`, while laying the foundation for future authorized sources.
+2. **Input Type Detection:** Identifies the input format/modality (`content_type = "text"`). Currently only `text` in the chat composer is permitted, while establishing the extensible foundation for future Word (`.docx`), `.pdf`, `.yaml`, voice/audio, and image inputs.
+3. **Input Validation (`DEFAULT_MIN_LETTERS = 50`):** Enforces UTF-8 compliance, rejects null bytes / unescaped ASCII control codes, caps size at `MAX_TEXT_BYTES = 1_000_000`, filters repetition noise, and enforces a minimum substantive threshold of **at least 50 authentic letters (`min_letters = 50`, counted via `count_letters` over Unicode category `L`)**.
+4. **Source Identification:** Computes deterministic SHA-256 hash (`content_hash` / `input_hash`) and assigns a stable `input_id` (`inp-<hash[:12]>`) recorded in `InputProvenance` so outputs remain traceable to their origin and future authorized sources remain strictly identified.
+5. **Initial Safety Checks:** Ensures operating mode is strictly `personal_vault` or `examples` and verifies path/access safety boundaries before any ingestion begins.
 
 ### Structured Evaluation Outcomes (`InputOutcome`)
-1. `ACCEPTED`: Valid research note text with assigned provenance. Downstream ingestion proceeds (`can_proceed=True`).
-2. `REJECTED`: Structural invalidity, repeated character spam, punctuation noise, or fragment noise. Downstream processing halted; audited into `failed/`.
-3. `NEEDS_CLARIFICATION`: Ambiguous single-token inputs (e.g. "a", "x", "1") requiring additional researcher context without presumption of intent.
+1. `ACCEPTED`: Valid research note text ($\ge 50$ authentic letters) with assigned provenance. Downstream ingestion proceeds (`can_proceed=True`).
+2. `REJECTED`: Structural invalidity, unsupported source/mode, encoding/control-char error, or repeated character spam (`repeated_char_noise`). Downstream processing halted; audited into `failed/`.
+3. `NEEDS_CLARIFICATION`: Inputs containing fewer than **50 authentic letters (`insufficient_letter_count`)** or ambiguous minimal tokens requiring additional researcher substance before evaluation. Downstream processing halted safely; audited into `failed/` with `input_clarification_required`.
 4. `STOPPED`: Cooperative cancellation requested by researcher; stops pipeline cleanly and audits `stopped_by_user`.
 5. `ERROR`: Unexpected execution error or backend unavailability.
 
 ---
 
-## 4. Deterministic Noise Boundaries vs. Research Notes
+## 4. Deterministic Noise Boundaries & 50-Letter Substance Gate
 
-To protect against accidental input corruption while respecting authentic research syntax:
+To protect against accidental input corruption while respecting multilingual research syntax:
 
-1. **Punctuation & Symbol Noise (`_is_punctuation_or_symbol_only`):**
+1. **Minimum 50-Letter Substance Gate (`count_letters` / `DEFAULT_MIN_LETTERS = 50`):**
+   * Counts authentic letters (`unicodedata.category(ch).startswith("L")`) across Persian, English, and all Unicode alphabets.
+   * Any input with `letter_count < 50` returns `InputOutcome.NEEDS_CLARIFICATION` (`error_code="insufficient_letter_count"`), prompting the researcher to provide at least 50 letters of substantive content.
+2. **Punctuation & Symbol Noise (`_is_punctuation_or_symbol_only`):**
    * Rejects inputs containing exclusively punctuation, whitespace, or symbols without letters or numbers.
-2. **Repeated Character Spam (`_is_repeated_char_spam`):**
-   * Rejects sequences dominated by single repeating characters (e.g., `aaaaaaaaaa`, `سسسسسسسسسسس`, `111111111111`).
-3. **Repeated Fragment Noise (`_is_repeated_fragment_noise`):**
-   * Detects repeated keyboard-mashing patterns of length 2 to 8 repeating $\ge 3$ times and covering $\ge 80\%$ of text (e.g., `qwertyqwertyqwerty`, `asdfasdfasdfasdf`).
-4. **Legitimate Short & Multilingual Notes Preserved:**
-   * Checks leverage Unicode category testing (`unicodedata.category(ch)[0] in ('L', 'N')`).
-   * Legitimate brief research queries, formulas, and multilingual expressions (e.g., `"Why?"`, `"چرا؟"`, `"AI-001"`, `"x = y + 1"`, code snippets) are classified as valid research notes and accepted.
+3. **Repeated Character Spam (`_is_repeated_char_spam`):**
+   * Rejects sequences dominated by single or dual repeating characters (e.g., `aaaaaaaaaa`, `سسسسسسسسسسس`, `111111111111`) even if they exceed 50 characters.
+4. **Repeated Fragment Noise (`_is_repeated_fragment_noise`):**
+   * Helper detecting repeated keyboard-mashing patterns of length 2 to 8 repeating $\ge 3$ times and covering $\ge 80\%$ of text (e.g., `qwertyqwertyqwerty`, `asdfasdfasdfasdf`).
+5. **Multilingual Script Parity:**
+   * Because letter counting and token analysis leverage Unicode category testing (`unicodedata.category(ch)` and `re.UNICODE` with Persian ZWNJ `\u200c`), Persian, English, and mixed bilingual research notes (containing $\ge 50$ letters) receive identical first-class validation.
 
 ---
 
@@ -149,6 +152,7 @@ flowchart TD
    * Emits `status` event: `raw_length`, `run_id`.
 3. **Cleaning (`cleaning`):**
    * Unicode NFC normalization (`unicodedata.normalize("NFC", ...)`), line ending normalization (`\r\n` / `\r` -> `\n`), trailing whitespace removal per line, and blank line collapsing (3+ -> 2).
+   * **Zero Substantive Loss Invariant:** Cleaning removes only technical formatting noise; substantive or important content must never be deleted under any circumstances.
    * Emits `status` event: `cleaned_length`, `run_id`.
 4. **Normalization (`normalization`):**
    * Refines cleaned representation by collapsing runs of multiple spaces within lines (`(?<=\S) {2,}` -> ` `) while strictly preserving leading indentation and line boundaries, ensuring canonical NFC precomposition.
@@ -161,6 +165,9 @@ flowchart TD
    * When a chunker accepts `parsed` or `**kwargs`, the parsed AST is passed (`chunker.split(text_for_analysis, parsed=parsed)`).
    * Legacy or third-party chunkers with `split(text)` receive only `text_for_analysis`.
    * When parsing is optional or yields no parsed structure (e.g. plain text), chunking proceeds normally on `text_for_analysis`.
+   * **Dual Architectural Role of Chunking:**
+     1. *One-Input-to-Multiple-Outputs Decomposition:* Enables a single complex input containing multiple distinct ideas to decompose into multiple independent `KnowledgeUnit`s and downstream outputs.
+     2. *Multi-Modal Retrieval Readiness:* Provides bounded, coherent segments essential for **lexical**, **semantic**, and future **hybrid** retrieval.
    * Emits `status` event: `chunk_count`, `chunker`, `run_id`.
 7. **Metadata Extraction (`metadata_extraction`):**
    * Extracts structured source and input metadata (`source`, `file_name`, `extension`, `reader`, `chunk_count`, `input_id`, `input_hash`).
@@ -174,37 +181,37 @@ flowchart TD
 
 ## 9. Multi-Format Readiness & Fail-Fast Registry Contract
 
-The ingestion subsystem is architecturally structured around registry patterns:
-* `ReaderRegistry`: Maps extensions (`.txt`, `.md`) and source identifiers (`chat_input`, `text`) to `BaseReader` implementations.
+The ingestion subsystem is architecturally structured around extensible registry patterns so future formats can be added cleanly without redesigning the pipeline:
+* `ReaderRegistry`: Maps extensions (`.txt`, `.md`) and source identifiers (`chat_input`, `text`) to `BaseReader` implementations (laying the architectural foundation for future `.yaml`, `.pdf`, `.docx`/Word, voice/audio, and image readers).
 * `ChunkerRegistry`: Maps format identifiers to chunkers (`TextChunker`, `MarkdownChunker`).
 * `ExtractorRegistry`: Maps format identifiers to parser/extractors (`TextExtractor`, `MarkdownExtractor`).
 
 ### Fail-Fast Contract
-* **Currently Supported:** In-memory interactive text (`chat_input`), plain text files (`.txt`), and markdown notes (`.md`).
-* **Intentionally Unsupported:** Binary file types (PDF, Word `.docx`, audio, images, spreadsheets) are not yet implemented.
+* **Currently Active Interactive Scope:** In-memory interactive text from the user's chat field (`chat_input`), plus plain text (`.txt`) and markdown notes (`.md`) for bounded corpus/vault reading.
+* **Future-Ready Foundation (Intentionally Unregistered in Current Version):** Binary and rich media formats (PDF, Word `.docx`, YAML, audio/voice, images) are architectural extensions for future phases.
 * **No Premature Stubs:** If an unregistered format or file extension (e.g. `document.pdf`) is presented, `ReaderRegistry.get()` immediately raises `ValueError("No reader registered for ...")`. The pipeline never simulates unsupported formats or pretends they succeeded.
 
 ---
 
-## 10. Granular Process Reporting & Live Observation (SSE)
+## 10. Granular Process Reporting, DeepThink-Style Live `Current Audit`, and SSE Observation
 
-Real-time pipeline transparency is provided through Server-Sent Events (SSE) streaming over the launcher transport:
+Real-time pipeline transparency is provided through Server-Sent Events (SSE) streaming over the launcher transport to both the `Workflow` timeline and the live `Current Audit` panel:
 
 ### Event Schema (`status` event)
 ```json
 {
   "kind": "status",
   "stage": "ingestion",
-  "substage": "cleaning",
-  "message": "Cleaned raw input text (240 chars)",
+  "operation": "cleaning",
+  "message": "Cleaning completed: line endings and whitespace normalized (240 characters)",
   "cleaned_length": 240,
   "run_id": "run-001"
 }
 ```
 
-* **Truthful Data Only:** All event payloads reflect actual measured values (e.g., character counts, chunk counts, unit IDs). No simulated or fabricated LLM monologues.
+* **Verifiable DeepThink-Style Live `Current Audit` Stream:** Rather than acting as a bare status indicator, the event stream acts as a continuous analytical spine connecting all sub-stages within `Input`, `Ingestion`, `Retrieval`, and downstream stages—streaming credible, evidence-grounded analytical reasoning steps live to `Current Audit` (and pausing/resuming in sync with the unified `Human Review & Explicit Approval` stage).
 * **Selective Observation:** Corpus background ingestion (`_load_knowledge_corpus`) remains quiet (`stage_observer=None`), preventing background library indexing from flooding the active run's event stream.
-* **Frontend Localization:** Sub-stage keys (`ui.ingestion.cleaning`, `ui.ingestion.extraction`, etc.) are localized symmetrically in English and Persian in `frontend/src/i18n/resources.ts`.
+* **Frontend Localization & Knowledge Language:** Sub-stage keys (`ui.ingestion.cleaning`, `ui.ingestion.extraction`, etc.) are localized symmetrically in English and Persian in `frontend/src/i18n/resources.ts`, while `Audit` (`language.audit`) and `Staging` (`language.staging`) honor their selected Knowledge Languages (`en`/`fa`) alongside on-demand `Translate` (`/api/translate`).
 
 ---
 
@@ -310,9 +317,10 @@ sequenceDiagram
     Note over Audit: Links H1, artifact_sha256, and 'supersedes:H0' to audit.jsonl
 ```
 
+* **Unified Human Review & Explicit Approval (Stages 12 & 13 Merged):** Every processed unit is presented to the human in the unified review stage (`human_review_required`), regardless of whether its proposed action is `CREATE`, `NEEDS_REVIEW`, or `DO_NOT_IMPORT`. Non-executable proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`) expose an explicit `Acknowledge` (`POST /api/run/accept` bound to the 64-hex `proposal_hash`) or `Reject` action, whereas `CREATE` proposals expose `Approve`, `Edit Proposal`, or `Reject`. Throughout the human review wait state, the live `Current Audit` stream stays synchronized and resumes continuously once the decision (`approval_decided`) is recorded.
 * **Authoritative Recomputation:** Edits are recomputed server-side in `apply_proposal_edit()`; client-supplied hashes are strictly ignored.
-* **Stale Approval Invalidation:** Because approval is bound to `proposal_hash`, any edit produces $H_1 \ne H_0$, invalidating prior approvals.
-* **Fail-Closed Tamper Protection:** If note or proposal contents are altered without re-approval, `Revalidator.revalidate()` fails closed (`proposal_contents` or `proposal_identity` check failure), preventing controlled execution.
+* **Stale Approval Invalidation:** Because approval is bound to `proposal_hash`, any edit produces $H_1 \ne H_0$ (`supersedes:H0`) without corrupting files, invalidating prior approvals and requiring fresh approval of $H_1$.
+* **Fail-Closed 7-Check Revalidation & Tamper Protection:** Immediately prior to `ControlledExecutor.execute()`, `Revalidator.revalidate()` verifies proposal identity, content/hash parity, single-target / no-duplicate output enforcement, destination eligibility, provenance integrity, approval binding, and current state.
 
 ---
 
