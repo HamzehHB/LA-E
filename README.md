@@ -18,15 +18,16 @@ Architecture
 - [Knowledge Schema](Knowledge-Schema.yaml) — the canonical knowledge representation schema.
 - [Coding Agent Access](Coding-Agent-Access.md) — filesystem and data-access boundaries.
 
-Architecture Logic at a Glance:
-- **INPUT & INGESTION:** What has been received, and how is it prepared for processing without losing meaning?
-- **RETRIEVAL & COMPARISON:** What relevant evidence exists, and what similarities, differences, or contradictions does the input have with those candidates?
-- **RELATION ANALYSIS & CORE ANALYSIS:** What defensible relationships exist, and how does the input relate to the central conceptual Core of the project's knowledge?
-- **CLASSIFICATION, PROPOSAL, CONFIDENCE & KNOWLEDGE FILTER:** What is the nature of the input, what action is proposed, and what mathematical confidence bounds, filter rules, and uncertainties exist?
-- **LLM SYNTHESIS:** How can the evidence and analyses be dynamically synthesized into a structured summary without granting decision authority to the model?
-- **HUMAN REVIEW & EXPLICIT APPROVAL (UNIFIED):** What is the human inspecting, and to what exact proposal version is execution permission granted?
-- **REVALIDATION & CONTROLLED EXECUTION:** Are all conditions still valid right before write, and is the authorized operation performed in a strictly controlled manner?
-- **AUDIT & OUTPUT:** What happened, why did it happen, and what is the final result?
+Architecture Logic at a Glance (16 Unified Stages: `STAGE 1: INPUT` to `STAGE 16: OUTPUT`):
+- **STAGES 1 & 2 (`INPUT` & `INGESTION`):** What has been received, and how is it prepared for processing without losing meaning?
+- **STAGES 3 & 4 (`RETRIEVAL` & `COMPARISON`):** What relevant evidence exists, and what similarities, differences, or contradictions does the input have with those candidates?
+- **STAGES 5 & 6 (`RELATION ANALYSIS` & `CORE ANALYSIS`):** What defensible relationships exist, and how does the input relate to the central conceptual Core of the project's knowledge?
+- **STAGES 7, 8, 9 & 10 (`CLASSIFICATION`, `PROPOSAL TYPE`, `CONFIDENCE` & `KNOWLEDGE FILTER`):** What is the nature of the input, what action is proposed, how strong is the 3-layer mathematical evidence support ($C_{\text{final}}$), and what 4-gate algorithmic filter rules or conflict downgrades apply?
+- **STAGE 11 (`LLM SYNTHESIS`):** How can the evidence and analyses be dynamically synthesized into a structured summary without granting decision authority to the model?
+- **STAGE 12 [MERGED 12 & 13] (`HUMAN REVIEW & EXPLICIT APPROVAL`):** What is the human inspecting across all outcomes, and to what exact proposal version (`proposal_hash`) is execution permission granted?
+- **STAGES 13 & 14 [FORMERLY 14 & 15] (`REVALIDATION` & `CONTROLLED EXECUTION`):** Are all 7 conditions still valid right before write, and is the authorized operation performed once in a strictly controlled manner?
+- **STAGES 15 & 16 [FORMERLY 16 & 17] (`AUDIT` & `OUTPUT`):** What happened, why did it happen, and what is the final result?
+- **Cross-Cutting Verification Triad (enforced at the end of every stage 1–16):** (1) `Continuous Cognitive Audit Hook (DeepThink Stream)`, (2) `Knowledge Language Alignment & Translation Layer`, and (3) `Frontend State & UI Sync Verification`.
 
 Current Status
 
@@ -36,20 +37,19 @@ Implemented foundations include:
 
 - Python project and package structure
 - Centralized configuration and path management
-- Authoritative `Input` evaluation gate (`knowledge/input/processor.py`: source selection currently restricted to interactive `chat_input`, type detection currently restricted to `text` with an extensible foundation for future document/media formats, structural & substantive validation, stable `inp-<hash[:12]>` source identification, and initial safety checks)
-- 8-substage `Ingestion` and parsing foundation (`reader_selection`, `reading`, `cleaning` with zero deletion of substantive content, `normalization`, `parsing`, `metadata_extraction`, `chunking`, and `extraction` with provenance)
+- Authoritative `STAGE 1: INPUT` evaluation gate (`knowledge/input/processor.py`: source selection currently restricted to interactive `chat_input`, type detection currently restricted to `text` with an extensible foundation for future document/media formats, structural & $\ge 50$-letter substantive validation [`DEFAULT_MIN_LETTERS = 50`], stable `inp-<hash[:12]>` source identification, and initial safety checks)
+- 8-substage `STAGE 2: INGESTION` and parsing foundation (`reader_selection`, `reading`, `cleaning` with zero deletion of substantive content, `normalization`, `parsing`, `metadata_extraction`, `chunking`, and `extraction` with provenance)
 - Semantic and structural chunking (supporting 1-to-many independent knowledge-unit extraction and lexical/semantic/future-hybrid retrieval readiness)
 - Dependency management
 - Testing infrastructure
 - Project documentation and governance
 - Separation of source code from persistent data
-- Deterministic analytical stages (`retrieval`, candidate-by-candidate `comparison`, causal-comparative `relation` analysis, `core` analysis against the repository's single active `Core` note with dynamic retrieval priority weighting and archive transition for superseded Core versions, evidence-informed `classification`, `proposal` type selection [`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`], and multi-factor mathematical `confidence` calculation) plus a proposed Obsidian note representation (`Generated Note ≠ Authoritative Note`; representation does not execute `CREATE`)
+- Deterministic analytical stages (`STAGE 3: RETRIEVAL`, candidate-by-candidate `STAGE 4: COMPARISON`, causal-comparative `STAGE 5: RELATION ANALYSIS`, `STAGE 6: CORE ANALYSIS` against the repository's single active `Core` note with dynamic retrieval priority weighting and `Archive` transition for superseded Core versions, evidence-informed `STAGE 7: CLASSIFICATION`, `STAGE 8: PROPOSAL TYPE` selection [`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`], and `STAGE 9: CONFIDENCE` powered by the 3-layer multiplicative epistemic formula $C_{\text{final}} = E_{\text{base}} \times P_{\text{conflict}} \times D_{\text{uncert}} \in [0.00, 1.00]$ with novel-knowledge calibration and quadratic conflict penalty $P_{\text{conflict}} = (1 - \max(D_{\text{cand}}, \min(1.0, 1.25 D_{\text{core}})))^{2.0}$) plus a proposed Obsidian note representation (`Generated Note ≠ Authoritative Note`; representation does not execute `CREATE`)
 - Integrated evidence-first analytical pipeline composing those
   stages in contractual order (retrieval before classification)
-  with inspectable intermediate results, plus an algorithmic multi-signal `Knowledge Filter`
-  as an analytical boundary signal (non-authoritative; no approval,
-  authorization, or execution)
-- Unified **Human Review & Explicit Approval** gate (presenting proposals and evidence for all actions to the human; explicit acknowledgment for `NEEDS_REVIEW` / `DO_NOT_IMPORT`; explicit approval, rejection, or server-side proposal editing with SHA-256 hash replacement [$H_0 \to H_1$] for `CREATE`), fresh 7-check `Revalidation` of the exact approved proposal (including single-target / no-duplicate output enforcement), one-shot `Controlled Execution` (`CREATE` into an isolated staging root only), continuous live `Current Audit` + persistent `Audit` traceability (audit authorizes and executes nothing), and structured `Output` assembly
+  with inspectable intermediate results, plus `STAGE 10: KNOWLEDGE FILTER`
+  powered by the **4-Gate Algorithmic Knowledge Filter Engine** (Gate 1 Provenance & Redundancy, Gate 2 Core & Candidate Conflict Veto automatically routing conflicts $D_{\text{core}} \ge 0.45$ or $D_{\text{cand}} \ge 0.60$ to `NEEDS_REVIEW`, Gate 3 Confidence Threshold Matrix, and Gate 4 Synthesis Context Budget) and **latent evolution tags** (`LATENT_CONFLICT_CORE`, `LATENT_CONFLICT_CANDIDATE` / `CONTRADICTION`, `LATENT_UPDATE`, `LATENT_MERGE`) laying the foundation for future `UPDATE`, `MERGE`, and `CONFLICT_RESOLUTION` (`CONTRADICTION`) categories (non-authoritative; no approval, authorization, or execution)
+- Unified **`STAGE 12 [MERGED 12 & 13]: HUMAN REVIEW & EXPLICIT APPROVAL`** gate (presenting proposals and evidence for all actions to the human; explicit acknowledgment for `NEEDS_REVIEW` / `DO_NOT_IMPORT`; explicit approval, rejection, or server-side proposal editing with SHA-256 hash replacement [$H_0 \to H_1$] for `CREATE`), fresh 7-check `STAGE 13: REVALIDATION` of the exact approved proposal (including single-target / no-duplicate output enforcement), one-shot `STAGE 14: CONTROLLED EXECUTION` (`CREATE` into an isolated staging root only), continuous live `Current Audit` + persistent `STAGE 15: AUDIT` traceability (audit authorizes and executes nothing), and structured `STAGE 16: OUTPUT` assembly
 - A mandatory formal LLM synthesis stage (`living_authenticity/llm/`)
   after the Knowledge Filter and before unified human review: deterministic
   bounded context, mandatory local model invocation via `Ollama` or privacy-gated Cloud API (`consent_required`), strict result contract, and per-candidate governance.
@@ -85,10 +85,17 @@ Implemented foundations include:
   strictly isolated and NEVER inserted or merged into the persistent corpus
   vector store. Cache lifecycle metrics and receipts are recorded in audit trails
   without raw vector floats or private text leakage.
-- An explicit Personal Vault vs Examples operating-mode contract
-  (`knowledge/modes.py`): examples mode fails closed rather than ever
-  resolving the configured personal vault; mode is recorded in audit
-  records
+- An explicit **VAULT MODE** (`personal_vault`) vs **TEST MODE** (`examples`)
+  operating-mode contract (`knowledge/modes.py`): example files and designated
+  test-specific files belong strictly to **TEST MODE** (`examples`), which uses
+  only synthetic fixtures under `examples/` and fails closed rather than ever
+  resolving a configured personal Vault. In **VAULT MODE** (`personal_vault`),
+  the user selects folders through the frontend UI (`POST /api/folders/pick`
+  and `POST /api/config`) and the application processes the user's own data
+  from those selected folders (with root directory configuration and fail-closed
+  path boundary validation active, while end-to-end processing of arbitrary user
+  vaults remains an ongoing integration goal). The active mode is recorded on
+  every audit record
 - Guarded `audit.root` configuration key with optional independently
   selectable `audit.passed` / `audit.failed` subroots, resolved-path
   validation, overlap rejection against vault/staging/vector roots
@@ -178,9 +185,9 @@ Implemented foundations include:
   - 17-node chronological workflow timeline tracking live pipeline stage and substage states (with `Human Review` and `Explicit Approval` operating as a unified governance boundary).
   - Upper constellation band with 13 connected stars and DeepThink-style `Current Audit`
     overlay streaming continuous, verifiable analytical reasoning during active runs (and pausing/resuming in sync with human review).
-  - Processing Result view with multi-factor numeric confidence score (`0.00`–`1.00`),
-    confidence band, proposal type (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), unified human review actions (`Approve`,
-    `Edit proposal`, `Reject`, `Accept`), actionable pause/fix/stop error recovery (with zero hallucinated cold-starts),
+  - Processing Result view with 3-layer numeric confidence score $C_{\text{final}}$ (`0.00`–`1.00`) and component breakdown ($E_{\text{base}}, P_{\text{conflict}}, D_{\text{uncert}}$),
+    confidence band, 4-gate filter verdict & latent evolution tags, proposal type (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), unified human review actions (`Approve`,
+    `Edit proposal`, `Reject`, `Accept`/`Acknowledge`), actionable pause/fix/stop error recovery (with zero hallucinated cold-starts),
     and on-demand bilingual translation (`Translate`: English ↔ Persian).
   - 1:1 paired newspaper journals for Audits (passed, failed, and errors partitions) and Staging
     with 5s synchronized rotation, digests, and scrollable "View All" historical modal.

@@ -284,25 +284,36 @@ execution
 
 as independent states.
 
-### 7.1 Governed Confidence Assessment (`CONFIDENCE`)
+### 7.1 Governed Confidence Assessment (`STAGE 9: CONFIDENCE`)
 
 Confidence is evaluated through four governed sub-stages:
 
 1. **Evidence Sufficiency Assessment:** Evaluates how sufficient the collected evidence across Retrieval, Comparison, Relation Analysis, Core Analysis, and Classification is to support the outcome, ensuring information gaps are never hidden.
 2. **Uncertainty Assessment:** Identifies ambiguities, contradictions, and analytical limitations so confidence is never overstated.
-3. **Confidence Calculation (`EvidenceStrengthGuard`):** Computes a rigorous, non-cosmetic analytical score $C \in [0.00, 1.00]$ paired with an ordinal band (`sufficiently_supported`, `weak`, `contradictory_or_unresolved`, `insufficient_evidence`) using a multi-factor epistemic formula:
-   $$C = \text{clip}_{[0, 1]}\!\left( \left( w_E S_{\text{evidence}} + w_D S_{\text{distinct}} + w_K S_{\text{class}} + w_R S_{\text{core}} \right) \cdot \prod_{g \in \mathcal{G}} (1 - \lambda_g) - \Phi_{\text{conflict}} \right)$$
-   combining weighted evidence completeness ($w_E = 0.30$), comparative distinctness ($w_D = 0.25$), classification certainty ($w_K = 0.25$), and Core resolution stability ($w_R = 0.20$), penalized by multiplicative uncertainty decay over recorded gaps $\mathcal{G}$ and bounded by hard conflict ceilings ($C \le 0.45$ on contradiction/insufficiency; $C \le 0.75$ when any uncertainty gap exists).
-4. **Confidence Result Recording:** Records the numeric score, ordinal level, evidentiary basis, and uncertainty tuple into `Audit` and streams the live calculation rationale to `Current Audit`.
+3. **Confidence Calculation (`EvidenceStrengthGuard` — 3-Layer Multiplicative Epistemic Formula):** Computes a rigorous, non-cosmetic analytical score $C_{\text{final}} \in [0.00, 1.00]$ paired with an ordinal band (`sufficiently_supported`, `weak`, `contradictory_or_unresolved`, `insufficient_evidence`) as the product of three independent epistemic layers:
+   $$C_{\text{final}} = E_{\text{base}} \times P_{\text{conflict}} \times D_{\text{uncert}} \in [0.00, 1.00]$$
+   - **Layer 1 — Composite Evidence Base ($E_{\text{base}}$):**
+     $$E_{\text{base}} = (0.25 \times S_{\text{ret}}) + (0.30 \times R_{\text{suff}}) + (0.25 \times A_{\text{core}}) + (0.20 \times M_{\text{class}})$$
+     combining retrieval/comparative distinctness evidence ($S_{\text{ret}}$, calibrated so novel `CREATE` proposals with verified distinctness in `STAGE 4` are not penalized for lacking prior duplicates), chunk provenance & analytical evidence sufficiency ($R_{\text{suff}}$), Core semantic alignment ($A_{\text{core}}$, neutral baseline $0.50$), and classification separation margin ($M_{\text{class}}$).
+   - **Layer 2 — Non-Linear Contradiction Penalty ($P_{\text{conflict}}$):**
+     $$P_{\text{conflict}} = \left(1 - \max(D_{\text{cand}}, \min(1.0, 1.25 \times D_{\text{core}}))\right)^{2.0}$$
+     applying quadratic penalty amplification whenever the input conflicts with existing candidate notes ($D_{\text{cand}}$ in `STAGE 4`) or with the active `Core` note ($D_{\text{core}}$ in `STAGE 6`, amplified by $\lambda = 1.25$).
+   - **Layer 3 — Epistemic Uncertainty Discount ($D_{\text{uncert}}$):**
+     $$D_{\text{uncert}} = 1 - (0.40 \times U_{\text{rel}} + 0.35 \times U_{\text{core}} + 0.25 \times U_{\text{class}})$$
+     discounting confidence proportionally to recorded ambiguities in Relation Analysis ($U_{\text{rel}}$), Core Analysis ($U_{\text{core}}$), and Classification ($U_{\text{class}}$).
+4. **Confidence Result Recording:** Records the auditable confidence vector $(C_{\text{final}}, E_{\text{base}}, P_{\text{conflict}}, D_{\text{uncert}})$, ordinal level, evidentiary basis, and uncertainty tuple into `Audit` and streams the live calculation rationale to `Current Audit`.
 
-### 7.2 Algorithmic Knowledge Filter (`KNOWLEDGE FILTER`)
+### 7.2 4-Gate Algorithmic Knowledge Filter (`STAGE 10: KNOWLEDGE FILTER`)
 
-Immediately following Confidence, the `Knowledge Filter` evaluates the input state and analytical results against system rules and boundary constraints through four algorithmic sub-stages:
+Immediately following Confidence, the `Knowledge Filter` evaluates the input state, conflict vectors, and $C_{\text{final}}$ against system rules through four sub-stages (`Filter Input Assessment`, `Boundary and Eligibility Signal Evaluation`, `Filter Outcome Determination`, `Filter Reason Recording`) powered by the **4-Gate Algorithmic Knowledge Filter Engine**:
 
-1. **Filter Input Assessment:** Verifies the integrity and completeness of all upstream analytical objects received by the filter.
-2. **Boundary and Eligibility Signal Evaluation:** Evaluates cross-stage boundary conditions (identity/duplication overlap, comparative contradiction, Core conflict/ambiguity, and confidence thresholds) to identify out-of-bounds or restricted cases.
-3. **Filter Outcome Determination:** Determines the analytical boundary verdict (`pass_to_review`, `hold_for_review`, or `do_not_import`).
-4. **Filter Reason Recording:** Records the exact boundary rationale into `FilterOutcome` and `Audit` (streamed live to `Current Audit`). Like Confidence, a filter verdict is an analytical boundary signal and never grants approval or execution permission.
+1. **Gate 1 — Provenance & Redundancy Gate (`FILTER_BLOCK_REDUNDANT`):** If the provenance chain is incomplete or similarity $S_{\text{ret}} \ge 0.95$ with zero meaningful difference in `STAGE 4` (pure duplication), enforces an automatic downgrade to `DO_NOT_IMPORT` (`do_not_import`).
+2. **Gate 2 — Core & Candidate Conflict Veto Gate (`FILTER_CONFLICT_OVERRIDE`):** If the input exhibits substantive conflict with the active `Core` note ($D_{\text{core}} \ge 0.45$) or contradiction with existing candidate notes ($D_{\text{cand}} \ge 0.60$), vetoes direct `CREATE` and **automatically routes the proposal to `NEEDS_REVIEW`** (`hold_for_review`) while attaching latent evolution tags (`LATENT_CONFLICT_CORE`, `LATENT_CONFLICT_CANDIDATE` / `CONTRADICTION`). Conflict-bearing inputs are never silently discarded as `DO_NOT_IMPORT`; they are preserved for human inspection and establish the foundation for future `CONFLICT_RESOLUTION` (`CONTRADICTION`), `UPDATE`, and `MERGE` categories.
+3. **Gate 3 — Confidence Threshold Matrix & Latent Evolution Gate:**
+   - $C_{\text{final}} < 0.35$ (without substantive conflict or complementary update/merge overlap) $\to$ `LOW_CONFIDENCE_REJECT` (enforces `DO_NOT_IMPORT`).
+   - $0.35 \le C_{\text{final}} < 0.70$ (or substantive conflict from Gate 2, or complementary update/merge overlap) $\to$ `MODERATE_CONFIDENCE_HOLD` (caps action at `NEEDS_REVIEW` and attaches `LATENT_UPDATE`, `LATENT_MERGE`, or `LATENT_CONFLICT_*` tags).
+   - $C_{\text{final}} \ge 0.70$ (with zero unresolved Core/candidate conflict) $\to$ `HIGH_CONFIDENCE_PASS` (permits `CREATE` to proceed to synthesis and human review).
+4. **Gate 4 — Synthesis Context Budget Gate (`PROCEED_TO_SYNTHESIS`):** Forwards all units evaluated by Gates 1–3 (including `NEEDS_REVIEW` and `DO_NOT_IMPORT`) with bounded evidence budgets and policy constraints to `STAGE 11: LLM SYNTHESIS` so the model synthesizes a transparent report for human review without overriding the filter verdict. Like Confidence, a filter verdict is an analytical boundary signal and never grants approval or execution permission.
 ---
 8. Retrieval Is Not Decision-Making
 
@@ -910,18 +921,18 @@ should be considered instead.
 
 
 ---
-24. Classification and Action States (`CLASSIFICATION` & `PROPOSAL TYPE`)
+24. Classification and Action States (`STAGE 7: CLASSIFICATION` & `STAGE 8: PROPOSAL TYPE`)
 
-### 24.1 Governed Classification (`CLASSIFICATION` — 4 Sub-Stages)
+### 24.1 Governed Classification (`STAGE 7: CLASSIFICATION` — 4 Sub-Stages)
 
 Following Retrieval, Comparison, Relation Analysis, and Core Analysis, the `Classification` stage places the input unit into an evidence-informed proposed category (`Core`, `Concept`, `Observation`, `Experience`, `Research`, `Method`, `Source`, `Meta`, `Archive`) through four governed sub-stages:
 
 1. **Classification Evidence Collection:** Gathers all upstream analytical evidence relevant to determining the unit's knowledge class.
 2. **Classification Assessment:** Matches the collected evidence against canonical classification criteria so categorization follows a deterministic structure.
-3. **Classification Uncertainty Assessment:** Evaluates ambiguity between competing candidate classes so uncertain units are never forced into a category with false certainty.
-4. **Classification Result Recording:** Records the proposed class, rationale, and uncertainty into `ClassificationResult` and `Audit` (streaming the reasoning live to `Current Audit`).
+3. **Classification Uncertainty Assessment:** Evaluates ambiguity between competing candidate classes ($U_{\text{class}}$) and separation margin ($M_{\text{class}}$) so uncertain units are never forced into a category with false certainty.
+4. **Classification Result Recording:** Records the proposed class, rationale, margin, and uncertainty into `ClassificationResult` and `Audit` (streaming the reasoning live to `Current Audit`).
 
-### 24.2 Canonical Action States (`PROPOSAL TYPE`)
+### 24.2 Canonical Action States & Latent Evolution Foundation (`STAGE 8: PROPOSAL TYPE`)
 
 The canonical knowledge-management actions are:
 
@@ -933,7 +944,7 @@ ARCHIVE
 NEEDS_REVIEW
 NO_ACTION
 
-*(In the current implementation scope, only `CREATE`, `NEEDS_REVIEW`, and `DO_NOT_IMPORT` are active operational proposal outcomes; future actions map safely to `NEEDS_REVIEW`).*
+*(In the current implementation scope, only `CREATE`, `NEEDS_REVIEW`, and `DO_NOT_IMPORT` are active operational proposal outcomes. Cases involving conflict with `Core` or existing candidate notes, or requiring `UPDATE`, `MERGE`, or `ARCHIVE_CORE`, are routed safely to `NEEDS_REVIEW` and tagged with `LATENT_CONFLICT_CORE`, `LATENT_CONFLICT_CANDIDATE` / `CONTRADICTION`, `LATENT_UPDATE`, or `LATENT_MERGE` so future `UPDATE`, `MERGE`, and `CONFLICT_RESOLUTION` / `CONTRADICTION` execution categories can be activated directly from this foundation without breaking hash or approval contracts).*
 
 CREATE
 
@@ -941,11 +952,11 @@ Create a new authoritative knowledge object in Staging after explicit human appr
 
 UPDATE
 
-Modify an existing knowledge object after approval.
+Modify an existing knowledge object after approval (routed to `NEEDS_REVIEW` with `LATENT_UPDATE` in current scope).
 
 MERGE
 
-Integrate two or more knowledge objects while preserving meaningful distinctions.
+Integrate two or more knowledge objects while preserving meaningful distinctions (routed to `NEEDS_REVIEW` with `LATENT_MERGE` in current scope).
 
 DO_NOT_IMPORT
 
@@ -959,7 +970,7 @@ Archival is not deletion.
 
 NEEDS_REVIEW
 
-The evidence or interpretation is insufficient for a reliable decision; requires human inspection.
+The evidence or interpretation is insufficient, or a substantive conflict (`LATENT_CONFLICT_CORE`, `LATENT_CONFLICT_CANDIDATE` / `CONTRADICTION`) or update/merge overlap requires human inspection.
 
 NO_ACTION
 
@@ -1227,27 +1238,27 @@ Consequential knowledge-management actions remain subject to explicit approval.
 
 
 ---
-33. Auditability, Live `Current Audit`, Knowledge Language, and Output (`AUDIT` & `OUTPUT`)
+33. Auditability, Live `Current Audit`, Knowledge Language, and Output (`STAGE 15: AUDIT` & `STAGE 16: OUTPUT`)
 
 Consequential processing must be continuously traceable from the moment input is received until the final output is presented.
 
-### 33.1 The 9 Governed Audit Sub-Capabilities (`AUDIT`)
+### 33.1 The 9 Governed Audit Sub-Capabilities (`STAGE 15 [FORMERLY 16]: AUDIT`)
 
 `Audit` synchronizes across every stage from start to finish through nine recording capabilities:
 
 1. **Input and Provenance Recording:** Records input metadata, source type, `input_id`, and `input_hash` (never raw private input text) so the origin of the run is verifiable.
 2. **Analysis and Proposal Recording:** Records retrieval candidates, comparisons, relations, Core analysis, classification, and the final proposal so the analytical path is reconstructible.
-3. **Confidence and Filter Outcome Recording:** Records the multi-factor confidence assessment and Knowledge Filter verdict so limitations and continuation/stop reasons are explicit.
+3. **Confidence and Filter Outcome Recording:** Records the 3-layer confidence vector $(C_{\text{final}}, E_{\text{base}}, P_{\text{conflict}}, D_{\text{uncert}})$, the 4-Gate Knowledge Filter verdict, and any attached latent evolution tags (`LATENT_CONFLICT_CORE`, `LATENT_CONFLICT_CANDIDATE`, `LATENT_UPDATE`, `LATENT_MERGE`) so limitations and continuation/stop reasons are explicit.
 4. **LLM Result Recording:** Records the LLM provider/model metadata, prompt hash, and validated synthesis result so the model's contribution is traceable.
 5. **Human Review Recording:** Records the human inspection and review interaction (`human_review_state`).
-6. **Approval State Recording:** Records explicit approval or rejection and its cryptographic binding to `proposal_hash`.
-7. **Revalidation Recording:** Records the pre-execution revalidation checks confirming that execution prerequisites were verified again after approval.
+6. **Approval State Recording:** Records explicit approval, rejection, or authorized human proposal edit ($H_0 \to H_1$) and its cryptographic binding to `proposal_hash`.
+7. **Revalidation Recording:** Records the 7 pre-execution revalidation checks confirming that execution prerequisites were verified again after approval.
 8. **Execution Result Recording:** Records the actual `ControlledExecutor` outcome, artifact path, and SHA-256 digest, keeping execution strictly distinct from proposal.
 9. **Error or Failure Recording:** Records safe stops, validation rejections, emergency persistence receipts, and artifact quarantine events across `passed/`, `failed/`, and `errors/` partitions so failures are never hidden.
 
 Audit records are append-only (`AuditWriter`) and must never be silently rewritten to hide previous decisions. Audit itself never issues approval or execution permission.
 
-### 33.2 The 5 Governed Output Sub-Capabilities (`OUTPUT`)
+### 33.2 The 5 Governed Output Sub-Capabilities (`STAGE 16 [FORMERLY 17]: OUTPUT`)
 
 The `Output` stage presents the final state of the workflow clearly to the researcher while keeping analysis, proposal, approval, and actual execution distinct:
 
@@ -1257,18 +1268,18 @@ The `Output` stage presents the final state of the workflow clearly to the resea
 4. **Audit Reference:** Provides direct traceability to the corresponding `Audit` record in the `Recent Audits` journal.
 5. **Error or Stop Explanation:** Clearly explains the reason for any stop, error, or clarification request, exposing in-UI `Fix / Edit Input`, `Retry`, and `Stop` controls. Displaying an output result never implies new approval or automatic placement into the authoritative Obsidian Vault.
 
-### 33.3 Three Cross-Cutting Governance Requirements Across All Stages
+### 33.3 The Cross-Cutting Verification Triad Across All 16 Stages
 
-Every stage in the workflow (from `Input` through `Output`) must enforce three cross-cutting operational contracts:
+Every stage in the workflow (`STAGE 1: INPUT` through `STAGE 16: OUTPUT`) must enforce the **Cross-Cutting Verification Triad**:
 
-1. **Continuous Audit Spine & DeepThink-Style Live `Current Audit`:**
-   - Audit acts as the internal connector across all sub-stages within each stage and as the continuous bridge linking each stage to the previous and next stages in the workflow.
-   - Every stage is connected simultaneously to persistent `Audit` and to the live **`Current Audit`** panel, streaming an authentic, verifiable **DeepThink-style analytical thought process** (explaining the evidence being weighed, the constraints checked, and the reasoning in real time—not merely emitting bare event labels). During `Human Review & Explicit Approval`, `Current Audit` pauses in sync with the human review and resumes seamlessly upon human decision.
-2. **Knowledge Language Alignment (`Audit` & `Staging`) + Universal `Translate` Layer:**
-   - Both `Audit` and `Staging` are coordinated with the user's selected `Knowledge Language` settings (`language.audit` and `language.staging` in `en` or `fa`), ensuring that audit narratives and staged notes are written and recorded in their designated domain language.
-   - An interactive **`Translate`** capability (`/api/translate`) is available across `Audit`, `Staging`, `Current Audit`, and `ProcessingResult` so any content can be translated on demand between English and Persian (`TranslationRecord` with SHA-256 `source_hash` verification).
-3. **Frontend Synchronization:**
-   - Every stage, sub-stage, live reasoning trace, language selector, translation toggle, and error recovery control is fully wired and synchronized with the frontend UI.
+1. **`Continuous Cognitive Audit Hook (DeepThink Stream)`:**
+   - Acts as the internal connector across all sub-stages within each stage and as the continuous bridge linking each stage to the previous and next stages in the workflow.
+   - Connects simultaneously to persistent `Audit` and to the live **`Current Audit`** panel, streaming an authentic, verifiable **DeepThink-style analytical thought process** (explaining the evidence being weighed, the constraints checked, and the reasoning in real time—not merely emitting bare event labels). During `STAGE 12: HUMAN REVIEW & EXPLICIT APPROVAL`, `Current Audit` pauses in sync with the human review and resumes seamlessly upon human decision.
+2. **`Knowledge Language Alignment & Translation Layer`:**
+   - Coordinates both `Audit` and `Staging` with the user's selected `Knowledge Language` settings (`language.audit` and `language.staging` in `en` or `fa`), ensuring that audit narratives and staged notes are written and recorded directly in their designated domain language.
+   - Provides an interactive **`Translate`** capability (`/api/translate`) across `Audit`, `Staging`, `Current Audit`, and `ProcessingResult` so any content can be translated on demand between English and Persian (`TranslationRecord` with SHA-256 `source_hash` verification).
+3. **`Frontend State & UI Sync Verification`:**
+   - Ensures every stage, sub-stage pill, live reasoning trace, language selector, translation toggle, and Safe-Stop error recovery control is fully wired and synchronized with the frontend UI.
 ---
 
 34. Reversibility
@@ -1613,19 +1624,19 @@ For any knowledge-management decision, the system should reason in this order:
 ---
 46. Canonical Processing Pattern and Architecture Logic
 
-### 46.1 Canonical Governed Workflow Pattern
+### 46.1 Canonical Governed Workflow Pattern (16 Unified Stages)
 
-The general governed pattern across the 16 unified stages (with Stages 12 & 13 unified into `HUMAN REVIEW & EXPLICIT APPROVAL`) is:
+The general governed pattern across the 16 unified stages (with Stages 12 & 13 merged into `STAGE 12: HUMAN REVIEW & EXPLICIT APPROVAL`) is:
 
 ```text
-1. INPUT
+STAGE 1: INPUT
      ├── Input Source Selection (chat_input active; extensible foundation)
      ├── Input Type Detection (text active; extensible for Word/PDF/YAML/audio/image)
      ├── Input Validation (>= 50-letter threshold & structural bounds)
      ├── Source Identification (input_id & provenance)
      └── Initial Safety Checks
   ↓
-2. INGESTION
+STAGE 2: INGESTION
      ├── Reader Selection
      ├── Reading
      ├── Cleaning (zero deletion of substantive content)
@@ -1635,48 +1646,48 @@ The general governed pattern across the 16 unified stages (with Stages 12 & 13 u
      ├── Chunking (1-to-many unit decomposition & lexical/semantic/hybrid retrieval readiness)
      └── Provenance Recording
   ↓
-3. RETRIEVAL
+STAGE 3: RETRIEVAL
      ├── Ephemeral Input Embedding Cache (wiped at end of run)
      ├── Human-Gated Vault Sync (if authorized: add new, replace modified, delete removed vectors)
-     └── Query Preparation → Method Selection → Candidate Retrieval → Relevance Assessment → Candidate Identification → Evidence Recording
+     └── Query Preparation → Method Selection & Health Check → Candidate Retrieval → Relevance Assessment → Candidate Identification → Evidence Recording
   ↓
-4. COMPARISON
+STAGE 4: COMPARISON
      └── Candidate-by-Candidate → Content → Similarity → Difference → Contradiction → Evidence Recording
   ↓
-5. RELATION ANALYSIS
+STAGE 5: RELATION ANALYSIS
      └── Candidate Identification → Evidence Analysis → Type Assessment → Uncertainty Assessment → Result Recording
   ↓
-6. CORE ANALYSIS
+STAGE 6: CORE ANALYSIS
      └── Core Schema Resolution → Context Identification → Relevance Analysis (single active Core note with dynamic retrieval weight) → Conflict/Uncertainty Detection → Result Recording
   ↓
-7. CLASSIFICATION
+STAGE 7: CLASSIFICATION
      └── Evidence Collection → Classification Assessment → Uncertainty Assessment → Result Recording
   ↓
-8. PROPOSAL TYPE
+STAGE 8: PROPOSAL TYPE
      └── Consolidation → Eligibility Assessment → Action Selection (CREATE / NEEDS_REVIEW / DO_NOT_IMPORT) → Content Generation → Destination Identification → Identity & Hash Recording
   ↓
-9. CONFIDENCE
-     └── Evidence Sufficiency → Uncertainty Assessment → Multi-Factor Mathematical Confidence Calculation → Result Recording
+STAGE 9: CONFIDENCE
+     └── Evidence Sufficiency → Uncertainty Assessment → 3-Layer Multiplicative Formula (C_final = E_base * P_conflict * D_uncert) → Result Recording
   ↓
-10. KNOWLEDGE FILTER
-     └── Filter Input Assessment → Boundary & Eligibility Signal Evaluation → Filter Outcome Determination → Filter Reason Recording
+STAGE 10: KNOWLEDGE FILTER
+     └── Filter Input Assessment → 4-Gate Algorithmic Evaluation (Gate 1 Redundancy, Gate 2 Core/Candidate Conflict -> NEEDS_REVIEW Veto, Gate 3 C_final Matrix & Latent Tagging, Gate 4 Synthesis Budget) → Filter Outcome Determination → Filter Reason Recording
   ↓
-11. LLM SYNTHESIS
+STAGE 11: LLM SYNTHESIS
      └── Bounded Context Preparation → Evidence & Uncertainty Packaging → Mandatory Local (Ollama) / Privacy-Gated Cloud Request → Structured Output Validation → Synthesis Result Recording
   ↓
-12 & 13. HUMAN REVIEW & EXPLICIT APPROVAL (UNIFIED STAGE)
-     └── Candidate & Exact Proposal Presentation (all actions) → Evidence & Uncertainty Inspection → Approval Eligibility Check → Human Decision Input (Acknowledge for non-CREATE; Approve/Reject/Edit with H0->H1 hash rebinding for CREATE) → Approval State Recording
+STAGE 12 [MERGED 12 & 13]: HUMAN REVIEW & EXPLICIT APPROVAL
+     └── Candidate & Exact Proposal Presentation (all actions) → Evidence & Uncertainty Inspection → Approval Eligibility Check → Human Decision Input (Acknowledge for non-CREATE; Approve/Reject/Edit with H0->H1 hash rebinding for CREATE) → Approval State Recording (with synchronized live Current Audit pause/resume)
   ↓
-14. REVALIDATION
+STAGE 13 [FORMERLY 14]: REVALIDATION
      └── Proposal Identity → Content & Hash → Single-Target (no duplicate outputs) → Destination → Provenance → Approval Binding → Current State & Eligibility
   ↓
-15. CONTROLLED EXECUTION
+STAGE 14 [FORMERLY 15]: CONTROLLED EXECUTION
      └── Execution Eligibility Check → Controlled Destination Validation → Controlled Write (Staging only) → Result Verification → Execution Receipt Recording
   ↓
-16. AUDIT (Continuous Spine across all stages + Live DeepThink-style Current Audit)
+STAGE 15 [FORMERLY 16]: AUDIT (Continuous Spine across all stages + Live DeepThink-style Current Audit)
      └── Input/Provenance → Analysis/Proposal → Confidence/Filter → LLM Result → Human Review → Approval State → Revalidation → Execution Result → Error/Failure Recording
   ↓
-17. OUTPUT
+STAGE 16 [FORMERLY 17]: OUTPUT
      └── Final Status Assembly → Processing Result Presentation → Staging Artifact Reference → Audit Reference → Error or Stop Explanation
 ```
 
@@ -1686,14 +1697,14 @@ This is a governance pattern, not a requirement that every implementation use id
 
 Each pair of stages answers a distinct question in the governed research cycle:
 
-- **INPUT & INGESTION:** What has been received, and how is it prepared for processing without losing meaning?
-- **RETRIEVAL & COMPARISON:** What relevant evidence exists in prior knowledge, and what similarities, differences, or contradictions does the input have with each candidate?
-- **RELATION ANALYSIS & CORE ANALYSIS:** What defensible relationships exist, and how does the input relate to the central conceptual Core of the repository?
-- **CLASSIFICATION, PROPOSAL, CONFIDENCE & KNOWLEDGE FILTER:** What is the nature of the input, what action is proposed, how strong is the mathematical evidence support, and what boundary limitations or uncertainties exist?
-- **LLM SYNTHESIS:** How can the evidence, analyses, and uncertainties be dynamically synthesized into a structured summary without granting decision authority to the model?
-- **HUMAN REVIEW & EXPLICIT APPROVAL (UNIFIED):** What is the human inspecting, and to what exact proposal version is execution permission granted?
-- **REVALIDATION & CONTROLLED EXECUTION:** Are all conditions still valid right before execution, and is the authorized operation performed in a strictly controlled manner?
-- **AUDIT & OUTPUT:** What happened across the entire reasoning chain, why did it happen, and what is the final outcome?
+- **STAGES 1 & 2 (`INPUT` & `INGESTION`):** What has been received, and how is it prepared for processing without losing meaning?
+- **STAGES 3 & 4 (`RETRIEVAL` & `COMPARISON`):** What relevant evidence exists in prior knowledge, and what similarities, differences, or contradictions does the input have with each candidate?
+- **STAGES 5 & 6 (`RELATION ANALYSIS` & `CORE ANALYSIS`):** What defensible relationships exist, and how does the input relate to the central conceptual Core of the repository?
+- **STAGES 7, 8, 9 & 10 (`CLASSIFICATION`, `PROPOSAL TYPE`, `CONFIDENCE` & `KNOWLEDGE FILTER`):** What is the nature of the input, what action is proposed, how strong is the mathematical evidence support ($C_{\text{final}}$), and what 4-gate boundary rules or conflict downgrades apply?
+- **STAGE 11 (`LLM SYNTHESIS`):** How can the evidence, analyses, and uncertainties be dynamically synthesized into a structured summary without granting decision authority to the model?
+- **STAGE 12 (`HUMAN REVIEW & EXPLICIT APPROVAL` — MERGED 12 & 13):** What is the human inspecting, and to what exact proposal version is execution permission granted?
+- **STAGES 13 & 14 (`REVALIDATION` & `CONTROLLED EXECUTION` — FORMERLY 14 & 15):** Are all conditions still valid right before execution, and is the authorized operation performed in a strictly controlled manner?
+- **STAGES 15 & 16 (`AUDIT` & `OUTPUT` — FORMERLY 16 & 17):** What happened across the entire reasoning chain, why did it happen, and what is the final outcome?
 
 > **Central LA-E Principle:** The system must be able to analyze knowledge and make proposals, but it must never confuse analysis, similarity, classification, confidence, or even model-generated output with authorization to modify authoritative knowledge. Every consequential action must pass through the boundaries of human review, explicit approval, revalidation, and controlled execution, and be durably documented in Audit.
 ---

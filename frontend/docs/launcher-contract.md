@@ -50,15 +50,16 @@ fixture/demo mode and performs no backend calls.
 
 ## POST /api/approve
 
-- Purpose: record one explicit human decision (`approve` or `reject`) bound to one `proposal_hash` in the unified **Human Review & Explicit Approval** stage.
-- Request: `{ proposal_hash, query_unit_id, decision: "approve"|"reject" }`
+- Purpose: record one explicit human decision (`approve` or `reject`) bound to one `proposal_hash` and `run_id` in **`STAGE 12 [MERGED 12 & 13]: HUMAN REVIEW & EXPLICIT APPROVAL`**.
+- Request: `{ run_id: string, proposal_hash: string, query_unit_id: string, decision: "approve"|"reject", proposal_action?: string, action?: string }`
 - Response: `{ proposal_hash, approved, reason }`
 - Eligibility & Errors:
-  - Only `CREATE` proposals may be approved for execution; attempting to `approve` a non-CREATE proposal (`NEEDS_REVIEW`, `DO_NOT_IMPORT`) returns HTTP 400 `validation_error` (non-CREATE proposals are acknowledged via `POST /api/run/accept` or rejected).
-  - Stale/unknown hash or mismatched `query_unit_id` → HTTP 400 `validation_error`.
+  - Mandatory `run_id` binding: `run_id` is required and must be a non-empty string matching the active pending review run (missing/blank → HTTP 400 `validation_error`; mismatched/cancelled/terminal run → HTTP 409 `conflict`).
+  - Action consistency: only `CREATE` proposals may be approved for execution; attempting to `approve` a non-CREATE proposal (`NEEDS_REVIEW`, `DO_NOT_IMPORT`) or supplying contradictory `proposal_action` / `action` fields returns HTTP 400 `validation_error` without mutating state.
+  - Stale/unknown `proposal_hash` or mismatched `query_unit_id` → HTTP 400 `validation_error`.
   - Cancelled, timed-out, or already-answered approval → HTTP 409 `conflict`.
 - Auth: token required. Only explicit UI decision; never inferred from confidence/classification/filter.
-- Sync: synchronous decision record; 7-check revalidation and controlled execution remain backend-gated in the integration layer.
+- Sync: synchronous decision record; 7-check revalidation (`STAGE 13`) and controlled execution (`STAGE 14`) remain backend-gated in the integration layer.
 
 ## POST /api/proposal/edit
 
@@ -204,11 +205,11 @@ fixture/demo mode and performs no backend calls.
 
 ## POST /api/run/accept
 
-- Purpose: explicit human review acknowledgment in the unified **Human Review & Explicit Approval** stage for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`). Acknowledges human inspection of the proposal and resumes the pipeline to terminal Audit/Output without triggering file creation.
-- Request: `{ proposal_hash: string, run_id?: string }` (`proposal_hash` must be a valid 64-character hex SHA-256 digest matching the active pending review).
+- Purpose: explicit human review acknowledgment (`Acknowledge`) in **`STAGE 12 [MERGED 12 & 13]: HUMAN REVIEW & EXPLICIT APPROVAL`** for non-CREATE proposals (`NEEDS_REVIEW`, `DO_NOT_IMPORT`, including Core/candidate conflict items routed to `NEEDS_REVIEW` by the 4-Gate Knowledge Filter with latent evolution tags `LATENT_CONFLICT_CORE`, `LATENT_CONFLICT_CANDIDATE` / `CONTRADICTION`, `LATENT_UPDATE`, or `LATENT_MERGE`). Acknowledges human inspection of the proposal and resumes the pipeline to terminal Audit (`STAGE 15`) and Output (`STAGE 16`) without triggering file creation.
+- Request: `{ run_id: string, proposal_hash: string, proposal_action?: string, action?: string }` (`run_id` is mandatory and must match the active pending review run; `proposal_hash` must be a valid 64-character hex SHA-256 digest matching the active pending review).
 - Response: `{ accepted: true, action: string, run_id: string, proposal_hash: string }`.
 - Errors:
-  - HTTP 400 `validation_error`: missing, non-64-hex, or mismatched `proposal_hash`, or if the pending proposal is `CREATE` (`CREATE` proposals require `/api/approve`).
+  - HTTP 400 `validation_error`: missing/blank `run_id`, missing/non-64-hex/mismatched `proposal_hash`, contradictory `proposal_action` / `action` fields, or if the pending proposal is `CREATE` (`CREATE` proposals require `/api/approve`).
   - HTTP 409 `conflict`: run already completed, cancelled, timed out, already answered, or `run_id` mismatch.
 - Auth: token required.
 - Sync: synchronous.
@@ -249,14 +250,15 @@ fixture/demo mode and performs no backend calls.
 
 ## GET /api/events (SSE)
 
-- Purpose: stream run-scoped operational events for the Current Audit view and workflow timeline.
-- Envelope: `{ kind, run_id, stage, substage?, operation?, phase?, message, timestamp, confidence_score?, confidence_score_band?, classification_type?, proposal_hash?, candidate_count?, unit_count? }`.
+- Purpose: stream run-scoped operational events for the live DeepThink-style `Current Audit` view (`Continuous Cognitive Audit Hook`) and workflow timeline across the 16 unified stages (`STAGE 1: INPUT` to `STAGE 16: OUTPUT`).
+- Envelope: `{ kind, run_id, stage, substage?, operation?, phase?, message, timestamp, confidence_score?, confidence_score_band?, classification_type?, proposal_hash?, query_unit_id?, proposal_action?, title?, body?, destination?, reason?, evidence?, provenance?, uncertainties?, is_executable?, candidate_count?, unit_count? }`.
 - Kinds: `run_started|stage_started|stage_completed|status|warning|error|stopped|human_review_required|approval_decided|consent_required|sync_approval_required|revalidation_result|execution_result|run_completed|run_rejected`.
 - Stages, Sub-Stages, and Live `Current Audit` Continuity:
-  - Streams continuous, verifiable DeepThink-style analytical progress across all 17 stages (16 unified operational stages), respecting the selected `Audit` and `Staging` Knowledge Languages (`en`/`fa`).
-  - `ingestion`: 8 discrete substages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `chunking`, `metadata_extraction`, `extraction`).
-  - `retrieval`: discrete operations (`query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording`) with explicit phases `started`, `completed`, and `failed`, plus ephemeral `TemporaryEmbeddingCache` cleanup receipts and human-gated Vault sync events (`sync_approval_required`).
-  - `human_review` (Unified Human Review & Explicit Approval): emits `human_review_required` for all proposal actions (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), pausing the live `Current Audit` stream in sync with human inspection/editing and resuming continuously upon `approval_decided`.
+  - Streams continuous, verifiable DeepThink-style analytical progress across all 16 unified stages (`STAGE 1: INPUT` to `STAGE 16: OUTPUT`), respecting the selected `Audit` and `Staging` Knowledge Languages (`en`/`fa`).
+  - `ingestion` (`STAGE 2: INGESTION`): 8 discrete substages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `chunking`, `metadata_extraction`, `extraction`).
+  - `retrieval` (`STAGE 3: RETRIEVAL`): discrete operations (`query_preparation`, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording`) with explicit phases `started`, `completed`, and `failed`, plus ephemeral `TemporaryEmbeddingCache` cleanup receipts and human-gated Vault sync events (`sync_approval_required`).
+  - `confidence` (`STAGE 9: CONFIDENCE`) & `knowledge_filter` (`STAGE 10: KNOWLEDGE FILTER`): reports the 3-layer multiplicative confidence score $C_{\text{final}} = E_{\text{base}} \times P_{\text{conflict}} \times D_{\text{uncert}} \in [0.00, 1.00]$ and 4-Gate Knowledge Filter enforcement (routing Core/candidate conflicts to `NEEDS_REVIEW` with latent evolution tags).
+  - `human_review` (`STAGE 12 [MERGED 12 & 13]: HUMAN REVIEW & EXPLICIT APPROVAL`): emits `human_review_required` with complete analytical payload (`title`, `body`, `destination`, `reason`, `evidence`, `provenance`, `uncertainties`, `is_executable`) for all proposal actions (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), pausing the live `Current Audit` stream in sync with human inspection/editing and resuming continuously upon `approval_decided`. If a run is cancelled or fails before `approval_decided`, `human_review` transitions truthfully to `stopped` (never falsely marked `completed`).
 - Rejection and Quarantine: When audit persistence fails post-execution, terminal rejection events explicitly report `"audit persistence failure: artifact quarantined"` or `"audit persistence failure: partial quarantine"`.
 - Client Correlation, Filtering, and Substep Lifecycle Contract:
   - Clients MUST strictly filter incoming SSE events by the active `run_id` (`filterEventsByRun(events, run.run_id)`). When `run_id` is omitted, events must NEVER be selected solely because they occur later in the array.

@@ -28,11 +28,11 @@ Facts verified against the repository at this checkpoint:
   per-launch in-memory `X-LAE-Token` authentication and Origin/Host verification.
   No dynamic code execution (`eval`/`exec`), no shell-out
   (`subprocess`/`os.system`), and no deserialization of untrusted data.
-* The `Input` stage (`knowledge/input/processor.py`) enforces an authoritative entry gate:
+* The `STAGE 1: INPUT` entry gate (`knowledge/input/processor.py`) enforces an authoritative boundary:
   it restricts active interactive input to `chat_input` text (while laying the extensible foundation
-  for future document/media formats), validates operating mode (`personal_vault` or `examples`),
+  for future document/media formats), validates operating mode (`personal_vault` [**VAULT MODE**] or `examples` [**TEST MODE**]),
   enforces UTF-8 encoding, `MAX_TEXT_BYTES = 1_000_000`, control-character rejection, noise filtering,
-  and substantive content thresholds, and records only `input_id` and SHA-256 `input_hash`
+  and the $\ge 50$-letter substantive content threshold (`DEFAULT_MIN_LETTERS = 50`), and records only `input_id` and SHA-256 `input_hash`
   (never persisting raw private input text to audit logs).
 * The analytical pipeline (`Ingestion` through `Retrieval`, `Comparison`, `Relation Analysis`,
   `Core Analysis`, `Classification`, `Proposal Type`, `Confidence`, `Knowledge Filter`, and `LLM Synthesis`)
@@ -71,7 +71,7 @@ Facts verified against the repository at this checkpoint:
   Local YAML configuration persistence (`Config/*.local.yaml`) is executed strictly
   in `Config/settings.py` (outside the `src/` tree), preserving the static AST invariant
   that no filesystem mutation operations exist in application logic outside `executor.py` and `persistence.py`.
-  Current executable action scope is `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` — everything else is future work.
+  Current executable action scope is `CREATE` / `DO_NOT_IMPORT` / `NEEDS_REVIEW` (with the 3-layer confidence formula and 4-Gate Knowledge Filter automatically routing any Core/candidate conflicts or latent `UPDATE` / `MERGE` / `CONFLICT_RESOLUTION` [`CONTRADICTION`] cases to `NEEDS_REVIEW`) — everything else is future work.
 * Private configuration and private documents are physically outside the
   tracked tree: `Config/paths.local.yaml`, `Config/llm.local.yaml`, `Config/localization.local.yaml`,
   `.project/`, `.clinerules/`,
@@ -121,8 +121,8 @@ Facts verified against the repository at this checkpoint:
   outcomes and explicit hash-bound approval (`Approve`) for `CREATE`. On-demand bilingual
   translations (`POST /api/translate`) are presentation-only (`persisted: false`) and never
   alter authoritative content or approval hashes. The vault stays read-only and bounded.
-* Example inputs under `examples/` are synthetic and fictitious; they
-  contain no real knowledge, no real machine path, and no credentials.
+* Example inputs under `examples/` belong strictly to **TEST MODE** (`examples`); they are synthetic and fictitious and
+  contain no real knowledge, no real machine path, and no credentials. In **VAULT MODE** (`personal_vault`), user-selected folders are validated fail-closed via `PathBoundary`.
 
 ---
 

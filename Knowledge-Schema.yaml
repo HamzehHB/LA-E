@@ -1048,7 +1048,7 @@ confidence:
   definition: >
     Analytical confidence measuring how strongly the collected evidence and
     analyses support a proposed interpretation, classification, comparison,
-    relation, or action, and how much epistemic uncertainty remains.
+    relation, or action, and how much epistemic uncertainty or conflict remains.
 
   sub_stages:
     - id: "evidence_sufficiency_assessment"
@@ -1056,9 +1056,9 @@ confidence:
     - id: "uncertainty_assessment"
       description: "Identifies ambiguities, contradictions, and analytical limitations so confidence is never inflated beyond reality."
     - id: "confidence_calculation_or_assessment"
-      description: "Computes both the multi-factor numeric confidence score C in [0.00, 1.00] and the ordinal strength level."
+      description: "Computes the 3-layer multiplicative numeric confidence score C_final in [0.00, 1.00], its constituent factors (E_base, P_conflict, D_uncert), and the ordinal strength level."
     - id: "confidence_result_recording"
-      description: "Records the numeric score, ordinal level, evidentiary basis, and uncertainty tuple into ConfidenceAssessment and Audit."
+      description: "Records the auditable confidence vector (C_final, E_base, P_conflict, D_uncert), ordinal level, evidentiary basis, and uncertainty tuple into ConfidenceAssessment and Audit."
 
   range:
     minimum: 0.0
@@ -1073,29 +1073,75 @@ confidence:
     - "insufficient_evidence"
 
   mathematical_formulation:
-    equation: "C = clip_[0,1]( (w_E * S_evidence + w_D * S_distinct + w_K * S_class + w_R * S_core) * prod_{g in G}(1 - lambda_g) - Phi_conflict )"
-    pillars:
-      evidence_completeness:
-        symbol: "S_evidence"
-        weight: 0.30
-        description: "Completeness of analytical evidence across classification, retrieval candidates, comparisons, relations, and Core analysis."
-      comparative_distinctness:
-        symbol: "S_distinct"
-        weight: 0.25
-        description: "Clarity and non-contradiction of candidate comparison outcomes."
-      classification_certainty:
-        symbol: "S_class"
-        weight: 0.25
-        description: "Certainty of the evidence-informed classification (is_certain vs is_resolved vs unresolved)."
-      core_resolution_stability:
-        symbol: "S_core"
-        weight: 0.20
-        description: "Resolution stability of Core relevance analysis."
-    uncertainty_decay_and_ceilings:
-      no_evidence_ceiling: 0.00
-      contradictory_or_insufficient_ceiling: 0.45
-      recorded_gap_ceiling: 0.75
-      sufficiently_supported_floor: 0.85
+    equation: "C_final = clip_[0,1]( E_base * P_conflict * D_uncert )"
+    layers:
+      composite_evidence_base:
+        symbol: "E_base"
+        formula: "E_base = (w_1 * S_ret) + (w_2 * R_suff) + (w_3 * A_core) + (w_4 * M_class)"
+        variables:
+          retrieval_and_distinctness_evidence:
+            symbol: "S_ret"
+            weight: 0.25
+            description: >
+              Weighted retrieval and comparative evidence quality across the top
+              candidates after dynamic Core boosting (for novel CREATE proposals
+              with verified distinctness in Stage 4, reflects proven distinctness
+              and absence of ambiguous overlap so genuinely new knowledge is not
+              penalized for lacking prior duplicates).
+          evidence_sufficiency_ratio:
+            symbol: "R_suff"
+            weight: 0.30
+            description: >
+              Proportion of input chunks possessing complete provenance, valid
+              parsed structure, and verified analytical evidence (supporting
+              retrieval/Core alignment or proven comparative distinctness).
+          core_semantic_alignment:
+            symbol: "A_core"
+            weight: 0.25
+            description: >
+              Degree of semantic alignment or reinforcement with the single
+              active Core note in Stage 6 (neutral baseline 0.50 when
+              no_observed_relevance and zero conflict).
+          classification_separation_margin:
+            symbol: "M_class"
+            weight: 0.20
+            description: >
+              Separation margin between the primary proposed knowledge class
+              and the runner-up class in Stage 7.
+      non_linear_contradiction_penalty:
+        symbol: "P_conflict"
+        formula: "P_conflict = (1 - max(D_cand, min(1.0, lambda * D_core)))^gamma"
+        parameters:
+          gamma: 2.0
+          lambda_core_amplification: 1.25
+        variables:
+          candidate_contradiction_severity:
+            symbol: "D_cand"
+            description: "Maximum contradiction severity detected against retrieved candidate notes in Stage 4."
+          core_conflict_severity:
+            symbol: "D_core"
+            description: "Conflict or challenge severity detected against the single active Core note in Stage 6."
+      epistemic_uncertainty_discount:
+        symbol: "D_uncert"
+        formula: "D_uncert = 1 - (0.40 * U_rel + 0.35 * U_core + 0.25 * U_class)"
+        variables:
+          relation_uncertainty:
+            symbol: "U_rel"
+            weight: 0.40
+            description: "Ambiguity and evidence gap recorded in Stage 5 (Relation Analysis)."
+          core_uncertainty:
+            symbol: "U_core"
+            weight: 0.35
+            description: "Ambiguity or unresolved relevance recorded in Stage 6 (Core Analysis)."
+          classification_uncertainty:
+            symbol: "U_class"
+            weight: 0.25
+            description: "Boundary ambiguity across candidate classes recorded in Stage 7 (Classification)."
+    auditable_output_vector:
+      - "C_final"
+      - "E_base"
+      - "P_conflict"
+      - "D_uncert"
 
   bands:
 
@@ -1114,8 +1160,8 @@ confidence:
   rules:
     - "Confidence is analytical, not authoritative."
     - "High confidence does not authorize execution."
-    - "Low confidence should normally trigger review."
-    - "Confidence should be supported by reasoning, mathematical breakdown, and evidence."
+    - "Low confidence or any substantive conflict with Core or existing notes must trigger human review."
+    - "Confidence should be supported by reasoning, the 3-layer mathematical breakdown (E_base, P_conflict, D_uncert), and evidence."
 
 
 # ============================================================================
@@ -1138,13 +1184,38 @@ action:
     - "NEEDS_REVIEW"
     - "DO_NOT_IMPORT"
 
+  future_extensible_evolution_categories:
+    - "UPDATE"
+    - "MERGE"
+    - "CONFLICT_RESOLUTION"
+    - "CONTRADICTION"
+    - "ARCHIVE_CORE"
+
+  latent_evolution_tags:
+    LATENT_CONFLICT_CORE:
+      target_future_category: "CONFLICT_RESOLUTION"
+      current_scope_routed_action: "NEEDS_REVIEW"
+      description: "Substantive tension or contradiction with the active Core note (D_core >= 0.45); routed to NEEDS_REVIEW in current scope and tagged for future Core conflict resolution."
+    LATENT_CONFLICT_CANDIDATE:
+      target_future_category: "CONTRADICTION"
+      current_scope_routed_action: "NEEDS_REVIEW"
+      description: "Substantive contradiction with one or more existing candidate notes (D_cand >= 0.60); routed to NEEDS_REVIEW in current scope and tagged for future contradiction/conflict resolution."
+    LATENT_UPDATE:
+      target_future_category: "UPDATE"
+      current_scope_routed_action: "NEEDS_REVIEW"
+      description: "Same underlying knowledge identity with meaningful new refinement, evidence, or correction; routed to NEEDS_REVIEW in current scope and tagged for future UPDATE execution."
+    LATENT_MERGE:
+      target_future_category: "MERGE"
+      current_scope_routed_action: "NEEDS_REVIEW"
+      description: "Complementary overlap across units representing the same conceptual entity where distinctions can be preserved; routed to NEEDS_REVIEW in current scope and tagged for future MERGE execution."
+
   proposal_type_sub_stages:
     - id: "evidence_and_analysis_consolidation"
       description: "Consolidates results from Retrieval, Comparison, Relation Analysis, Core Analysis, and Classification into a coherent evidentiary picture."
     - id: "action_eligibility_assessment"
       description: "Evaluates whether consolidated evidence and system rules permit proposing a supported action."
     - id: "proposal_action_selection"
-      description: "Selects CREATE, NEEDS_REVIEW, or DO_NOT_IMPORT (mapping future actions to NEEDS_REVIEW in current scope)."
+      description: "Selects CREATE, NEEDS_REVIEW, or DO_NOT_IMPORT (mapping future UPDATE, MERGE, CONFLICT_RESOLUTION/CONTRADICTION, and ARCHIVE_CORE cases to NEEDS_REVIEW with latent evolution tags)."
     - id: "proposed_content_generation"
       description: "Prepares the proposed Markdown note content (GeneratedNote) in the selected Staging language (en or fa) for human inspection."
     - id: "proposed_destination_identification"
@@ -1167,6 +1238,11 @@ action:
       type: "string"
       required: false
       description: "Previous proposal_hash (H0) replaced when a human edits a CREATE proposal to produce H1."
+
+    latent_evolution_tag:
+      type: "string"
+      required: false
+      description: "Optional latent tag (LATENT_CONFLICT_CORE, LATENT_CONFLICT_CANDIDATE, LATENT_UPDATE, LATENT_MERGE) recorded when an item is routed to NEEDS_REVIEW."
 
     target_id:
       type: "string"
@@ -1247,19 +1323,75 @@ proposal_status:
 knowledge_filter:
 
   definition: >
-    Algorithmic multi-signal boundary evaluation examining the input state and
-    analytical results against system rules and constraints to determine
-    continuation or restriction signals.
+    4-Gate algorithmic boundary and eligibility engine examining the input
+    state, comparison/conflict vectors, Core alignment, and calibrated
+    confidence (C_final) against system rules to enforce automatic action
+    downgrades and attach latent evolution tags before LLM synthesis.
 
   sub_stages:
     - id: "filter_input_assessment"
-      description: "Verifies the integrity and completeness of all analytical inputs received by the filter."
+      description: "Verifies the integrity and completeness of all analytical inputs received by the filter (Stages 4 through 9)."
     - id: "boundary_and_eligibility_signal_evaluation"
-      description: "Evaluates cross-stage boundary constraints (identity/duplication overlap, comparative contradiction, Core tension/conflict, and confidence thresholds)."
+      description: "Evaluates the 4 sequential algorithmic gates across provenance, redundancy, Core/candidate conflicts, and C_final thresholds."
     - id: "filter_outcome_determination"
-      description: "Determines the filter verdict (pass_to_review, hold_for_review, or do_not_import)."
+      description: "Determines the filter verdict (pass_to_review, hold_for_review, or do_not_import), enforces automatic action downgrades, and attaches latent evolution tags."
     - id: "filter_reason_recording"
-      description: "Records the exact boundary rationale into FilterOutcome and Audit."
+      description: "Records the exact gate signal, boundary rationale, and latent evolution tags into FilterOutcome and Audit."
+
+  algorithmic_gates:
+    gate_1_provenance_and_redundancy:
+      name: "Provenance & Redundancy Gate"
+      condition: "Provenance chain is incomplete OR (similarity S_ret >= 0.95 AND Stage 4 meaningful difference == 0, indicating pure duplication)."
+      signal: "FILTER_BLOCK_REDUNDANT"
+      enforced_action: "DO_NOT_IMPORT"
+      verdict: "do_not_import"
+    gate_2_core_and_candidate_conflict_veto:
+      name: "Core & Candidate Conflict Veto Gate"
+      condition: "Core conflict severity D_core >= 0.45 OR candidate contradiction severity D_cand >= 0.60."
+      signal: "FILTER_CONFLICT_OVERRIDE"
+      enforced_action: "NEEDS_REVIEW"
+      verdict: "hold_for_review"
+      latent_tags_attached:
+        - "LATENT_CONFLICT_CORE (when D_core >= 0.45)"
+        - "LATENT_CONFLICT_CANDIDATE / CONTRADICTION (when D_cand >= 0.60)"
+      rule: >
+        Any substantive conflict with the active Core note or existing notes
+        vetoes direct CREATE and routes the proposal to NEEDS_REVIEW (never
+        silently discarding it as DO_NOT_IMPORT) so the human can inspect the
+        conflict and future CONFLICT_RESOLUTION / UPDATE / MERGE workflows can
+        operate on the tagged record.
+    gate_3_confidence_threshold_matrix:
+      name: "Confidence Threshold Matrix & Latent Evolution Gate"
+      bands:
+        low_confidence_reject:
+          condition: "C_final < 0.35 (and not a substantive conflict or complementary update/merge candidate)"
+          signal: "LOW_CONFIDENCE_REJECT"
+          enforced_action: "DO_NOT_IMPORT"
+          verdict: "do_not_import"
+        moderate_confidence_or_evolution_hold:
+          condition: "0.35 <= C_final < 0.70 OR substantive conflict (Gate 2) OR complementary update/merge overlap"
+          signal: "MODERATE_CONFIDENCE_HOLD"
+          enforced_action: "NEEDS_REVIEW"
+          verdict: "hold_for_review"
+          latent_tags_attached:
+            - "LATENT_UPDATE"
+            - "LATENT_MERGE"
+            - "LATENT_CONFLICT_CORE"
+            - "LATENT_CONFLICT_CANDIDATE"
+        high_confidence_pass:
+          condition: "C_final >= 0.70 AND zero unresolved Core/candidate conflict"
+          signal: "HIGH_CONFIDENCE_PASS"
+          enforced_action: "CREATE"
+          verdict: "pass_to_review"
+    gate_4_synthesis_context_budget:
+      name: "Synthesis Context Budget Gate"
+      condition: "All units evaluated by Gates 1-3 (including NEEDS_REVIEW and DO_NOT_IMPORT)."
+      signal: "PROCEED_TO_SYNTHESIS"
+      description: >
+        Sets the bounded evidence quota and policy constraints forwarded to
+        Stage 11 (LLM Synthesis) so the model synthesizes a transparent report
+        for human review without exceeding filter boundaries or overriding the
+        enforced action.
 
   verdicts:
     - "pass_to_review"
@@ -1643,7 +1775,7 @@ audit:
 output_stage:
 
   definition: >
-    Final stage (Stage 17) assembling and presenting the truthful end-to-end
+    Final stage (STAGE 16 [formerly Stage 17]) assembling and presenting the truthful end-to-end
     outcome of the run while keeping analysis, proposal, human review, explicit
     approval, revalidation, and actual execution strictly distinct.
 
@@ -1725,10 +1857,33 @@ pipeline:
     - "EXECUTE_APPROVED_ACTION"
     - "RECORD_AUDIT_EVENT"
 
+  cross_cutting_verification_triad:
+    continuous_cognitive_audit_hook:
+      id: "Continuous Cognitive Audit Hook (DeepThink Stream)"
+      description: >
+        Internal connector across all sub-stages of a stage, continuous bridge
+        to the previous and next workflow stages, and dual emitter writing
+        immutable records to persistent Audit while streaming a live,
+        verifiable DeepThink-style analytical reasoning trace to Current Audit.
+    knowledge_language_alignment_and_translation_layer:
+      id: "Knowledge Language Alignment & Translation Layer"
+      description: >
+        Ensures Audit narratives/streams and Staging notes are written and
+        recorded directly in their configured domain languages (language.audit
+        and language.staging in en or fa) while providing an on-demand
+        Translate layer (/api/translate) across all artifacts.
+    frontend_state_and_ui_sync_verification:
+      id: "Frontend State & UI Sync Verification"
+      description: >
+        Verifies real-time frontend synchronization of stage/sub-stage pills,
+        live Current Audit, review/edit controls, and Safe-Stop recovery
+        (Fix / Retry / Stop).
+
   unified_runtime_stages:
 
     stage_01_input:
-      question: "What has been received and is it safe and valid to enter processing?"
+      canonical_name: "STAGE 1: INPUT"
+      question: "What has been received and is it safe and valid (>= 50 letters) to enter processing?"
       sub_stages:
         - "input_source_selection"
         - "input_type_detection"
@@ -1737,7 +1892,8 @@ pipeline:
         - "initial_safety_checks"
 
     stage_02_ingestion:
-      question: "How is the accepted input cleaned, structured, chunked, and extracted into KnowledgeUnits without losing meaning?"
+      canonical_name: "STAGE 2: INGESTION"
+      question: "How is the accepted input cleaned (with zero substantive loss), structured, chunked, and extracted into KnowledgeUnits?"
       sub_stages:
         - "reader_selection"
         - "reading"
@@ -1749,6 +1905,7 @@ pipeline:
         - "provenance_recording"
 
     stage_03_retrieval:
+      canonical_name: "STAGE 3: RETRIEVAL"
       question: "What relevant prior evidence exists in the knowledge base?"
       pre_retrieval_mechanisms:
         - "ephemeral_input_embedding_cache"
@@ -1762,6 +1919,7 @@ pipeline:
         - "retrieval_evidence_recording"
 
     stage_04_comparison:
+      canonical_name: "STAGE 4: COMPARISON"
       question: "What similarities, differences, or contradictions does the input have against each retrieved candidate?"
       sub_stages:
         - "candidate_by_candidate_comparison"
@@ -1772,6 +1930,7 @@ pipeline:
         - "comparison_evidence_recording"
 
     stage_05_relation_analysis:
+      canonical_name: "STAGE 5: RELATION ANALYSIS"
       question: "What defensible causal-comparative or structural relationships exist with prior knowledge?"
       sub_stages:
         - "relation_candidate_identification"
@@ -1781,6 +1940,7 @@ pipeline:
         - "relation_result_recording"
 
     stage_06_core_analysis:
+      canonical_name: "STAGE 6: CORE ANALYSIS"
       question: "How does the input relate to the repository's single active Core note, and is there any conflict or ambiguity?"
       sub_stages:
         - "core_schema_resolution"
@@ -1790,6 +1950,7 @@ pipeline:
         - "core_analysis_result_recording"
 
     stage_07_classification:
+      canonical_name: "STAGE 7: CLASSIFICATION"
       question: "What proposed knowledge class best fits the unit based on the upstream evidence?"
       sub_stages:
         - "classification_evidence_collection"
@@ -1798,6 +1959,7 @@ pipeline:
         - "classification_result_recording"
 
     stage_08_proposal_type:
+      canonical_name: "STAGE 8: PROPOSAL TYPE"
       question: "What operational action (CREATE, NEEDS_REVIEW, DO_NOT_IMPORT), draft content, destination, and proposal_hash are proposed?"
       sub_stages:
         - "evidence_and_analysis_consolidation"
@@ -1808,7 +1970,8 @@ pipeline:
         - "proposal_identity_and_hash_recording"
 
     stage_09_confidence:
-      question: "How strongly does the mathematical multi-factor evidence formula support the proposal, and what uncertainties remain?"
+      canonical_name: "STAGE 9: CONFIDENCE"
+      question: "How strongly does the 3-layer multiplicative formula (C_final = E_base * P_conflict * D_uncert) support the proposal?"
       sub_stages:
         - "evidence_sufficiency_assessment"
         - "uncertainty_assessment"
@@ -1816,7 +1979,8 @@ pipeline:
         - "confidence_result_recording"
 
     stage_10_knowledge_filter:
-      question: "What algorithmic boundary and eligibility signals apply to continuing or holding the proposal?"
+      canonical_name: "STAGE 10: KNOWLEDGE FILTER"
+      question: "What 4-gate algorithmic boundary signals, conflict-to-NEEDS_REVIEW downgrades, and latent evolution tags apply?"
       sub_stages:
         - "filter_input_assessment"
         - "boundary_and_eligibility_signal_evaluation"
@@ -1824,6 +1988,7 @@ pipeline:
         - "filter_reason_recording"
 
     stage_11_llm_synthesis:
+      canonical_name: "STAGE 11: LLM SYNTHESIS"
       question: "How are the evidence, analyses, and uncertainties synthesized into a structured candidate draft by the local/cloud LLM?"
       sub_stages:
         - "bounded_context_preparation"
@@ -1832,7 +1997,8 @@ pipeline:
         - "structured_output_validation"
         - "synthesis_result_recording"
 
-    stages_12_and_13_unified_human_review_and_explicit_approval:
+    stage_12_unified_human_review_and_explicit_approval:
+      canonical_name: "STAGE 12 [MERGED 12 & 13]: UNIFIED HUMAN REVIEW & EXPLICIT APPROVAL"
       question: "What is the human inspecting across all proposal outcomes, and to what exact proposal_hash is execution permission granted?"
       sub_stages:
         - "candidate_and_exact_proposal_presentation"
@@ -1843,7 +2009,8 @@ pipeline:
         - "approval_to_proposal_binding"
         - "human_decision_and_approval_state_recording"
 
-    stage_14_revalidation:
+    stage_13_revalidation:
+      canonical_name: "STAGE 13 [FORMERLY 14]: REVALIDATION"
       question: "Are proposal identity, content/hash, single-target non-duplication, destination safety, provenance, approval binding, and state still valid right before execution?"
       sub_stages:
         - "proposal_identity_validation"
@@ -1854,7 +2021,8 @@ pipeline:
         - "approval_binding_validation"
         - "current_state_and_eligibility_validation"
 
-    stage_15_controlled_execution:
+    stage_14_controlled_execution:
+      canonical_name: "STAGE 14 [FORMERLY 15]: CONTROLLED EXECUTION"
       question: "Is the approved and revalidated CREATE action written once into the isolated Staging boundary and verified?"
       sub_stages:
         - "execution_eligibility_check"
@@ -1863,7 +2031,8 @@ pipeline:
         - "result_verification"
         - "execution_receipt_recording"
 
-    stage_16_audit:
+    stage_15_audit:
+      canonical_name: "STAGE 15 [FORMERLY 16]: AUDIT"
       question: "How is every step of the reasoning chain continuously streamed to live Current Audit and durably recorded in Audit?"
       sub_stages:
         - "input_and_provenance_recording"
@@ -1876,7 +2045,8 @@ pipeline:
         - "execution_result_recording"
         - "error_or_failure_recording"
 
-    stage_17_output:
+    stage_16_output:
+      canonical_name: "STAGE 16 [FORMERLY 17]: OUTPUT"
       question: "What is the final assembled status, artifact reference, audit reference, or actionable recovery explanation presented to the user?"
       sub_stages:
         - "final_status_assembly"

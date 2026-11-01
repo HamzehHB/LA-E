@@ -365,14 +365,21 @@ Notes:
 
 * `--max-files` defaults to `1` and bounds source, corpus, and Core files
   alike; each additional file is an explicit operator decision.
-* Every extracted knowledge unit is governed independently through the
-  unified **Human Review & Explicit Approval** boundary: the complete
-  proposal, evidence, and uncertainties are displayed for all actions
-  (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), followed by explicit human
-  acknowledgment (for non-CREATE) or explicit approval / hash-rebinding
+* Every extracted knowledge unit is evaluated through the 3-layer
+  multiplicative confidence formula ($C_{\text{final}} = E_{\text{base}} \times P_{\text{conflict}} \times D_{\text{uncert}} \in [0.00, 1.00]$)
+  and the 4-Gate Algorithmic Knowledge Filter (which routes any substantive
+  conflict with the active `Core` note or existing candidate notes safely to
+  `NEEDS_REVIEW` with latent evolution tags `LATENT_CONFLICT_CORE`,
+  `LATENT_CONFLICT_CANDIDATE` / `CONTRADICTION`, `LATENT_UPDATE`, or
+  `LATENT_MERGE`), and is then governed independently through the unified
+  **`STAGE 12 [MERGED 12 & 13]: HUMAN REVIEW & EXPLICIT APPROVAL`** boundary:
+  the complete proposal, evidence, and uncertainties are displayed for all
+  actions (`CREATE`, `NEEDS_REVIEW`, `DO_NOT_IMPORT`), followed by explicit
+  human acknowledgment (for non-CREATE) or explicit approval / hash-rebinding
   proposal edit ($H_0 \to H_1$) (default No for `CREATE`), fresh 7-check
-  revalidation (including single-target / no-duplicate output verification),
-  controlled execution, continuous audit record, and final output assembly.
+  revalidation (`STAGE 13`, including single-target / no-duplicate output
+  verification), controlled execution (`STAGE 14`), continuous audit record
+  (`STAGE 15`), and final output assembly (`STAGE 16`).
 * `--embed` uses the configured local embedding model
   (`Config/models.yaml` + `Config/paths.local.yaml`) and an isolated
   LanceDB vector database. `--vector-db` is required with `--embed`, must
@@ -474,7 +481,7 @@ Transport surface (JSON + SSE, token header on every non-health route):
 - `GET /api/health`: Discovery and instance check.
 - `GET /api/state`: Snapshot configuration, folder validity, active models, Knowledge Language settings (`app`, `staging`, `audit`), and paused runs.
 - `GET /api/journals`: 1:1 paired recent audits and staging records (including `passed/`, `failed/`, `errors/audit.jsonl`, and emergency recovery journals `errors/audit_emergency.jsonl`, with quarantine reporting for unreconciled staging artifacts).
-- `GET /api/events`: SSE stream for live DeepThink-style `Current Audit` analytical traces and sanitized operational run events across the 17-step (16 unified-stage) workflow—including the 5 `Input` validation/provenance checks, the 8 discrete `Ingestion` sub-stages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `metadata_extraction`, `chunking`, `extraction`), the discrete `Retrieval` operations (`query_preparation`, strategy/method validation, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording` across `started`, `completed`, and `failed` phases), multi-factor mathematical confidence scores (`0.00`–`1.00`), and synchronized wait/resume during unified `Human Review & Explicit Approval`.
+- `GET /api/events`: SSE stream for live DeepThink-style `Current Audit` analytical traces (`Continuous Cognitive Audit Hook`) and sanitized operational run events across the 16 unified stages (`STAGE 1: INPUT` to `STAGE 16: OUTPUT`)—including the 5 `Input` validation/provenance checks ($\ge 50$-letter threshold `DEFAULT_MIN_LETTERS = 50`), the 8 discrete `Ingestion` sub-stages (`reader_selection`, `reading`, `cleaning`, `normalization`, `parsing`, `metadata_extraction`, `chunking`, `extraction`), the discrete `Retrieval` operations (`query_preparation`, strategy/method health check, `candidate_retrieval`, `relevance_assessment`, `candidate_identification`, `retrieval_evidence_recording` across `started`, `completed`, and `failed` phases), 3-layer multiplicative confidence scores ($C_{\text{final}} = E_{\text{base}} \times P_{\text{conflict}} \times D_{\text{uncert}} \in [0.00, 1.00]$), 4-Gate Knowledge Filter signals, and synchronized wait/resume during `STAGE 12: HUMAN REVIEW & EXPLICIT APPROVAL`.
 - `GET /api/vault/sync/status`: Inspect current Vault vector index authorization and freshness state (`unauthorized`, `fresh`, `stale`, `revoked`).
 - `POST /api/config`: Persist paths, LLM settings, and per-domain localization (`app`, `staging`, `audit`) to `Config/*.local.yaml`.
 - `POST /api/folders/pick`: Open native OS folder dialog server-side with guard validation.
@@ -484,7 +491,7 @@ Transport surface (JSON + SSE, token header on every non-health route):
 - `POST /api/vault/sync/reconcile`: Perform 3-way Vault reconciliation (indexing added notes, replacing modified note embeddings, and deleting removed note embeddings in the dedicated store).
 - `POST /api/vault/sync/decide`: Record explicit human operator approval or rejection when pre-retrieval Vault changes are detected (`sync_approval_required`).
 - `POST /api/vault/sync/revoke`: Revoke authorization for Vault indexing.
-- `POST /api/run`: Submit interactive chat input (`chat_input` text in current scope, with extensible foundation for future file/media formats) for processing through the full 17-step (16 unified-stage) backend pipeline (`Input` → `Ingestion` → `Retrieval` → `Comparison` → `Relation Analysis` → `Core Analysis` → `Classification` → `Proposal Type` → `Confidence` → `Knowledge Filter` → `LLM Synthesis` → `Unified Human Review & Explicit Approval` → `Revalidation` → `Controlled Execution` → `Audit` → `Output`).
+- `POST /api/run`: Submit interactive chat input (`chat_input` text $\ge 50$ letters in current scope, with extensible foundation for future file/media formats) for processing through the full 16-stage unified backend pipeline (`STAGE 1: INPUT` → `STAGE 2: INGESTION` → `STAGE 3: RETRIEVAL` → `STAGE 4: COMPARISON` → `STAGE 5: RELATION ANALYSIS` → `STAGE 6: CORE ANALYSIS` → `STAGE 7: CLASSIFICATION` → `STAGE 8: PROPOSAL TYPE` → `STAGE 9: CONFIDENCE` → `STAGE 10: KNOWLEDGE FILTER` → `STAGE 11: LLM SYNTHESIS` → `STAGE 12: HUMAN REVIEW & EXPLICIT APPROVAL` → `STAGE 13: REVALIDATION` → `STAGE 14: CONTROLLED EXECUTION` → `STAGE 15: AUDIT` → `STAGE 16: OUTPUT`).
 - `POST /api/cancel`: Request cooperative cancellation of an active in-flight run at the next safe boundary.
 - `POST /api/approve`: Submit explicit human approval or rejection for `CREATE` proposals bound to `proposal_hash` and `query_unit_id`.
 - `POST /api/proposal/edit`: Server-side authoritative edit of pending `CREATE` proposal with SHA-256 hash recomputation ($H_0 \to H_1$, superseding prior hash without file corruption).

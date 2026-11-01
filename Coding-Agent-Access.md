@@ -155,6 +155,7 @@ This applies even when the motivation is troubleshooting, verification, or worki
 
 > Coding-agent capability is not permission to access production data.  
 > Minimum necessary access. Explicit scoped approval. Never the whole tree by default.
+
 ---
 
 ## 12. Operating Modes: Example Fixtures vs. Personal Vault Data
