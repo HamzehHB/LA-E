@@ -51,7 +51,8 @@ def resolve_production_vector_db(config=None) -> str:
 
 def check_vector_store_eligible(db_path, production_vector_db="",
                                vault_root="", audit_root="",
-                               staging_root="") -> tuple:
+                               staging_root="",
+                               allow_test_output: bool = False) -> tuple:
     """Return ``(eligible, reason, check)`` for one vector store candidate.
 
     The candidate must be explicitly supplied, outside the repository,
@@ -72,8 +73,18 @@ def check_vector_store_eligible(db_path, production_vector_db="",
             return (False, "vector store is a symlink", "vector_db")
         if not candidate.is_dir():
             return (False, "vector store is not a directory", "vector_db")
-    if PathBoundary(str(REPOSITORY_ROOT)).is_allowed(db_path):
-        return (False, "vector store inside repository workspace", "vector_db")
+    test_output_root = (REPOSITORY_ROOT / "tests" / "output").resolve()
+    candidate_resolved = candidate.expanduser().resolve()
+    is_inside_repo = PathBoundary(str(REPOSITORY_ROOT)).is_allowed(db_path)
+    is_strict_descendant = (
+        test_output_root in candidate_resolved.parents
+        and candidate_resolved != test_output_root
+    )
+    from .guard import is_test_mode_authorized
+    is_test_auth = bool(allow_test_output) and is_test_mode_authorized(allow_test_output)
+    if is_inside_repo:
+        if not (is_test_auth and is_strict_descendant):
+            return (False, "vector store inside repository workspace", "vector_db")
     production = (
         production_vector_db.strip()
         if isinstance(production_vector_db, str) else ""

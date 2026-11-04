@@ -171,6 +171,7 @@ def test_downstream_execution_trace_order():
     )
 
     result = pipe.run_unit(unit, corpus=[], core_units=[])
+    assert result is not None
     assert result.query_unit.id == "ku-downstream-test"
 
     expected_downstream = [

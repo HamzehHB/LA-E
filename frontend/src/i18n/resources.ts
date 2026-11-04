@@ -6,7 +6,7 @@ import type { AppLanguage } from "../contracts/ui";
  * Backend resource files are untouched in this foundation; these tables mirror their
  * discipline: identical keys in en/fa, {placeholders}, no secrets.
  */
-const en = {
+export const en = {
   "ui.appName": "LA-E",
   "ui.welcome.title": "Welcome to LA-E",
   "ui.welcome.intro": "A secure, private, researcher-controlled environment for advancing research.",
@@ -162,6 +162,8 @@ const en = {
   "ui.state.unavailable": "Unavailable",
   "ui.state.pending": "Validation pending",
   "ui.stage.completed": "Completed",
+  "ui.stage.logged": "Logged",
+  "ui.stage.failed": "Failed",
   "ui.stage.current": "Current",
   "ui.stage.pending": "Pending",
   "ui.stage.stopped": "Stopped",
@@ -230,11 +232,121 @@ const en = {
   "ui.ingestion.parsingCompleted": "Parsing completed: note structure identified",
   "ui.ingestion.metadataCompleted": "Metadata extraction completed",
   "ui.ingestion.extractionCompleted": "Extraction completed: {count} knowledge units extracted",
+  // Translation action & badges
+  "ui.translate.translating": "Translating…",
+  "ui.status.unverifiable": "unverifiable",
+  "ui.status.stale": "stale",
+  "ui.status.current": "current",
+  "ui.status.onDemand": "on-demand",
+  "ui.status.staged": "Staged",
+  "ui.status.unavailable": "Unavailable",
+
+  // Vault Sync & Recovery
+  "ui.vaultSync.modalAria": "Vault Synchronization Approval",
+  "ui.recovery.correctInputHeading": "Correct input or parameters to resume:",
+  "ui.recovery.correctInputPlaceholder": "Enter corrected query or instructions…",
+  "ui.recovery.fixResume": "Fix & Resume",
+  "ui.recovery.stopRun": "Stop Run",
+
+  // Review & Proposal
+  "ui.review.proposalReviewAria": "Proposal Review",
+  "ui.review.execBanner": "Explicit human approval authorizes proceeding to Revalidation and Controlled Execution. A staged markdown note will be generated upon approval.",
+  "ui.review.nonExecBanner": "This proposal is non-executable and cannot be staged or imported into authoritative knowledge. Acknowledgment records your review in the durable audit log; no execution will occur.",
+  "ui.review.proposedTitle": "Proposed Knowledge Note",
+  "ui.review.targetDestination": "Target Destination:",
+  "ui.review.analyticalJustification": "Analytical Justification:",
+  "ui.review.provenance": "Provenance:",
+  "ui.review.evidenceAnchors": "Evidence Anchors:",
+  "ui.review.uncertainties": "Uncertainties / Limitations:",
+  "ui.review.humanReviewAria": "human review",
+  "ui.review.submitting": "Submitting…",
+  "ui.review.submittingAck": "Submitting Acknowledgment…",
+  "ui.review.submittingDecision": "Submitting decision to backend…",
+  "ui.review.readGeneratedNote": "Read Generated Note ↗",
+  "ui.review.flaggedHint": "This proposal is flagged as {action}. Human acknowledgment is required to complete the review.",
+  "ui.review.editProposal": "Edit Proposal",
+  "ui.review.cancelEdit": "Cancel Edit",
+  "ui.common.close": "Close",
+
+  // Journals & Tables
+  "ui.journals.recentAuditsSummary": "Summary Of Recent Audits",
+  "ui.journals.synchronized": "⟳ 5s synchronized",
+  "ui.journals.recentStagingSummary": "Summary Of Recent Staging",
+  "ui.journals.allHistoricalRecords": "All Historical Audits & Staging Records",
+  "ui.journals.auditsTrail": "Audits Trail (Passed & Failed)",
+  "ui.table.timestamp": "Timestamp",
+  "ui.table.digest": "ID / Digest",
+  "ui.table.outcome": "Outcome",
+  "ui.table.reference": "Reference",
+  "ui.journals.noAudits": "No audit records logged yet.",
+  "ui.journals.stagingArtifacts": "Staging Artifacts",
+  "ui.table.titleRef": "Title / Reference",
+  "ui.table.status": "Status",
+  "ui.journals.noStaging": "No staging records available yet.",
+
+  // TopNav Hints & Modals
+  "ui.nav.vaultClickHint": "Click to select or change Vault folder",
+  "ui.nav.vaultIndexSync": "Vault Index Sync",
+  "ui.nav.syncStatusLabel": "Status:",
+  "ui.nav.embeddingModel": "Embedding Model",
+  "ui.nav.llm": "LLM",
+  "ui.nav.auditLanguage": "Audit Language",
+  "ui.nav.stagingLanguage": "Staging Language",
+  "ui.modal.vaultIndexTitle": "Initial Vault Vector Indexing",
+  "ui.modal.vaultIndexDesc": "For a more personalized experience with your data, an initial vector index is needed. Would you like to create the first one?",
+  "ui.modal.vaultLocation": "Vault Location:",
+  "ui.modal.selectVault": "Select Vault",
+  "ui.modal.databaseLocation": "Database Location:",
+  "ui.modal.selectFolder": "Select Folder",
+  "ui.modal.embeddingModelLabel": "Embedding Model (BGE-M3):",
+  "ui.modal.chooseModel": "Choose Model",
+  "ui.modal.createIndex": "Create Initial Index",
+  "ui.modal.downloadBge": "Download BGE-M3 ↗",
+  "ui.modal.notNow": "Not now",
+  "ui.modal.stagingTitle": "Staging Destination",
+  "ui.modal.stagingDesc": "Selecting a Staging folder provides a safe, isolated, and controlled destination for approved note outputs before they ever touch your authoritative vault.",
+  "ui.modal.selectStagingFolder": "Select Staging Folder",
+  "ui.modal.cancel": "Cancel",
+  "ui.modal.auditTitle": "Audit Trail Destination",
+  "ui.modal.auditDesc": "Audits store append-only, tamper-evident traceability records. Configuring an Audit folder ensures passed, failed, and errors subdirectories are created and kept strictly disjoint from your knowledge vault.",
+  "ui.modal.selectAuditFolder": "Select Audit Folder",
+  "ui.modal.vectorDbTitle": "Vector Database Engine",
+  "ui.modal.vectorDbDesc": "This feature requires a local vector database engine. LanceDB is the recommended isolated engine for high-efficiency semantic retrieval.",
+  "ui.modal.configureLanceDb": "Configure LanceDB Folder",
+  "ui.modal.changeFolder": "Change Folder",
+  "ui.modal.close": "Close",
+
+  // Workflow Retrieval Substeps
+  "ui.substep.query_preparation": "Query Preparation",
+  "ui.substep.candidate_retrieval": "Candidate Retrieval",
+  "ui.substep.relevance_assessment": "Relevance Assessment",
+  "ui.substep.candidate_identification": "Candidate Identification",
+  "ui.substep.retrieval_evidence_recording": "Retrieval Evidence Recording",
+  "ui.substep.running": "running",
+  "ui.substep.completed": "completed",
+  "ui.substep.failed": "failed",
+  "ui.substep.cancelled": "cancelled",
+  "ui.substep.stopped": "stopped",
+  "ui.workflow.substepsAria": "Retrieval Substeps",
+  "ui.modal.runningInitialIndex": "Running initial vector indexing…",
+  "ui.modal.initialIndexComplete": "Initial index complete!",
+  "ui.modal.indexingFailed": "Indexing failed. Verify Database and Embedding model settings.",
+  "ui.nav.indexedCounts": "({notes} notes, {vectors} vectors)",
+  "ui.nav.downloadBgeHuggingFace": "Download BGE-M3 on Hugging Face ↗",
+  "ui.nav.downloadGgufModels": "Download GGUF Models ↗",
+  "ui.review.defaultNoteTitle": "Generated Note",
+  "ui.status.emergencyJournal": "Emergency Journal",
+  "ui.journals.continuousAuditNarrative": "Continuous Audit Narrative",
+  "ui.status.emergency": "Emergency",
+  "ui.status.active": "Active",
+  "ui.journals.defaultStagingTitle": "Staged Artifact",
+  "ui.journals.stagingReadyExcerpt": "Staging file generated and ready for human review.",
+  "ui.journals.stagingUnavailableExcerpt": "Unavailable — no staged note produced.",
 } as const;
 
 export type UiKey = keyof typeof en;
 
-const fa: Record<UiKey, string> = {
+export const fa: Record<UiKey, string> = {
   "ui.appName": "LA-E",
   "ui.welcome.title": "به LA-E خوش آمدید",
   "ui.welcome.intro": "محیطی امن، خصوصی و کاملاً تحت کنترل پژوهشگر برای توسعه و پیشبرد پژوهش.",
@@ -391,6 +503,8 @@ const fa: Record<UiKey, string> = {
   "ui.state.unavailable": "در دسترس نیست",
   "ui.state.pending": "در انتظار اعتبارسنجی",
   "ui.stage.completed": "تکمیل‌شده",
+  "ui.stage.logged": "ثبت‌شده",
+  "ui.stage.failed": "ناموفق",
   "ui.stage.current": "جاری",
   "ui.stage.pending": "در انتظار",
   "ui.stage.stopped": "متوقف‌شده",
@@ -459,10 +573,131 @@ const fa: Record<UiKey, string> = {
   "ui.ingestion.parsingCompleted": "تجزیه ساختاری تکمیل شد: ساختار یادداشت شناسایی گردید",
   "ui.ingestion.metadataCompleted": "استخراج فرا‌داده تکمیل شد",
   "ui.ingestion.extractionCompleted": "استخراج تکمیل شد: {count} واحد دانشی استخراج گردید",
+  // Translation action & badges
+  "ui.translate.translating": "در حال ترجمه…",
+  "ui.status.unverifiable": "غیرقابل راستی‌آزمایی",
+  "ui.status.stale": "نامعتبر / قدیمی",
+  "ui.status.current": "به‌روز",
+  "ui.status.onDemand": "درخواستی",
+  "ui.status.staged": "آماده‌شده (استیج)",
+  "ui.status.unavailable": "ناموجود",
+
+  // Vault Sync & Recovery
+  "ui.vaultSync.modalAria": "تأیید همگام‌سازی مخزن",
+  "ui.recovery.correctInputHeading": "ورودی یا پارامترها را برای ادامه اصلاح کنید:",
+  "ui.recovery.correctInputPlaceholder": "پرس‌وجو یا دستورالعمل اصلاح‌شده را وارد کنید…",
+  "ui.recovery.fixResume": "اصلاح و ادامه",
+  "ui.recovery.stopRun": "توقف اجرا",
+
+  // Review & Proposal
+  "ui.review.proposalReviewAria": "بررسی پیشنهاد",
+  "ui.review.execBanner": "تأیید صریح انسانی اجازه ورود به بازاعتبارسنجی و اجرای کنترل‌شده را صادر می‌کند. با تأیید، یک یادداشت مارک‌داون استیج ایجاد خواهد شد.",
+  "ui.review.nonExecBanner": "این پیشنهاد غیرقابل اجراست و امکان استیجینگ یا ورود به مخزن دانش معتبر را ندارد. تأیید شما صرفاً ثبت بازبینی در گزارش حسابرسی پایدار است؛ هیچ اجرایی رخ نخواهد داد.",
+  "ui.review.proposedTitle": "یادداشت دانشی پیشنهادی",
+  "ui.review.targetDestination": "مقصد هدف:",
+  "ui.review.analyticalJustification": "توجیه تحلیلی:",
+  "ui.review.provenance": "منشأ و پیشینه:",
+  "ui.review.evidenceAnchors": "شواهد و ارجاعات مستند:",
+  "ui.review.uncertainties": "عدم قطعیت‌ها و محدودیت‌ها:",
+  "ui.review.humanReviewAria": "بازبینی انسانی",
+  "ui.review.submitting": "در حال ارسال…",
+  "ui.review.submittingAck": "در حال ثبت تأیید دریافت…",
+  "ui.review.submittingDecision": "در حال ارسال تصمیم به سرور…",
+  "ui.review.readGeneratedNote": "مشاهده یادداشت ایجادشده ↗",
+  "ui.review.flaggedHint": "این پیشنهاد با عنوان {action} علامت‌گذاری شده است. تأیید دریافت انسانی برای تکمیل بازبینی الزامی است.",
+  "ui.review.editProposal": "ویرایش پیشنهاد",
+  "ui.review.cancelEdit": "انصراف از ویرایش",
+  "ui.common.close": "بستن",
+
+  // Journals & Tables
+  "ui.journals.recentAuditsSummary": "خلاصه حسابرسی‌های اخیر",
+  "ui.journals.synchronized": "⟳ همگام‌سازی ۵ ثانیه‌ای",
+  "ui.journals.recentStagingSummary": "خلاصه فایل‌های موقت اخیر",
+  "ui.journals.allHistoricalRecords": "تمام سوابق تاریخی حسابرسی و استیجینگ",
+  "ui.journals.auditsTrail": "ردپای حسابرسی‌ها (موفق و ناموفق)",
+  "ui.table.timestamp": "زمان ثبت",
+  "ui.table.digest": "شناسه / خلاصه رمزی",
+  "ui.table.outcome": "نتیجه",
+  "ui.table.reference": "مرجع",
+  "ui.journals.noAudits": "هنوز سابقه حسابرسی ثبت نشده است.",
+  "ui.journals.stagingArtifacts": "خروجی‌های آماده‌سازی (استیجینگ)",
+  "ui.table.titleRef": "عنوان / مرجع",
+  "ui.table.status": "وضعیت",
+  "ui.journals.noStaging": "هنوز رکورد استیجینگی ثبت نشده است.",
+
+  // TopNav Hints & Modals
+  "ui.nav.vaultClickHint": "برای انتخاب یا تغییر پوشه مخزن کلیک کنید",
+  "ui.nav.vaultIndexSync": "همگام‌سازی نمایه‌سازی مخزن",
+  "ui.nav.syncStatusLabel": "وضعیت:",
+  "ui.nav.embeddingModel": "مدل تعبیه‌ساز (Embedding)",
+  "ui.nav.llm": "مدل زبانی بزرگ (LLM)",
+  "ui.nav.auditLanguage": "زبان حسابرسی",
+  "ui.nav.stagingLanguage": "زبان استیجینگ",
+  "ui.modal.vaultIndexTitle": "نمایه‌سازی برداری اولیه مخزن",
+  "ui.modal.vaultIndexDesc": "برای تجربه اختصاصی‌تر با داده‌های شما، نمایه‌سازی برداری اولیه لازم است. مایلید نخستین نمایه ایجاد شود؟",
+  "ui.modal.vaultLocation": "موقعیت مخزن:",
+  "ui.modal.selectVault": "انتخاب مخزن",
+  "ui.modal.databaseLocation": "موقعیت پایگاه داده:",
+  "ui.modal.selectFolder": "انتخاب پوشه",
+  "ui.modal.embeddingModelLabel": "مدل تعبیه‌ساز (BGE-M3):",
+  "ui.modal.chooseModel": "انتخاب مدل",
+  "ui.modal.createIndex": "ایجاد نمایه اولیه",
+  "ui.modal.downloadBge": "دانلود BGE-M3 ↗",
+  "ui.modal.notNow": "اکنون نه",
+  "ui.modal.stagingTitle": "مقصد آماده‌سازی (Staging)",
+  "ui.modal.stagingDesc": "انتخاب پوشه استیجینگ مقصدی امن، ایزوله و کنترل‌شده را برای خروجی‌های تأییدشده پیش از ورود به مخزن اصلی فراهم می‌کند.",
+  "ui.modal.selectStagingFolder": "انتخاب پوشه استیجینگ",
+  "ui.modal.cancel": "انصراف",
+  "ui.modal.auditTitle": "مقصد ثبت حسابرسی",
+  "ui.modal.auditDesc": "حسابرسی سوابق تغییرناپذیر و ردیابی را ذخیره می‌کند. پیکربندی این پوشه اطمینان می‌دهد که زیرپوشه‌های passed، failed و errors ایجاد شده و کاملاً مجزا از مخزن دانش حفظ می‌شوند.",
+  "ui.modal.selectAuditFolder": "انتخاب پوشه حسابرسی",
+  "ui.modal.vectorDbTitle": "موتور پایگاه داده برداری",
+  "ui.modal.vectorDbDesc": "این قابلیت نیازمند موتور پایگاه داده برداری محلی است. LanceDB موتور پیشنهادی و ایزوله برای بازیابی معنایی با کارایی بالاست.",
+  "ui.modal.configureLanceDb": "پیکربندی پوشه LanceDB",
+  "ui.modal.changeFolder": "تغییر پوشه",
+  "ui.modal.close": "بستن",
+
+  // Workflow Retrieval Substeps
+  "ui.substep.query_preparation": "آماده‌سازی پرس‌وجو",
+  "ui.substep.candidate_retrieval": "بازیابی کاندیداها",
+  "ui.substep.relevance_assessment": "ارزیابی ارتباط",
+  "ui.substep.candidate_identification": "شناسایی کاندیداها",
+  "ui.substep.retrieval_evidence_recording": "ثبت شواهد بازیابی",
+  "ui.substep.running": "در حال اجرا",
+  "ui.substep.completed": "تکمیل شده",
+  "ui.substep.failed": "ناموفق",
+  "ui.substep.cancelled": "لغو شده",
+  "ui.substep.stopped": "متوقف شده",
+  "ui.workflow.substepsAria": "زیرمراحل بازیابی",
+  "ui.modal.runningInitialIndex": "در حال اجرای نمایه‌سازی برداری اولیه…",
+  "ui.modal.initialIndexComplete": "نمایه‌سازی اولیه تکمیل شد!",
+  "ui.modal.indexingFailed": "نمایه‌سازی ناموفق بود. تنظیمات پایگاه داده و مدل تعبیه را بررسی کنید.",
+  "ui.nav.indexedCounts": "({notes} یادداشت، {vectors} بردار)",
+  "ui.nav.downloadBgeHuggingFace": "دریافت BGE-M3 از هاگینگ‌فیس ↗",
+  "ui.nav.downloadGgufModels": "دریافت مدل‌های GGUF ↗",
+  "ui.review.defaultNoteTitle": "یادداشت تولید شده",
+  "ui.status.emergencyJournal": "دفتر وقایع اضطراری",
+  "ui.journals.continuousAuditNarrative": "گزارش حسابرسی پیوسته",
+  "ui.status.emergency": "اضطراری",
+  "ui.status.active": "فعال",
+  "ui.journals.defaultStagingTitle": "مصنوع مرحله‌بندی شده",
+  "ui.journals.stagingReadyExcerpt": "فایل مرحله‌بندی تولید شد و برای بازبینی انسانی آماده است.",
+  "ui.journals.stagingUnavailableExcerpt": "در دسترس نیست — هیچ یادداشت مرحله‌بندی‌شده‌ای تولید نشد.",
 };
 
-export function translate(lang: AppLanguage, key: UiKey): string {
-  return lang === "fa" ? fa[key] : en[key];
+export function translate(
+  lang: AppLanguage,
+  key: UiKey,
+  params?: Record<string, string | number>
+): string {
+  const dict = lang === "fa" ? fa : en;
+  let text = dict[key] ?? en[key] ?? key;
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      text = text.replace(new RegExp(`\\{${k}\\}`, "g"), String(v));
+    }
+  }
+  return text;
 }
 
 export const UI_KEYS_EN = Object.keys(en);

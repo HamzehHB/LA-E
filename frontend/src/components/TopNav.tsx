@@ -54,7 +54,7 @@ export function TopNav() {
     liveRevealFolder,
   } = useStore();
 
-  const t = (k: Parameters<typeof translate>[1]) => translate(state.appLanguage, k);
+  const t = (k: Parameters<typeof translate>[1], params?: Record<string, string | number>) => translate(state.appLanguage, k, params);
   const [open, setOpen] = useState<string | null>(null);
   const toggle = (k: string) => setOpen((v) => (v === k ? null : k));
   const [syncStatus, setSyncStatus] = useState<VaultSyncStatusResponse | null>(null);
@@ -107,17 +107,14 @@ export function TopNav() {
   // Vault / Test Mode Click Handler
   const handleSourceTabClick = () => {
     if (state.sourceMode === "test") {
-      // Transition from Test -> Vault
-      setSourceMode("vault");
-      const hasSeenVault = localStorage.getItem("lae-first-vault");
-      if (!hasSeenVault) {
-        localStorage.setItem("lae-first-vault", "1");
-        setVaultModalOpen(true);
-      } else if (!vaultValid && liveAvailable) {
+      if (vaultValid) {
+        setSourceMode("vault");
+      } else if (liveAvailable) {
         void pickLiveFolder("vault");
+      } else {
+        setSourceMode("vault");
       }
     } else {
-      // Transition from Vault -> Test
       setSourceMode("test");
     }
   };
@@ -160,10 +157,10 @@ export function TopNav() {
   };
 
   const runInitialIndex = async () => {
-    setIndexingMsg("Running initial vector indexing…");
+    setIndexingMsg(t("ui.modal.runningInitialIndex"));
     const res = await liveAuthorizeVaultSync();
     if (res.indexed) {
-      setIndexingMsg("Initial index complete!");
+      setIndexingMsg(t("ui.modal.initialIndexComplete"));
       if (liveAvailable) {
         void liveGetVaultSyncStatus().then(setSyncStatus);
       }
@@ -172,7 +169,7 @@ export function TopNav() {
         setIndexingMsg("");
       }, 1500);
     } else {
-      setIndexingMsg(res.reason || "Indexing failed. Verify Database and Embedding model settings.");
+      setIndexingMsg(res.reason || t("ui.modal.indexingFailed"));
     }
   };
 
@@ -290,7 +287,14 @@ export function TopNav() {
         >
           <span className="tab-label">{state.sourceMode === "test" ? t("ui.nav.sourceTest") : t("ui.nav.sourceVault")}</span>
           {state.sourceMode === "vault" && (
-            <span className={`badge ${validityClass(state.resources.vault.validity)}`}>
+            <span
+              className={`badge ${validityClass(state.resources.vault.validity)}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (liveAvailable) void pickLiveFolder("vault");
+              }}
+              title={t("ui.nav.vaultClickHint")}
+            >
               {state.resources.vault.display || t(validityKey(state.resources.vault.validity) as Parameters<typeof translate>[1])}
             </span>
           )}
@@ -340,11 +344,11 @@ export function TopNav() {
                 </span>
               </button>
               <hr />
-              <span className="dropdown-title">Vault Index Sync</span>
+              <span className="dropdown-title">{t("ui.nav.vaultIndexSync")}</span>
               {syncStatus && (
                 <div style={{ padding: "0.25rem 0.5rem", fontSize: "0.85em" }}>
-                  <span>Status: <strong>{syncStatus.status}</strong></span>
-                  {syncStatus.indexed_notes > 0 && <span> ({syncStatus.indexed_notes} notes, {syncStatus.indexed_vectors} vectors)</span>}
+                  <span>{t("ui.nav.syncStatusLabel")} <strong>{syncStatus.status}</strong></span>
+                  {syncStatus.indexed_notes > 0 && <span> {t("ui.nav.indexedCounts", { notes: syncStatus.indexed_notes, vectors: syncStatus.indexed_vectors })}</span>}
                 </div>
               )}
               <div style={{ display: "flex", gap: "0.5rem", padding: "0.25rem 0.5rem" }}>
@@ -433,7 +437,7 @@ export function TopNav() {
           </button>
           {open === "ai" && (
             <div role="menu" className="dropdown">
-              <span className="dropdown-title">Embedding Model</span>
+              <span className="dropdown-title">{t("ui.nav.embeddingModel")}</span>
               <button type="button" role="menuitem" onClick={() => { if (liveAvailable) void pickLiveFolder("embedding_model"); }}>
                 BGE-M3 ·{" "}
                 <span className={`badge ${validityClass(state.resources.embedding_model.validity)}`}>
@@ -446,10 +450,10 @@ export function TopNav() {
                 rel="noreferrer"
                 className="dropdown-link"
               >
-                Download BGE-M3 on Hugging Face ↗
+                {t("ui.nav.downloadBgeHuggingFace")}
               </a>
               <hr />
-              <span className="dropdown-title">LLM</span>
+              <span className="dropdown-title">{t("ui.nav.llm")}</span>
               <button
                 type="button"
                 role="menuitemradio"
@@ -482,7 +486,7 @@ export function TopNav() {
                     rel="noreferrer"
                     className="dropdown-link"
                   >
-                    Download GGUF Models ↗
+                    {t("ui.nav.downloadGgufModels")}
                   </a>
                 </>
               ) : (
@@ -499,7 +503,7 @@ export function TopNav() {
           </button>
           {open === "lang" && (
             <div role="menu" className="dropdown">
-              <span className="dropdown-title">Audit Language</span>
+              <span className="dropdown-title">{t("ui.nav.auditLanguage")}</span>
               <div className="button-group">
                 <button
                   type="button"
@@ -521,7 +525,7 @@ export function TopNav() {
                 </button>
               </div>
               <hr />
-              <span className="dropdown-title">Staging Language</span>
+              <span className="dropdown-title">{t("ui.nav.stagingLanguage")}</span>
               <div className="button-group">
                 <button
                   type="button"
@@ -552,25 +556,34 @@ export function TopNav() {
       {vaultModalOpen && (
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="vault-modal-title">
           <div className="modal-card">
-            <h3 id="vault-modal-title">Initial Vault Vector Indexing</h3>
-            <p>For a more personalized experience with your data, an initial vector index is needed. Would you like to create the first one?</p>
+            <h3 id="vault-modal-title">{t("ui.modal.vaultIndexTitle")}</h3>
+            <p>{t("ui.modal.vaultIndexDesc")}</p>
             <div className="modal-checks">
               <div className="check-item">
-                <span>Database Location:</span>
-                <span className={`badge ${validityClass(state.resources.vector_db.validity)}`}>
-                  {state.resources.vector_db.display || "Not configured"}
+                <span>{t("ui.modal.vaultLocation")}</span>
+                <span className={`badge ${validityClass(state.resources.vault.validity)}`}>
+                  {state.resources.vault.display || t("ui.state.notConfigured")}
                 </span>
-                {state.resources.vector_db.validity !== "configured_valid" && (
-                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("vector_db")}>Select Folder</button>
+                {state.resources.vault.validity !== "configured_valid" && (
+                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("vault")}>{t("ui.modal.selectVault")}</button>
                 )}
               </div>
               <div className="check-item">
-                <span>Embedding Model (BGE-M3):</span>
+                <span>{t("ui.modal.databaseLocation")}</span>
+                <span className={`badge ${validityClass(state.resources.vector_db.validity)}`}>
+                  {state.resources.vector_db.display || t("ui.state.notConfigured")}
+                </span>
+                {state.resources.vector_db.validity !== "configured_valid" && (
+                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("vector_db")}>{t("ui.modal.selectFolder")}</button>
+                )}
+              </div>
+              <div className="check-item">
+                <span>{t("ui.modal.embeddingModelLabel")}</span>
                 <span className={`badge ${validityClass(state.resources.embedding_model.validity)}`}>
-                  {state.resources.embedding_model.display || "Not configured"}
+                  {state.resources.embedding_model.display || t("ui.state.notConfigured")}
                 </span>
                 {state.resources.embedding_model.validity !== "configured_valid" && (
-                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("embedding_model")}>Choose Model</button>
+                  <button type="button" className="btn small" onClick={() => void pickLiveFolder("embedding_model")}>{t("ui.modal.chooseModel")}</button>
                 )}
               </div>
             </div>
@@ -582,7 +595,7 @@ export function TopNav() {
                 disabled={!semanticReady}
                 onClick={() => void runInitialIndex()}
               >
-                Create Initial Index
+                {t("ui.modal.createIndex")}
               </button>
               <a
                 href="https://huggingface.co/BAAI/bge-m3"
@@ -590,9 +603,9 @@ export function TopNav() {
                 rel="noreferrer"
                 className="btn ghost"
               >
-                Download BGE-M3 ↗
+                {t("ui.modal.downloadBge")}
               </a>
-              <button type="button" className="btn ghost" onClick={() => setVaultModalOpen(false)}>Not now</button>
+              <button type="button" className="btn ghost" onClick={() => setVaultModalOpen(false)}>{t("ui.modal.notNow")}</button>
             </div>
           </div>
         </div>
@@ -602,8 +615,8 @@ export function TopNav() {
       {stagingModalOpen && (
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="staging-modal-title">
           <div className="modal-card">
-            <h3 id="staging-modal-title">Staging Destination</h3>
-            <p>Selecting a Staging folder provides a safe, isolated, and controlled destination for approved note outputs before they ever touch your authoritative vault.</p>
+            <h3 id="staging-modal-title">{t("ui.modal.stagingTitle")}</h3>
+            <p>{t("ui.modal.stagingDesc")}</p>
             <div className="modal-actions">
               {stagingValid && liveAvailable && (
                 <button
@@ -625,9 +638,9 @@ export function TopNav() {
                   if (liveAvailable) void pickLiveFolder("staging");
                 }}
               >
-                Select Staging Folder
+                {t("ui.modal.selectStagingFolder")}
               </button>
-              <button type="button" className="btn ghost" onClick={() => setStagingModalOpen(false)}>Cancel</button>
+              <button type="button" className="btn ghost" onClick={() => setStagingModalOpen(false)}>{t("ui.modal.cancel")}</button>
             </div>
           </div>
         </div>
@@ -637,8 +650,8 @@ export function TopNav() {
       {auditModalOpen && (
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="audit-modal-title">
           <div className="modal-card">
-            <h3 id="audit-modal-title">Audit Trail Destination</h3>
-            <p>Audits store append-only, tamper-evident traceability records. Configuring an Audit folder ensures <strong>passed</strong>, <strong>failed</strong>, and <strong>errors</strong> subdirectories are created and kept strictly disjoint from your knowledge vault.</p>
+            <h3 id="audit-modal-title">{t("ui.modal.auditTitle")}</h3>
+            <p>{t("ui.modal.auditDesc")}</p>
             <div className="modal-actions">
               {auditValid && liveAvailable && (
                 <button
@@ -660,9 +673,9 @@ export function TopNav() {
                   if (liveAvailable) void pickLiveFolder("audit");
                 }}
               >
-                Select Audit Folder
+                {t("ui.modal.selectAuditFolder")}
               </button>
-              <button type="button" className="btn ghost" onClick={() => setAuditModalOpen(false)}>Cancel</button>
+              <button type="button" className="btn ghost" onClick={() => setAuditModalOpen(false)}>{t("ui.modal.cancel")}</button>
             </div>
           </div>
         </div>
@@ -672,8 +685,8 @@ export function TopNav() {
       {dbModalOpen && (
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="db-modal-title">
           <div className="modal-card">
-            <h3 id="db-modal-title">Vector Database Engine</h3>
-            <p>This feature requires a local vector database engine. LanceDB is the recommended isolated engine for high-efficiency semantic retrieval.</p>
+            <h3 id="db-modal-title">{t("ui.modal.vectorDbTitle")}</h3>
+            <p>{t("ui.modal.vectorDbDesc")}</p>
             <div className="modal-actions">
               <button
                 type="button"
@@ -683,9 +696,9 @@ export function TopNav() {
                   if (liveAvailable) void pickLiveFolder("vector_db");
                 }}
               >
-                Configure LanceDB Folder
+                {t("ui.modal.configureLanceDb")}
               </button>
-              <button type="button" className="btn ghost" onClick={() => setDbModalOpen(false)}>Not now</button>
+              <button type="button" className="btn ghost" onClick={() => setDbModalOpen(false)}>{t("ui.modal.notNow")}</button>
             </div>
           </div>
         </div>
@@ -722,9 +735,9 @@ export function TopNav() {
                   if (liveAvailable) void pickLiveFolder(p);
                 }}
               >
-                Change Folder
+                {t("ui.modal.changeFolder")}
               </button>
-              <button type="button" className="btn ghost" onClick={() => setInspectModal(null)}>Close</button>
+              <button type="button" className="btn ghost" onClick={() => setInspectModal(null)}>{t("ui.common.close")}</button>
             </div>
           </div>
         </div>

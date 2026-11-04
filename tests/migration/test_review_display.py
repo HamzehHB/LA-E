@@ -108,6 +108,7 @@ def test_llm_synthesis_runs_and_produces_valid_candidate(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
     unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    assert unit_result is not None
     provider = _FakeProvider(_candidate())
     details: list = []
     entries: list = []
@@ -136,6 +137,7 @@ def test_interactive_review_called_only_for_create_proposals(monkeypatch, capsys
     staging = tmp_path / "staging"
     staging.mkdir()
     unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    assert unit_result is not None
     
     # First, check what proposal action was generated
     action = unit_result.proposal.action
@@ -268,6 +270,7 @@ def test_non_create_proposal_exposes_full_inspectable_information(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
     unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    assert unit_result is not None
     assert unit_result.proposal.action != "CREATE", (
         "this test must exercise a non-CREATE proposal")
     provider = _FakeProvider(_candidate())

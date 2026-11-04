@@ -433,3 +433,126 @@ class TestRetrievalCoordinator:
         res = coordinator.run(query, corpus)
         assert len(res.candidates) == 1
         assert res.strategy == "lexical"
+
+
+class TestRetrievalCancellationAndRunIdStamping:
+    def test_all_five_retrieval_capabilities_emit_ordered_events_with_run_id(self):
+        events = []
+        coordinator = RetrievalCoordinator(
+            strategy="token_overlap",
+            observer=lambda ev: events.append(ev),
+        )
+        query = _make_unit("presence and awareness", id="q-stamp")
+        corpus = [_make_unit("presence and awareness deeply", id="c-stamp")]
+        res = coordinator.run(query, corpus, run_id="run-ordered-123")
+
+        assert res.has_candidates is True
+        assert len(events) == 10
+        expected_sequence = [
+            ("query_preparation", "started"),
+            ("query_preparation", "completed"),
+            ("candidate_retrieval", "started"),
+            ("candidate_retrieval", "completed"),
+            ("relevance_assessment", "started"),
+            ("relevance_assessment", "completed"),
+            ("candidate_identification", "started"),
+            ("candidate_identification", "completed"),
+            ("retrieval_evidence_recording", "started"),
+            ("retrieval_evidence_recording", "completed"),
+        ]
+        for idx, (op, phase) in enumerate(expected_sequence):
+            ev = events[idx]
+            assert ev["stage"] == "retrieval"
+            assert ev["operation"] == op
+            assert ev["phase"] == phase
+            assert ev["run_id"] == "run-ordered-123"
+
+    def test_cancellation_before_candidate_retrieval_stops_progression(self):
+        events = []
+        coordinator = RetrievalCoordinator(
+            strategy="token_overlap",
+            observer=lambda ev: events.append(ev),
+        )
+        query = _make_unit("presence and awareness", id="q-canc-2")
+        corpus = [_make_unit("presence and awareness deeply", id="c-canc-2")]
+
+        call_count = 0
+        def cancel_check():
+            nonlocal call_count
+            call_count += 1
+            return call_count >= 2
+
+        res = coordinator.run(query, corpus, run_id="run-canc-2", should_cancel=cancel_check)
+        assert res.metadata.get("cancelled") is True
+        assert res.metadata.get("cancelled_at_substep") == "candidate_retrieval"
+        assert res.candidates == ()
+
+        ops_phases = [(e["operation"], e["phase"]) for e in events]
+        assert ops_phases == [
+            ("query_preparation", "started"),
+            ("query_preparation", "completed"),
+            ("candidate_retrieval", "cancelled"),
+        ]
+        assert all(e["run_id"] == "run-canc-2" for e in events)
+
+    def test_cancellation_before_relevance_assessment_stops_progression(self):
+        events = []
+        coordinator = RetrievalCoordinator(
+            strategy="token_overlap",
+            observer=lambda ev: events.append(ev),
+        )
+        query = _make_unit("presence and awareness", id="q-canc-3")
+        corpus = [_make_unit("presence and awareness deeply", id="c-canc-3")]
+
+        call_count = 0
+        def cancel_check():
+            nonlocal call_count
+            call_count += 1
+            return call_count >= 3
+
+        res = coordinator.run(query, corpus, run_id="run-canc-3", should_cancel=cancel_check)
+        assert res.metadata.get("cancelled") is True
+        assert res.metadata.get("cancelled_at_substep") == "relevance_assessment"
+
+        ops_phases = [(e["operation"], e["phase"]) for e in events]
+        assert ops_phases == [
+            ("query_preparation", "started"),
+            ("query_preparation", "completed"),
+            ("candidate_retrieval", "started"),
+            ("candidate_retrieval", "completed"),
+            ("relevance_assessment", "cancelled"),
+        ]
+
+    def test_token_overlap_retriever_forwards_run_id_and_cancellation(self):
+        events = []
+        retriever = TokenOverlapRetriever(observer=lambda ev: events.append(ev))
+        query = _make_unit("presence", id="q-fwd")
+        corpus = [_make_unit("presence", id="c-fwd")]
+
+        res = retriever.retrieve(query, corpus, run_id="run-fwd-999", should_cancel=lambda: True)
+        assert res.metadata.get("cancelled") is True
+        assert len(events) == 1
+        assert events[0]["operation"] == "query_preparation"
+        assert events[0]["phase"] == "cancelled"
+        assert events[0]["run_id"] == "run-fwd-999"
+
+    def test_pipeline_halts_at_cancelled_retrieval_without_downstream_stages(self):
+        from src.living_authenticity.knowledge.orchestration.orchestrator import EvidenceFirstPipeline
+        events = []
+        pipeline = EvidenceFirstPipeline(stage_observer=lambda ev: events.append(ev))
+        query = _make_unit("presence", id="q-pipe")
+        corpus = [_make_unit("presence", id="c-pipe")]
+
+        call_count = 0
+        def cancel_check():
+            nonlocal call_count
+            call_count += 1
+            return call_count >= 2
+
+        res = pipeline.run_unit(query, corpus, run_id="run-pipe-canc", should_cancel=cancel_check)
+        assert res is None
+        stages = [e.get("stage") for e in events]
+        assert all(s == "retrieval" for s in stages)
+        assert "comparison" not in stages
+        assert "relation" not in stages
+        assert "proposal" not in stages

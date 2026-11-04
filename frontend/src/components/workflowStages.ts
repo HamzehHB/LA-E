@@ -30,7 +30,7 @@ export type TimelineStageKey =
   | "audit"
   | "output";
 
-export type TimelineState = "pending" | "completed" | "current" | "stopped";
+export type TimelineState = "pending" | "completed" | "current" | "stopped" | "logged" | "failed";
 
 export interface TimelineStage {
   key: TimelineStageKey;
@@ -78,6 +78,14 @@ const STAGE_TO_TIMELINE: Record<string, TimelineStageKey> = {
   confidence: "confidence",
   knowledge_filter: "knowledge_filter",
   representation: "knowledge_filter",
+  llm_synthesis: "llm_synthesis",
+  human_review: "human_review",
+  cancellation: "human_review",
+  explicit_approval: "explicit_approval",
+  revalidation: "revalidation",
+  controlled_execution: "controlled_execution",
+  audit: "audit",
+  output: "output",
 };
 
 export const RETRIEVAL_SUBSTEPS = [
@@ -85,7 +93,7 @@ export const RETRIEVAL_SUBSTEPS = [
   { key: "candidate_retrieval", label: "Candidate Retrieval" },
   { key: "relevance_assessment", label: "Relevance Assessment" },
   { key: "candidate_identification", label: "Candidate Identification" },
-  { key: "retrieval_evidence_recording", label: "Evidence Recording" },
+  { key: "retrieval_evidence_recording", label: "Retrieval Evidence Recording" },
 ] as const;
 
 export type SubstepState = "pending" | "current" | "completed" | "failed" | "cancelled" | "stopped" | "unknown";
@@ -411,17 +419,24 @@ export function deriveRetrievalSubsteps(
  * - pending: never reached.
  */
 export function deriveWorkflow(
-  run: Pick<CurrentRunView, "run_id" | "current_stage" | "stopped" | "status">,
+  run: Pick<CurrentRunView, "run_id" | "current_stage" | "stopped" | "status"> & { audit_status?: string },
   events: RunEvent[],
 ): TimelineStage[] {
   const completed = new Set<TimelineStageKey>();
   let sawRun = false;
   let reviewRequired = false;
+  let approvalDecided = false;
   let approvalApproved = false;
   let revalidationValid: boolean | null = null;
   let executionExecuted = false;
   let terminal = false;
   let stopped = run.stopped;
+  let cancelledStage: TimelineStageKey | null = null;
+  let auditTimelineState: TimelineState | null = null;
+  let explicitAuditFailure = false;
+  let decisiveAuditEvent = false;
+  let emergencyAuditObserved = false;
+  let ambiguousAuditMetadata = false;
 
   for (const e of events) {
     switch (e.kind) {
@@ -437,6 +452,10 @@ export function deriveWorkflow(
         reviewRequired = true;
         break;
       case "approval_decided":
+        if (/cancel/i.test(e.message)) {
+          break;
+        }
+        approvalDecided = true;
         approvalApproved = /approve/i.test(e.message);
         break;
       case "revalidation_result":
@@ -445,18 +464,89 @@ export function deriveWorkflow(
       case "execution_result":
         if (/executed|success/i.test(e.message)) executionExecuted = true;
         break;
+      case "audit_persisted": {
+        if (e.durability && ["unconfirmed", "failed", "unconfigured"].includes(e.durability)) {
+          explicitAuditFailure = true;
+        }
+        const isEmergency =
+          e.audit_mode === "emergency" ||
+          e.audit_partition === "errors" ||
+          /emergency/i.test(e.message) ||
+          e.operation === "emergency";
+        const isNormal =
+          !isEmergency &&
+          (e.audit_mode === "normal" ||
+            (!e.audit_mode && /normal mode/i.test(e.message))) &&
+          (e.audit_partition === undefined ||
+            ["passed", "failed", "mixed"].includes(e.audit_partition));
+
+        // Explicit audit failure is sticky: once explicit failure occurs,
+        // subsequent audit persistence events cannot overwrite it or complete audit.
+        if (explicitAuditFailure) {
+          break;
+        }
+
+        if (isEmergency) {
+          emergencyAuditObserved = true;
+          auditTimelineState = "logged";
+          decisiveAuditEvent = true;
+          completed.delete("audit");
+        } else if (isNormal) {
+          // Normal persistence requires that no prior emergency or ambiguous evidence occurred.
+          if (!emergencyAuditObserved && !ambiguousAuditMetadata) {
+            auditTimelineState = "completed";
+            completed.add("audit");
+            decisiveAuditEvent = true;
+          }
+        } else {
+          // Missing, malformed, or ambiguous audit metadata
+          ambiguousAuditMetadata = true;
+          decisiveAuditEvent = true;
+          if (!emergencyAuditObserved) {
+            auditTimelineState = null;
+          }
+          completed.delete("audit");
+        }
+        break;
+      }
+      case "audit_failed":
+        explicitAuditFailure = true;
+        decisiveAuditEvent = true;
+        auditTimelineState = "failed";
+        completed.delete("audit");
+        break;
+      case "warning":
+        if ((e.stage === "audit" || /audit/i.test(e.message)) && /failed to persist|persistence fail/i.test(e.message)) {
+          explicitAuditFailure = true;
+          decisiveAuditEvent = true;
+          auditTimelineState = "failed";
+          completed.delete("audit");
+        }
+        break;
       case "run_completed":
       case "completed":
         terminal = true;
-        completed.add("audit");
-        if (executionExecuted) {
-          completed.add("output");
-        }
         break;
       case "run_rejected":
       case "stopped":
       case "error":
         stopped = true;
+        if (e.stage === "audit_persistence") {
+          explicitAuditFailure = true;
+          decisiveAuditEvent = true;
+          auditTimelineState = "failed";
+        }
+        if (e.stage === "cancellation" || /cancel/i.test(e.message)) {
+          if (/during approval|during review/i.test(e.message) || (reviewRequired && !approvalApproved)) {
+            cancelledStage = "human_review";
+          } else if (/before execution/i.test(e.message)) {
+            cancelledStage = "controlled_execution";
+          }
+        }
+        if (auditTimelineState !== "logged") {
+          completed.delete("audit");
+        }
+        completed.delete("output");
         break;
       default:
         break;
@@ -469,8 +559,74 @@ export function deriveWorkflow(
   if (approvalApproved) completed.add("explicit_approval");
   if (revalidationValid) completed.add("revalidation");
   if (executionExecuted) completed.add("controlled_execution");
-  if (reviewRequired) completed.add("human_review");
+  // Human review is completed only after an explicit human decision is made.
+  // When a run terminates due to cancellation, error, or failure before a decision,
+  // human review must NOT be marked completed so as not to falsely imply a decision occurred.
+  if (reviewRequired && approvalDecided && cancelledStage !== "human_review") {
+    completed.add("human_review");
+  }
   if (completed.size > 0) completed.add("input");
+
+  // Precedence 2: Authoritative run.audit_status when no decisive audit event exists.
+  // Invariant: A successful snapshot (normal_persisted) must NEVER override explicit failure evidence
+  // (audit_failed or authoritative persistence failure warnings), nor emergency or ambiguous evidence.
+  if (run.audit_status) {
+    if (run.audit_status === "persistence_failed") {
+      explicitAuditFailure = true;
+      auditTimelineState = "failed";
+      completed.delete("audit");
+    } else if (!explicitAuditFailure) {
+      if (run.audit_status === "emergency_persisted") {
+        emergencyAuditObserved = true;
+        auditTimelineState = "logged";
+        completed.delete("audit");
+      } else if (run.audit_status === "normal_persisted") {
+        if (!decisiveAuditEvent && !ambiguousAuditMetadata && !emergencyAuditObserved) {
+          auditTimelineState = "completed";
+          completed.add("audit");
+        }
+      }
+    }
+  }
+
+  // Precedence 3: Conservative terminal fallback only when neither source establishes the outcome.
+  // If the run reached a terminal state without stop, but audit persistence
+  // was never confirmed by an audit event or audit_status:
+  // - If execution executed, durable audit was mandatory, so its absence is an audit failure.
+  // - In all cases, audit must never remain 'completed' without proof.
+  // - When ambiguous audit metadata was received, do not claim persistence failed physically.
+  if (terminal && !stopped && !auditTimelineState && !completed.has("audit")) {
+    if (executionExecuted && !ambiguousAuditMetadata) {
+      auditTimelineState = "failed";
+    }
+  }
+
+  // Output stage completion:
+  // Completes when execution succeeded, run reached terminal state without stopping,
+  // and normal audit was confirmed (completed) without failure, emergency, or ambiguity.
+  if (terminal && !stopped && executionExecuted) {
+    if (
+      !explicitAuditFailure &&
+      !emergencyAuditObserved &&
+      !ambiguousAuditMetadata &&
+      (auditTimelineState === "completed" || completed.has("audit"))
+    ) {
+      if (auditTimelineState !== "failed") {
+        completed.add("output");
+      }
+    }
+  }
+
+  // If audit failed, was emergency, or was ambiguous/not confirmed, output cannot be completed
+  if (
+    auditTimelineState === "failed" ||
+    explicitAuditFailure ||
+    emergencyAuditObserved ||
+    ambiguousAuditMetadata ||
+    auditTimelineState !== "completed"
+  ) {
+    completed.delete("output");
+  }
 
   // Furthest reached index = last completed stage (in canonical order).
   let reached = -1;
@@ -481,7 +637,9 @@ export function deriveWorkflow(
   // Stop boundary index: precisely where the run halted
   let stopStageIndex = -1;
   if (stopped) {
-    if (run.current_stage && STAGE_TO_TIMELINE[run.current_stage]) {
+    if (cancelledStage) {
+      stopStageIndex = ORDER.indexOf(cancelledStage);
+    } else if (run.current_stage && STAGE_TO_TIMELINE[run.current_stage]) {
       stopStageIndex = ORDER.indexOf(STAGE_TO_TIMELINE[run.current_stage]);
     } else if (reached >= 0) {
       stopStageIndex = reached + 1;
@@ -505,7 +663,19 @@ export function deriveWorkflow(
 
   return ORDER.map((key, i) => {
     let state: TimelineState;
-    if (completed.has(key)) {
+    if (key === "audit") {
+      if (auditTimelineState) {
+        state = auditTimelineState;
+      } else if (stopped && stopStageIndex !== -1 && i > stopStageIndex) {
+        state = "pending";
+      } else if (completed.has(key)) {
+        state = "completed";
+      } else if (stopped) {
+        state = i === stopStageIndex ? "stopped" : "pending";
+      } else {
+        state = "pending";
+      }
+    } else if (completed.has(key)) {
       state = "completed";
     } else if (stopped) {
       if (i === stopStageIndex) {
@@ -529,7 +699,9 @@ export function deriveWorkflow(
  *   - the proposal reached Human Review and was explicitly APPROVED;
  *   - revalidation passed;
  *   - ControlledExecutor actually executed;
- *   - no stop / error / rejection occurred anywhere in the run.
+ *   - normal durable audit persistence was confirmed by a valid audit_persisted
+ *     event or authoritative normal_persisted audit status;
+ *   - no stop / error / rejection / audit persistence failure occurred anywhere.
  *
  * An ambiguous, partial, rejected, NEEDS_REVIEW, DO_NOT_IMPORT, or safe-stopped
  * sequence is NEVER reported as success. This is a strict AND over real signals
@@ -537,13 +709,50 @@ export function deriveWorkflow(
  * remains the source of truth; this helper is used only to color the timeline
  * and never to authorize anything.
  */
-export function isTerminalSuccess(events: RunEvent[]): boolean {
+export function isTerminalSuccess(
+  events: RunEvent[],
+  auditStatus?:
+    | string
+    | {
+        audit_status?: string;
+        run_outcome?: string;
+        units_cancelled?: number;
+        files_failed?: number;
+        units_failed_operational?: number;
+        recoverable_errors?: number;
+      },
+): boolean {
+  if (auditStatus && typeof auditStatus === "object") {
+    if (auditStatus.run_outcome && auditStatus.run_outcome !== "full_success") {
+      return false;
+    }
+    if (auditStatus.units_cancelled && auditStatus.units_cancelled > 0) {
+      return false;
+    }
+    if (auditStatus.files_failed && auditStatus.files_failed > 0) {
+      return false;
+    }
+    if (auditStatus.units_failed_operational && auditStatus.units_failed_operational > 0) {
+      return false;
+    }
+  }
   let terminal = false;
   let reviewRequired = false;
   let approved = false;
   let revalidated = false;
   let executed = false;
   let stopped = false;
+  let auditFailed = false;
+  let normalAuditConfirmed = false;
+  let emergencyAuditObserved = false;
+  let ambiguousAuditMetadata = false;
+
+  const rawAuditStatus =
+    typeof auditStatus === "string"
+      ? auditStatus
+      : auditStatus && typeof auditStatus === "object"
+      ? auditStatus.audit_status
+      : undefined;
 
   for (const e of events) {
     switch (e.kind) {
@@ -555,8 +764,11 @@ export function isTerminalSuccess(events: RunEvent[]): boolean {
         reviewRequired = true;
         break;
       case "approval_decided":
-        // Approval must be affirmative; a rejection clears it.
-        approved = /approve/i.test(e.message);
+        if (!/cancel/i.test(e.message)) {
+          approved = /approve/i.test(e.message);
+        } else {
+          approved = false;
+        }
         break;
       case "revalidation_result":
         revalidated = /valid|pass/i.test(e.message);
@@ -564,15 +776,79 @@ export function isTerminalSuccess(events: RunEvent[]): boolean {
       case "execution_result":
         executed = /executed|success/i.test(e.message);
         break;
+      case "audit_persisted": {
+        if (e.durability && ["unconfirmed", "failed", "unconfigured"].includes(e.durability)) {
+          auditFailed = true;
+        }
+        const isEmergency =
+          e.audit_mode === "emergency" ||
+          e.audit_partition === "errors" ||
+          /emergency/i.test(e.message) ||
+          e.operation === "emergency";
+        const isNormal =
+          !isEmergency &&
+          (e.audit_mode === "normal" ||
+            (!e.audit_mode && /normal mode/i.test(e.message))) &&
+          (e.audit_partition === undefined ||
+            ["passed", "failed", "mixed"].includes(e.audit_partition));
+
+        if (isEmergency) {
+          emergencyAuditObserved = true;
+        } else if (isNormal) {
+          if (!emergencyAuditObserved && !ambiguousAuditMetadata && !auditFailed) {
+            normalAuditConfirmed = true;
+          }
+        } else {
+          ambiguousAuditMetadata = true;
+        }
+        break;
+      }
+      case "audit_failed":
+        auditFailed = true;
+        break;
+      case "warning":
+        // Only warnings that actually establish audit persistence failure invalidate terminal success
+        if (
+          (e.stage === "audit" || /audit/i.test(e.message)) &&
+          /failed to persist|persistence fail/i.test(e.message)
+        ) {
+          auditFailed = true;
+        }
+        break;
       case "run_rejected":
       case "stopped":
       case "error":
         stopped = true;
+        if (e.stage === "audit_persistence") {
+          auditFailed = true;
+        }
         break;
       default:
         break;
     }
   }
 
-  return terminal && reviewRequired && approved && revalidated && executed && !stopped;
+  if (rawAuditStatus === "persistence_failed") {
+    auditFailed = true;
+  } else if (
+    rawAuditStatus === "normal_persisted" &&
+    !auditFailed &&
+    !emergencyAuditObserved &&
+    !ambiguousAuditMetadata
+  ) {
+    normalAuditConfirmed = true;
+  }
+
+  return (
+    terminal &&
+    reviewRequired &&
+    approved &&
+    revalidated &&
+    executed &&
+    normalAuditConfirmed &&
+    !emergencyAuditObserved &&
+    !ambiguousAuditMetadata &&
+    !auditFailed &&
+    !stopped
+  );
 }

@@ -7,6 +7,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    exclude: ["e2e/**", "node_modules/**"],
     setupFiles: ["./src/test/setup.ts"],
     // Vitest 4.1.x on Node 24 can lose the AsyncLocalStorage "current
     // suite" context in the default fork/threads pools (a known tinypool

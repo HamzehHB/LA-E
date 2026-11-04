@@ -183,10 +183,11 @@ def _decide_action(classification, comparisons, relation, core,
         uncertainties.append("relation evidence missing")
     if core is None:
         uncertainties.append("core analysis evidence missing")
-    contradictory = bool(
-        ("identical_content" in cats or "possible_duplicate" in cats)
-        and ("distinct" in cats or "related_but_distinct" in cats)
-    )
+    has_identical = "identical_content" in cats
+    has_possible_dup = "possible_duplicate" in cats
+    has_distinct_like = bool("distinct" in cats or "related_but_distinct" in cats)
+
+    contradictory = bool(has_possible_dup and has_distinct_like and not has_identical)
     if contradictory:
         uncertainties.append("contradictory comparison evidence")
     insufficient = any(
@@ -202,6 +203,13 @@ def _decide_action(classification, comparisons, relation, core,
     core_unresolved = core is None or core.relevance == "insufficient_evidence"
     if core_unresolved:
         uncertainties.append("core relevance unresolved")
+    if has_identical:
+        return (
+            "DO_NOT_IMPORT",
+            "Comparison reports identical content with existing "
+            "knowledge; importing would risk duplication.",
+            tuple(uncertainties),
+        )
     if contradictory or insufficient:
         return (
             "NEEDS_REVIEW",

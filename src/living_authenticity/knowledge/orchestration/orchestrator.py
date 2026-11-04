@@ -115,24 +115,27 @@ class EvidenceFirstPipeline:
             raise TypeError("destination must be a string")
         self.destination = destination
 
-    def _observe(self, kind: str, stage: str, message: str = "") -> None:
+    def _observe(self, kind: str, stage: str, message: str = "", run_id: str = "") -> None:
         if self._stage_observer is None:
             return
+        payload = {"kind": kind, "stage": stage, "message": message}
+        if run_id:
+            payload["run_id"] = run_id
         try:
-            self._stage_observer(
-                {"kind": kind, "stage": stage, "message": message})
+            self._stage_observer(payload)
         except Exception:
             pass
     @property
     def stage_order(self) -> tuple:
         return STAGE_ORDER
-    def run_file(self, file_path: str, corpus=(), core_units=()) -> IntegratedResult:
+    def run_file(self, file_path: str, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None) -> IntegratedResult:
         if not isinstance(file_path, str) or not file_path:
             raise TypeError("file_path must be a non-empty string")
         return self.run_ingestion(
-            self.ingestion.ingest(file_path, observer=self._stage_observer), corpus, core_units)
+            self.ingestion.ingest(file_path, observer=self._stage_observer), corpus, core_units,
+            run_id=run_id, should_cancel=should_cancel)
 
-    def run_ingestion(self, ingestion, corpus=(), core_units=()) -> IntegratedResult:
+    def run_ingestion(self, ingestion, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None) -> IntegratedResult:
         """Run the analytical chain over one already-ingested result.
 
         Where input comes from (file, explicit directory, or terminal
@@ -148,7 +151,14 @@ class EvidenceFirstPipeline:
         for item in cores:
             if not isinstance(item, KnowledgeUnit):
                 raise TypeError("core_units must hold KnowledgeUnit objects")
-        unit_results = tuple(self.run_unit(u, corpus_units, cores) for u in ingestion.knowledge_units)
+        unit_results_list = []
+        for u in ingestion.knowledge_units:
+            if should_cancel is not None and (should_cancel() if callable(should_cancel) else bool(should_cancel)):
+                break
+            res = self.run_unit(u, corpus_units, cores, run_id=run_id, should_cancel=should_cancel)
+            if res is not None:
+                unit_results_list.append(res)
+        unit_results = tuple(unit_results_list)
         cache = getattr(self.retriever, "cache", None)
         if cache is not None:
             cache.cleanup()
@@ -168,7 +178,7 @@ class EvidenceFirstPipeline:
             source=ingestion.file_path, ingestion=ingestion,
             units=unit_results, note=note)
 
-    def run_unit(self, query: KnowledgeUnit, corpus=(), core_units=()) -> IntegratedUnitResult:
+    def run_unit(self, query: KnowledgeUnit, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None) -> IntegratedUnitResult | None:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError("query must be a KnowledgeUnit")
         corpus_units = self._corpus_units(corpus)
@@ -177,61 +187,74 @@ class EvidenceFirstPipeline:
             if not isinstance(item, KnowledgeUnit):
                 raise TypeError("core_units must hold KnowledgeUnit objects")
         uid = query.id if isinstance(query, KnowledgeUnit) else ""
-        self._observe("stage_started", "retrieval", uid)
-        if _retriever_accepts_observer(self.retriever):
-            retrieval = self.retriever.retrieve(
-                query, corpus_units, observer=self._stage_observer
-            )
-        else:
-            retrieval = self.retriever.retrieve(query, corpus_units)
-        self._observe("stage_completed", "retrieval", uid)
+        self._observe("stage_started", "retrieval", uid, run_id=run_id)
+
+        ret_kwargs: dict[str, Any] = {}
+        ret_sig = inspect.signature(self.retriever.retrieve)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in ret_sig.parameters.values())
+        if "observer" in ret_sig.parameters or has_var_kw:
+            ret_kwargs["observer"] = self._stage_observer
+        if "run_id" in ret_sig.parameters or has_var_kw:
+            ret_kwargs["run_id"] = run_id
+        if "should_cancel" in ret_sig.parameters or has_var_kw:
+            ret_kwargs["should_cancel"] = should_cancel
+
+        retrieval = self.retriever.retrieve(query, corpus_units, **ret_kwargs)
         if not isinstance(retrieval, RetrievalResult):
             raise TypeError("retriever must return a RetrievalResult")
-        self._observe("stage_started", "comparison", uid)
+
+        is_canc = False
+        if should_cancel is not None:
+            is_canc = bool(should_cancel()) if callable(should_cancel) else bool(should_cancel)
+        if is_canc or (isinstance(retrieval.metadata, dict) and retrieval.metadata.get("cancelled")):
+            return None
+
+        self._observe("stage_completed", "retrieval", uid, run_id=run_id)
+        self._observe("stage_started", "comparison", uid, run_id=run_id)
         comparisons = tuple(self.comparator.compare(query, retrieval.candidates))
-        self._observe("stage_completed", "comparison", uid)
+        self._observe("stage_completed", "comparison", uid, run_id=run_id)
         for item in comparisons:
             if not isinstance(item, ComparisonResult):
                 raise TypeError("comparator must return ComparisonResult items")
-        self._observe("stage_started", "relation", uid)
+        self._observe("stage_started", "relation", uid, run_id=run_id)
         relation = self.relation_detector.detect(query, comparisons)
-        self._observe("stage_completed", "relation", uid)
+        self._observe("stage_completed", "relation", uid, run_id=run_id)
         if not isinstance(relation, RelationDetectionResult):
             raise TypeError("detector must return a RelationDetectionResult")
-        self._observe("stage_started", "core", uid)
+        self._observe("stage_started", "core", uid, run_id=run_id)
         core = self.core_analyzer.analyze(query, cores)
-        self._observe("stage_completed", "core", uid)
+        self._observe("stage_completed", "core", uid, run_id=run_id)
         if not isinstance(core, CoreAnalysisResult):
             raise TypeError("analyzer must return a CoreAnalysisResult")
-        self._observe("stage_started", "classification", uid)
+        self._observe("stage_started", "classification", uid, run_id=run_id)
         classification = self.classifier.classify(query)
-        self._observe("stage_completed", "classification", uid)
+        self._observe("stage_completed", "classification", uid, run_id=run_id)
         if not isinstance(classification, ClassificationResult):
             raise TypeError("classifier must return a ClassificationResult")
-        self._observe("stage_started", "proposal", uid)
+        self._observe("stage_started", "proposal", uid, run_id=run_id)
         proposal = self.proposal_builder.build(query, classification=classification,
             retrieval=retrieval, comparisons=comparisons, relation=relation,
             core=core, destination=self.destination)
-        self._observe("stage_completed", "proposal", uid)
+        self._observe("stage_completed", "proposal", uid, run_id=run_id)
         if not isinstance(proposal, Proposal):
             raise TypeError("proposal builder must return a Proposal")
-        self._observe("stage_started", "confidence", uid)
+        self._observe("stage_started", "confidence", uid, run_id=run_id)
         confidence = self.confidence_guard.assess(query, proposal, classification=classification,
             retrieval=retrieval, comparisons=comparisons, relation=relation, core=core)
-        self._observe("stage_completed", "confidence", uid)
+        self._observe("stage_completed", "confidence", uid, run_id=run_id)
         if not isinstance(confidence, ConfidenceAssessment):
             raise TypeError("confidence guard must return a ConfidenceAssessment")
-        self._observe("stage_started", "knowledge_filter", uid)
+        self._observe("stage_started", "knowledge_filter", uid, run_id=run_id)
         filter_outcome = self.knowledge_filter.filter(query, proposal, classification=classification,
             retrieval=retrieval, comparisons=comparisons, relation=relation,
             core=core, confidence=confidence)
-        self._observe("stage_completed", "knowledge_filter", uid)
+        self._observe("stage_completed", "knowledge_filter", uid, run_id=run_id)
         if not isinstance(filter_outcome, FilterOutcome):
             raise TypeError("knowledge filter must return a FilterOutcome")
-        self._observe("stage_started", "representation", uid)
+        self._observe("stage_started", "representation", uid, run_id=run_id)
         generated = self.output_generator.generate(query, proposal=proposal,
             classification=classification, confidence=confidence)
-        self._observe("stage_completed", "representation", uid)
+        self._observe("stage_completed", "representation", uid, run_id=run_id)
         if not isinstance(generated, GeneratedNote):
             raise TypeError("output generator must return a GeneratedNote")
         return IntegratedUnitResult(query_unit=query, retrieval_result=retrieval,

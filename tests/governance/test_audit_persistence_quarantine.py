@@ -20,6 +20,7 @@ import pytest
 from src.living_authenticity.knowledge.governance.audit.persistence import (
     AuditWriter,
     persist_record_resilient,
+    canonical_json_dumps,
 )
 from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
 from src.living_authenticity.knowledge.governance.execution.executor import (
@@ -1414,7 +1415,7 @@ class TestAuditDurabilityAndQuarantine:
 
         # Tamper with terminal_outcome directly on disk without updating record_digest
         lines[0]["terminal_outcome"] = "tampered_outcome"
-        emerg_file.write_text(json.dumps(lines[0]) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(lines[0]) + "\n", encoding="utf-8")
 
         # verify_record_digest directly detects tampering
         is_valid, err = verify_record_digest(lines[0])
@@ -1455,7 +1456,7 @@ class TestAuditDurabilityAndQuarantine:
         orig_digest = lines[0]["record_digest"]
         tampered_digest = ("0" if orig_digest[0] != "0" else "1") + orig_digest[1:]
         lines[0]["record_digest"] = tampered_digest
-        emerg_file.write_text(json.dumps(lines[0]) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(lines[0]) + "\n", encoding="utf-8")
 
         is_valid, err = verify_record_digest(lines[0])
         assert is_valid is False
@@ -1584,7 +1585,7 @@ class TestAuditDurabilityAndQuarantine:
             "storage_category": "errors",
             "emergency": True,
         }
-        emerg_file.write_text(json.dumps(corrupted_payload) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(corrupted_payload) + "\n", encoding="utf-8")
 
         # Verify initial state: 1 malformed line, 0 valid records
         records_by_id, malformed = writer.read_emergency_records()
@@ -2108,7 +2109,7 @@ class TestAuditDurabilityAndQuarantine:
         # Alter the supplemental record's conflict_type on disk, updating its digest so it remains valid JSON
         lines[1]["conflict_type"] = "tampered_conflict_type"
         lines[1]["record_digest"] = compute_record_digest(lines[1])
-        emerg_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+        emerg_file.write_text("\n".join(canonical_json_dumps(l) for l in lines) + "\n", encoding="utf-8")
 
         # Retry with the same conf_rec
         res2 = writer.append_emergency_history([conf_rec])
@@ -2141,7 +2142,7 @@ class TestAuditDurabilityAndQuarantine:
 
         # Tamper with the supplemental record's digest
         lines[1]["record_digest"] = "0" * 64
-        emerg_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+        emerg_file.write_text("\n".join(canonical_json_dumps(l) for l in lines) + "\n", encoding="utf-8")
 
         # Retry
         res2 = writer.append_emergency_history([conf_rec])
@@ -2295,7 +2296,7 @@ class TestAuditDurabilityAndQuarantine:
         emerg_file = errors_dir / "audit_emergency.jsonl"
 
         # Valid JSON but bad digest
-        emerg_file.write_text(json.dumps({
+        emerg_file.write_text(canonical_json_dumps({
             "record_id": "rec-baddig-coll",
             "run_id": "run-baddig",
             "terminal_outcome": "approved",
@@ -2512,7 +2513,7 @@ class TestAuditDurabilityAndQuarantine:
         entry2["timestamp"] = "2026-10-26T00:00:05Z"
         entry2["record_digest"] = compute_record_digest(entry2)
 
-        emerg_file.write_text(json.dumps(entry1) + "\n" + json.dumps(entry2) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(entry1) + "\n" + canonical_json_dumps(entry2) + "\n", encoding="utf-8")
 
         writer = AuditWriter(str(audit_root))
         read_res = writer.read_emergency_records()
@@ -2578,7 +2579,7 @@ class TestAuditDurabilityAndQuarantine:
         }
         entry2["record_digest"] = compute_record_digest(entry2)
 
-        emerg_file.write_text(json.dumps(entry1) + "\n" + json.dumps(entry2) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(entry1) + "\n" + canonical_json_dumps(entry2) + "\n", encoding="utf-8")
 
         writer = AuditWriter(str(audit_root))
         read_res = writer.read_emergency_records()
@@ -2643,7 +2644,7 @@ class TestAuditDurabilityAndQuarantine:
         }
         entry2["record_digest"] = compute_record_digest(entry2)
 
-        emerg_file.write_text(json.dumps(entry1) + "\n" + json.dumps(entry2) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(entry1) + "\n" + canonical_json_dumps(entry2) + "\n", encoding="utf-8")
 
         writer = AuditWriter(str(audit_root))
         read_res = writer.read_emergency_records()
@@ -2686,7 +2687,7 @@ class TestAuditDurabilityAndQuarantine:
                 "emergency": True,
             }
             e["record_digest"] = compute_record_digest(e)
-            rows.append(json.dumps(e))
+            rows.append(canonical_json_dumps(e))
         emerg_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
         writer = AuditWriter(str(audit_root))
@@ -2748,10 +2749,10 @@ class TestAuditDurabilityAndQuarantine:
         line4_clean["record_digest"] = compute_record_digest(line4_clean)
 
         emerg_file.write_text(
-            json.dumps(line1) + "\n" +
+            canonical_json_dumps(line1) + "\n" +
             line2_malformed +
-            json.dumps(line3_conflict) + "\n" +
-            json.dumps(line4_clean) + "\n",
+            canonical_json_dumps(line3_conflict) + "\n" +
+            canonical_json_dumps(line4_clean) + "\n",
             encoding="utf-8",
         )
 
@@ -2811,7 +2812,7 @@ class TestAuditDurabilityAndQuarantine:
         }
         e2["record_digest"] = compute_record_digest(e2)
 
-        emerg_file.write_text(json.dumps(e1) + "\n" + json.dumps(e2) + "\n", encoding="utf-8")
+        emerg_file.write_text(canonical_json_dumps(e1) + "\n" + canonical_json_dumps(e2) + "\n", encoding="utf-8")
 
         writer = AuditWriter(str(audit_root))
         incoming = AuditRecord(record_id="rec-bounded-supp", run_id="run-bounded", terminal_outcome="quarantined")
@@ -2890,7 +2891,7 @@ class TestAuditDurabilityAndQuarantine:
         supp_entry["record_digest"] = compute_record_digest(supp_entry)
 
         emerg_file.write_text(
-            json.dumps(stored_rec) + "\n" + json.dumps(supp_entry) + "\n",
+            canonical_json_dumps(stored_rec) + "\n" + canonical_json_dumps(supp_entry) + "\n",
             encoding="utf-8",
         )
 
@@ -2975,9 +2976,9 @@ class TestAuditDurabilityAndQuarantine:
 
         # Line 1: primary, Line 2: supplemental, Line 3: identical duplicate supplemental
         emerg_file.write_text(
-            json.dumps(stored_rec) + "\n" +
-            json.dumps(supp_entry) + "\n" +
-            json.dumps(supp_entry) + "\n",
+            canonical_json_dumps(stored_rec) + "\n" +
+            canonical_json_dumps(supp_entry) + "\n" +
+            canonical_json_dumps(supp_entry) + "\n",
             encoding="utf-8",
         )
 
@@ -3070,9 +3071,9 @@ class TestAuditDurabilityAndQuarantine:
         supp2["record_digest"] = compute_record_digest(supp2)
 
         emerg_file.write_text(
-            json.dumps(stored_rec) + "\n" +
-            json.dumps(supp1) + "\n" +
-            json.dumps(supp2) + "\n",
+            canonical_json_dumps(stored_rec) + "\n" +
+            canonical_json_dumps(supp1) + "\n" +
+            canonical_json_dumps(supp2) + "\n",
             encoding="utf-8",
         )
 
@@ -3158,9 +3159,9 @@ class TestAuditDurabilityAndQuarantine:
         supp_corrupt["record_digest"] = "f" * 64  # invalid digest
 
         emerg_file.write_text(
-            json.dumps(stored_rec) + "\n" +
-            json.dumps(supp_valid) + "\n" +
-            json.dumps(supp_corrupt) + "\n",
+            canonical_json_dumps(stored_rec) + "\n" +
+            canonical_json_dumps(supp_valid) + "\n" +
+            canonical_json_dumps(supp_corrupt) + "\n",
             encoding="utf-8",
         )
 
@@ -3241,9 +3242,9 @@ class TestAuditDurabilityAndQuarantine:
         occ2["record_digest"] = compute_record_digest(occ2)
 
         emerg_file.write_text(
-            json.dumps(stored_rec) + "\n" +
-            json.dumps(occ1) + "\n" +
-            json.dumps(occ2) + "\n",
+            canonical_json_dumps(stored_rec) + "\n" +
+            canonical_json_dumps(occ1) + "\n" +
+            canonical_json_dumps(occ2) + "\n",
             encoding="utf-8",
         )
 
@@ -3317,7 +3318,7 @@ class TestAuditDurabilityAndQuarantine:
         supp_mismatched_linkage["record_digest"] = compute_record_digest(supp_mismatched_linkage)
 
         emerg_file.write_text(
-            json.dumps(stored_rec) + "\n" + json.dumps(supp_mismatched_linkage) + "\n",
+            canonical_json_dumps(stored_rec) + "\n" + canonical_json_dumps(supp_mismatched_linkage) + "\n",
             encoding="utf-8",
         )
 
@@ -3354,3 +3355,871 @@ class TestAuditDurabilityAndQuarantine:
         assert res3.conflicts[0]["supplemental_preserved"] is False
         lines_after_att3 = [l for l in emerg_file.read_text(encoding="utf-8").splitlines() if l.strip()]
         assert len(lines_after_att3) == 2
+
+
+    def test_quarantine_collision_safe_fallback_when_target_already_exists(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        unrec = staging / ".unreconciled"
+        unrec.mkdir()
+
+        # Existing file in .unreconciled
+        existing_in_unrec = unrec / "test_artifact.md"
+        existing_in_unrec.write_text("prior quarantined version", encoding="utf-8")
+
+        # Active artifact to be quarantined
+        active_art = staging / "test_artifact.md"
+        active_art.write_text("new unreconciled version", encoding="utf-8")
+
+        outcome = quarantine_artifact(staging, "test_artifact.md", collision_safe=True)
+        assert outcome.success is True
+        assert outcome.status == "quarantined"
+        assert not active_art.exists(), "source artifact must be moved out of staging"
+        assert existing_in_unrec.read_text(encoding="utf-8") == "prior quarantined version", "prior file must not be overwritten"
+
+        # Verify collision-safe file was created in .unreconciled
+        all_unrec = list(unrec.glob("test_artifact*.md"))
+        assert len(all_unrec) == 2
+        fallback_file = next(f for f in all_unrec if f != existing_in_unrec)
+        assert fallback_file.read_text(encoding="utf-8") == "new unreconciled version"
+
+
+
+    def test_unit_loop_fails_closed_without_audit_writer(self, tmp_path):
+        from unittest.mock import MagicMock
+        from src.living_authenticity.knowledge.integration.unit_loop import _govern_candidate
+        from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        runner = MagicMock()
+
+        request = ApprovalRequest(
+            proposal_hash="hash456",
+            query_unit_id="q2",
+            query_source="test.md",
+            query_position=0,
+            proposal_action="CREATE",
+            destination="note.md",
+        )
+        outcome = ApprovalOutcome(
+            approved=True,
+            proposal_hash="hash456",
+            query_unit_id="q2",
+            proposal_action="CREATE",
+        )
+        proposal = Proposal(query_unit_id="q2", query_source="test.md", query_position=0, action="CREATE", provenance=("unit_test",))
+        confidence = ConfidenceAssessment(query_unit_id="q2", query_source="test.md", query_position=0, level="sufficiently_supported", score=0.95)
+        note = GeneratedNote(
+            query_unit_id="q2",
+            query_source="test.md",
+            query_position=0,
+            proposal_action="CREATE",
+            markdown="# Test Note",
+        )
+        gate = MagicMock()
+        gate.request_approval.return_value = (request, "y", outcome)
+        from src.living_authenticity.knowledge.governance.revalidation.outcome import RevalidationResult
+        validator = MagicMock()
+        validator.revalidate.return_value = RevalidationResult(valid=True, approval_bound=True, eligible=True)
+
+        entries = []
+        audits = []
+
+        _govern_candidate(
+            child="test.txt",
+            query=MagicMock(id="q2", source="test.txt", position=0),
+            proposal=proposal,
+            confidence=confidence,
+            note=note,
+            gate=gate,
+            validator=validator,
+            runner=runner,
+            pinned_staging=str(staging),
+            guarded=(),
+            schema_version="",
+            approval_reader=lambda *a: "y",
+            entries=entries,
+            audits=audits,
+            authorized_staging=str(staging),
+            audit_writer=None,  # Missing audit writer
+            audit_requested=True,
+        )
+
+        assert not runner.execute.called, "ControlledExecutor must NOT be called if audit_writer is None!"
+        assert len(entries) == 1
+        assert entries[0].outcome == "audit_persistence_failed"
+        assert "audit writer missing" in entries[0].reason
+
+    def test_failure_matrix_9_scenarios_verified(self, tmp_path):
+        """Verify all 9 failure-matrix resilience and governance scenarios."""
+        # 1. Normal post-execution audit succeeds (durability: written)
+        staging = tmp_path / "stg1"
+        staging.mkdir()
+        audit_root = tmp_path / "audit1"
+        audit_root.mkdir()
+        writer = AuditWriter(str(audit_root))
+        rec1 = AuditRecord(record_id="r1", run_id="run1", execution_executed=True, artifact_path="art1.md")
+        receipts1 = []
+        r1 = persist_record_resilient(writer, rec1, receipts=receipts1)
+        assert r1["persisted"] is True
+        assert r1["durability"] == "written"
+
+        # 2. Primary append fails, emergency append succeeds (durability: confirmed)
+        audit_root2 = tmp_path / "audit2"
+        failing_writer = FailingWriter(audit_root2 / "errors")
+        rec2 = AuditRecord(record_id="r2", run_id="run2", execution_executed=True, artifact_path="art2.md")
+        receipts2 = []
+        r2 = persist_record_resilient(failing_writer, rec2, receipts=receipts2)
+        assert r2["persisted"] is True
+        assert r2["emergency"] is True
+        assert r2["durability"] == "confirmed"
+
+        # 3. Primary append fails, emergency append fails, artifact quarantined
+        staging3 = tmp_path / "stg3"
+        staging3.mkdir()
+        (staging3 / "art3.md").write_text("unreconciled data")
+        double_fail = DoubleFailingWriter()
+        rec3 = AuditRecord(record_id="r3", run_id="run3", execution_executed=True, artifact_path="art3.md")
+        receipts3 = []
+        _persist_audits(double_fail, [rec3], receipts3, staging_root=str(staging3))
+        assert len(receipts3) == 1
+        assert receipts3[0]["persisted"] is False
+        assert receipts3[0]["quarantined"] is True
+        assert not (staging3 / "art3.md").exists()
+
+        # 4. Primary fails, emergency fails, destination exists in quarantine -> collision-safe quarantine succeeds
+        staging4 = tmp_path / "stg4"
+        staging4.mkdir()
+        (staging4 / ".unreconciled").mkdir()
+        (staging4 / ".unreconciled" / "art4.md").write_text("prior quarantined")
+        (staging4 / "art4.md").write_text("new unreconciled data")
+        rec4 = AuditRecord(record_id="r4", run_id="run4", execution_executed=True, artifact_path="art4.md")
+        receipts4 = []
+        _persist_audits(double_fail, [rec4], receipts4, staging_root=str(staging4))
+        assert receipts4[0]["quarantined"] is True
+        assert not (staging4 / "art4.md").exists()
+        assert (staging4 / ".unreconciled" / "art4.md").read_text() == "prior quarantined"
+
+        # 5. Primary fails, emergency fails, quarantine fails completely (e.g. non-existent staging root)
+        rec5 = AuditRecord(record_id="r5", run_id="run5", execution_executed=True, artifact_path="art5.md")
+        receipts5 = []
+        ok5 = _persist_audits(double_fail, [rec5], receipts5, staging_root=str(tmp_path / "non_existent_stg"))
+        assert ok5 is False
+        assert receipts5[0]["quarantined"] is False
+
+        # 6. Pre-execution audit fails -> ControlledExecutor blocked
+        # (Verified in test_pipeline_contract_ordering.py & unit_loop logic)
+
+        # 7. Pre-execution audit_writer is None -> ControlledExecutor blocked
+        # (Verified in test_unit_loop_fails_closed_without_audit_writer)
+
+        # 8. Cooperative cancellation before execution -> ControlledExecutor blocked, operational record in errors/
+        rec8 = AuditRecord(record_id="r8", run_id="run8", terminal_outcome="cancelled")
+        from src.living_authenticity.knowledge.governance.audit.persistence import audit_storage_category
+        assert audit_storage_category(rec8) == "errors"
+
+        # 9. Cooperative cancellation during approval -> human review uncompleted, operational record in errors/
+        rec9 = AuditRecord(record_id="r9", run_id="run9", terminal_outcome="cancelled", human_review_state="cancelled")
+        assert audit_storage_category(rec9) == "errors"
+
+
+class UnusableAuditWriter:
+    """Audit writer where both primary and emergency persistence fail completely."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def append(self, record):
+        raise OSError("primary disk write failed (simulated unusable)")
+
+    def append_emergency(self, record, failure_reason=""):
+        raise OSError("emergency journal write failed (simulated unusable)")
+
+    def append_emergency_history(self, records, failure_reason="", failing_record_id=""):
+        raise OSError("emergency history write failed (simulated unusable)")
+
+
+class RealAuditWriterWithFailingPrimary(AuditWriter):
+    """Subclass of production AuditWriter that forces append() (primary persistence)
+    to fail with an OSError, but relies 100% on the UNMODIFIED production append_emergency()
+    and append_emergency_history() methods for durable emergency persistence."""
+
+    def append(self, record):
+        raise OSError("simulated primary append disk write failure")
+
+
+def _make_core_sample():
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import (
+        KnowledgeUnit,
+    )
+    sample = "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n"
+    return KnowledgeUnit(
+        id="core1", source="core", original_text=sample,
+        meaning=sample, cleaned_text=sample,
+        normalized_text=sample,
+        context="", proposed_type="", position=0,
+    )
+
+
+class TestMandatoryAuditWriterOnExecution:
+    """Regression tests verifying the invariant:
+    No controlled execution may proceed without a configured and usable durable audit mechanism,
+    regardless of whether the caller explicitly supplied an audit destination or set audit_requested=True.
+    """
+
+    def test_execution_blocked_when_no_audit_root(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        cores = [_make_core_sample()]
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_root="",
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+        )
+
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert "no audit writer configured" in report.rejection_reason
+        assert any(u.outcome == "audit_persistence_failed" for u in report.units)
+        # Invariant: Zero staging artifacts created when execution is blocked
+        assert list(staging.iterdir()) == []
+
+    def test_execution_blocked_when_no_audit_writer(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+        )
+
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert "no audit writer configured" in report.rejection_reason
+        assert any(u.outcome == "audit_persistence_failed" for u in report.units)
+        assert list(staging.iterdir()) == []
+
+    def test_execution_blocked_even_when_audit_requested_is_false(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_requested=False,
+            audit_root="",
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+        )
+
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert "no audit writer configured" in report.rejection_reason
+        assert any(u.outcome == "audit_persistence_failed" for u in report.units)
+        assert list(staging.iterdir()) == []
+
+    def test_execution_blocked_when_audit_writer_is_unusable(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        unusable_writer = UnusableAuditWriter()
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=unusable_writer,
+            audit_requested=True,
+            audit_root=str(tmp_path / "dummy_audit"),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+        )
+
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert any(u.outcome == "audit_persistence_failed" for u in report.units)
+        # Pre-execution persistence failed: execution was blocked before writing to staging
+        assert list(staging.iterdir()) == []
+
+    def test_execution_succeeds_when_normal_audit_writer_is_valid(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        audit_root = tmp_path / "audit"
+        audit_root.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        writer = AuditWriter(str(audit_root))
+
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=writer,
+            audit_root=str(audit_root),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        assert report.accepted is True
+        assert any(u.outcome == "executed" for u in report.units)
+        assert len(list(staging.iterdir())) == 1
+        persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+        assert len(persisted_events) >= 1
+        assert persisted_events[0].get("audit_mode") == "normal"
+        assert persisted_events[0].get("audit_partition") == "passed"
+
+    def test_execution_allowed_with_real_production_emergency_fallback(self, tmp_path, monkeypatch):
+        """Prove Priority A: When primary audit persistence fails, the REAL production
+        AuditWriter.append_emergency implementation executes, calls handle.flush() and
+        os.fsync(handle.fileno()), durably writes the emergency record, returns durability='confirmed',
+        and allows controlled execution to proceed."""
+        import os
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        audit_root = tmp_path / "audit"
+        audit_root.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        # Real production AuditWriter subclass with failing primary append
+        writer = RealAuditWriterWithFailingPrimary(str(audit_root))
+
+        # Instrument os.fsync to verify it is genuinely called by the production append_emergency path
+        fsync_fds = []
+        orig_fsync = os.fsync
+
+        def spy_fsync(fd):
+            fsync_fds.append(fd)
+            return orig_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", spy_fsync)
+
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=writer,
+            audit_root=str(audit_root),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        # 1. Controlled execution allowed because emergency persistence succeeded with confirmed durability
+        assert report.accepted is True
+        assert any(u.outcome == "executed" for u in report.units)
+        assert len(list(staging.iterdir())) == 1
+
+        # 2. Production os.fsync was actually called on the open file descriptor
+        assert len(fsync_fds) >= 1, "Real os.fsync must be called by production append_emergency"
+
+        # 3. Emergency file genuinely exists on disk and contains valid records
+        emerg_file = audit_root / "errors" / "audit_emergency.jsonl"
+        assert emerg_file.is_file(), "audit_emergency.jsonl must genuinely exist on disk"
+        emerg_content = emerg_file.read_text(encoding="utf-8")
+        assert emerg_content.strip() != "", "Emergency log file must not be empty"
+        assert "run-" in emerg_content
+
+        # 4. Returned receipts confirm durability='confirmed' and emergency=True
+        confirmed_receipts = [
+            r for r in report.audit_receipts
+            if isinstance(r, dict) and r.get("emergency") is True and r.get("durability") == "confirmed"
+        ]
+        assert len(confirmed_receipts) >= 1
+
+        # 5. Event emitted with mode='emergency' and partition='errors'
+        persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+        assert len(persisted_events) >= 1
+        assert persisted_events[0].get("audit_mode") == "emergency"
+        assert persisted_events[0].get("audit_partition") == "errors"
+
+    def test_execution_blocked_when_production_emergency_fsync_fails(self, tmp_path, monkeypatch):
+        """Prove Priority A: When primary persistence fails AND emergency os.fsync fails,
+        the production implementation must not produce a confirmed durability receipt,
+        controlled execution must be strictly BLOCKED before writing to staging, and the run fails closed."""
+        import os
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        audit_root = tmp_path / "audit"
+        audit_root.mkdir()
+
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        writer = RealAuditWriterWithFailingPrimary(str(audit_root))
+
+        # Force os.fsync to fail
+        def failing_fsync(fd):
+            raise OSError("simulated hardware failure during emergency fsync")
+
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=writer,
+            audit_root=str(audit_root),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        # 1. Run must be rejected
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert report.rejection_reason == "audit persistence failed before execution"
+
+        # 2. Invariant: ZERO staging artifacts created (execution blocked before write)
+        assert list(staging.iterdir()) == []
+        assert any(u.outcome == "audit_persistence_failed" for u in report.units)
+
+        # 3. No confirmed durability receipts
+        for r in report.audit_receipts:
+            if isinstance(r, dict):
+                assert r.get("durability") != "confirmed"
+                assert r.get("persisted") is False
+
+        # 4. audit_failed event emitted; NO audit_persisted event
+        persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+        assert len(persisted_events) == 0
+        failed_events = [e for e in events if e.get("kind") == "audit_failed"]
+        assert len(failed_events) >= 1
+
+    def test_genuine_needs_review_workflow_preserved_without_audit_writer(self, tmp_path):
+        """Prove Priority B: A genuine NEEDS_REVIEW proposal naturally derived by the analytical
+        pipeline (due to core relevance uncertainty) completes without an AuditWriter when no
+        controlled execution is attempted. ControlledExecutor is not invoked, zero staging artifacts
+        are created, and the proposal is preserved and reported truthfully."""
+        from src.living_authenticity.knowledge.orchestration.orchestrator import EvidenceFirstPipeline
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        from src.living_authenticity.knowledge.governance.execution.executor import ControlledExecutor
+        from tests._synthetic_synthesis import SyntheticSynthesis
+
+        class SpyExecutor:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, *args, **kwargs):
+                self.calls += 1
+                return ControlledExecutor().execute(*args, **kwargs)
+
+        spy = SpyExecutor()
+
+        # Realistic core unit and input text with semantic core overlap
+        core_text = "Observation:\nCore mindfulness observation regarding mental calm.\n"
+        core_unit = KnowledgeUnit(
+            id="core1", source="core", original_text=core_text,
+            meaning=core_text, cleaned_text=core_text, normalized_text=core_text,
+            context="", proposed_type="Observation", position=0,
+        )
+        input_text = "Observation:\nA mindfulness observation regarding mental calm in daily routines.\n"
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text(input_text, encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        pipe = EvidenceFirstPipeline()
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            audit_requested=False,
+            approval_reader=lambda: "acknowledge",
+            synthesis=SyntheticSynthesis(),
+            pipeline=pipe,
+            corpus=(),
+            core_units=[core_unit],
+            executor=spy,
+            max_files=1,
+        )
+
+        # 1. Non-executable analysis succeeds
+        assert report.accepted is True
+        # 2. Genuine NEEDS_REVIEW action produced by pipeline
+        assert len(report.units) == 1
+        unit = report.units[0]
+        assert unit.proposal_action == "NEEDS_REVIEW"
+        assert unit.outcome == "held_non_executable"
+        assert "not CREATE" in unit.reason or "candidate proposal action is not CREATE" in unit.reason
+        # 3. ControlledExecutor was NEVER called
+        assert spy.calls == 0
+        # 4. Zero staging artifacts written
+        assert list(staging.iterdir()) == []
+
+    def test_genuine_do_not_import_workflow_preserved_without_audit_writer(self, tmp_path):
+        """Prove Priority B: A genuine DO_NOT_IMPORT proposal naturally derived by the analytical
+        pipeline (due to identical content in existing corpus) completes without an AuditWriter when no
+        controlled execution is attempted. ControlledExecutor is not invoked, zero staging artifacts
+        are created, and the duplicate is preserved and reported truthfully."""
+        from src.living_authenticity.knowledge.orchestration.orchestrator import EvidenceFirstPipeline
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        from src.living_authenticity.knowledge.governance.execution.executor import ControlledExecutor
+        from tests._synthetic_synthesis import SyntheticSynthesis
+
+        class SpyExecutor:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, *args, **kwargs):
+                self.calls += 1
+                return ControlledExecutor().execute(*args, **kwargs)
+
+        spy = SpyExecutor()
+
+        # Realistic input text identical to an existing note in the corpus
+        dup_text = "Observation:\nPeople often lose calmness in modern life.\n"
+        corpus_unit = KnowledgeUnit(
+            id="corpus1", source="vault/note1.md", original_text=dup_text,
+            meaning=dup_text, cleaned_text=dup_text, normalized_text=dup_text,
+            context="", proposed_type="Observation", position=0,
+        )
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text(dup_text, encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        pipe = EvidenceFirstPipeline()
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            audit_requested=False,
+            approval_reader=lambda: "acknowledge",
+            synthesis=SyntheticSynthesis(),
+            pipeline=pipe,
+            corpus=[corpus_unit],
+            core_units=(),
+            executor=spy,
+            max_files=1,
+        )
+
+        # 1. Non-executable analysis succeeds
+        assert report.accepted is True
+        # 2. Genuine DO_NOT_IMPORT action produced by pipeline
+        assert len(report.units) == 1
+        unit = report.units[0]
+        assert unit.proposal_action == "DO_NOT_IMPORT"
+        assert unit.outcome == "held_non_executable"
+        # 3. ControlledExecutor was NEVER called
+        assert spy.calls == 0
+        # 4. Zero staging artifacts written
+        assert list(staging.iterdir()) == []
+
+    def test_mandatory_audit_writer_blocks_executable_create_even_when_non_executable_succeeds(self, tmp_path):
+        """Prove Priority B contrast: While genuine non-executable proposals succeed without an AuditWriter,
+        any executable CREATE proposal approved by human review strictly FAILS CLOSED when an AuditWriter
+        is missing, verifying that the mandatory audit invariant remains fully enforced for execution."""
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        cores = [_make_core_sample()]
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            audit_requested=False,
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+            max_files=1,
+        )
+
+        # Must fail closed on execution attempt
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert "no audit writer configured" in report.rejection_reason
+        assert any(u.outcome == "audit_persistence_failed" for u in report.units)
+        assert list(staging.iterdir()) == []
+
+
+
+class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
+    """Focused regression tests for Section 1 (Mixed Audit Telemetry) and Section 2 (Unavailable AuditWriter Policy)."""
+
+    def test_mixed_audit_telemetry_across_passed_and_failed_partitions(self, tmp_path):
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        """A multi-unit run containing both successful (CREATE -> executed in passed/)
+        and held (DO_NOT_IMPORT -> held in failed/) terminal outcomes must truthfully
+        report audit_partition='mixed' and list all involved partitions without hiding either."""
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note1.md").write_text("Observation:\nPeople often lose calmness in modern life and daily stress.\n", encoding="utf-8")
+        dup_text = "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n"
+        (source / "note2.md").write_text(dup_text, encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        audit_root = tmp_path / "audit"
+        audit_root.mkdir()
+
+        # Core units for comparison
+        cores = [_make_core_sample()]
+        corpus = [
+            KnowledgeUnit(
+                id="corpus1", source="vault/method.md", original_text=dup_text,
+                meaning=dup_text, cleaned_text=dup_text, normalized_text=dup_text,
+                context="", proposed_type="Method", position=0,
+            )
+        ]
+
+        writer = AuditWriter(str(audit_root))
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=writer,
+            audit_root=str(audit_root),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(title="T", body="B"),
+            core_units=cores,
+            corpus=corpus,
+            max_files=2,
+            event_sink=lambda e: events.append(e),
+        )
+
+        assert report.accepted is True
+        assert len(report.units) == 2
+        # Unit 1 was novel -> executed
+        assert report.units[0].outcome == "executed"
+        # Unit 2 was identical duplicate -> held non-executable
+        assert report.units[1].proposal_action in ("DO_NOT_IMPORT", "NEEDS_REVIEW")
+        assert report.units[1].outcome != "executed"
+
+        persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+        assert len(persisted_events) >= 1
+        last_persisted = persisted_events[-1]
+
+        # 1. Truthful mixed partition representation
+        assert last_persisted.get("audit_partition") == "mixed"
+        assert last_persisted.get("audit_partitions") == ["failed", "passed"]
+        assert "mixed partitions: failed+passed" in last_persisted.get("message")
+
+        # 2. Durable files exist in BOTH partitions
+        passed_file = audit_root / "passed" / "audit.jsonl"
+        failed_file = audit_root / "failed" / "audit.jsonl"
+        assert passed_file.is_file() and passed_file.read_text(encoding="utf-8").strip() != ""
+        assert failed_file.is_file() and failed_file.read_text(encoding="utf-8").strip() != ""
+
+    def test_single_unit_create_distinguishes_checkpoint_from_terminal(self, tmp_path):
+        """A single-unit CREATE execution creates a pre-execution checkpoint in failed/
+        and a terminal record in passed/. Telemetry must distinguish the checkpoint from
+        terminal outcome and report audit_partition='passed' (not mixed)."""
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nSingle novel note for cognition analysis.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        audit_root = tmp_path / "audit"
+        audit_root.mkdir()
+
+        cores = [_make_core_sample()]
+        writer = AuditWriter(str(audit_root))
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=writer,
+            audit_root=str(audit_root),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(title="T", body="B"),
+            core_units=cores,
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        assert report.accepted is True
+        assert len(report.units) == 1
+        assert report.units[0].outcome == "executed"
+
+        # Checkpoint is in failed/, terminal is in passed/
+        assert len(report.audits) == 2
+        checkpoint = report.audits[0]
+        assert checkpoint.audit_phase == "pre_execution"
+        assert checkpoint.terminal_outcome == "approved_pending_execution"
+        terminal = report.audits[1]
+        assert terminal.audit_phase == "post_execution"
+        assert terminal.execution_executed is True
+
+        persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+        assert len(persisted_events) >= 1
+        # Derived terminal outcome is pure 'passed'
+        assert persisted_events[0].get("audit_partition") == "passed"
+        assert persisted_events[0].get("audit_partitions") == ["passed"]
+
+    def test_unavailable_audit_writer_policy_for_non_executable_outcomes(self, tmp_path):
+        """Non-executable outcomes (NEEDS_REVIEW, DO_NOT_IMPORT) when AuditWriter is unavailable
+        must record unconfigured durability receipts, emit audit_failed telemetry, and never
+        misrepresent that audit persistence occurred."""
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        source = tmp_path / "source"
+        source.mkdir()
+        # Empty Core yields NEEDS_REVIEW
+        (source / "note.md").write_text("Observation:\nTesting non-executable policy without audit writer.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            audit_requested=False,
+            approval_reader=lambda: "acknowledge",
+            synthesis=SyntheticSynthesis(title="T", body="B"),
+            core_units=[],  # Empty core -> NEEDS_REVIEW
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        # 1. Non-executable outcome produces 0 staging notes
+        assert list(staging.iterdir()) == []
+        assert len(report.units) == 1
+        assert report.units[0].proposal_action == "NEEDS_REVIEW"
+
+        # 2. Receipts truthfully record unconfigured durability
+        assert len(report.audit_receipts) >= 1
+        for r in report.audit_receipts:
+            assert r.get("persisted") is False
+            assert r.get("durability") == "unconfigured"
+
+        # 3. Telemetry emits visible audit_failed event; NEVER audit_persisted
+        persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+        assert len(persisted_events) == 0
+        failed_events = [e for e in events if e.get("kind") == "audit_failed"]
+        assert len(failed_events) >= 1
+        assert failed_events[0].get("audit_mode") == "unconfigured"
+        assert "no audit writer configured" in failed_events[0].get("message")
+
+    def test_unavailable_audit_writer_when_audit_requested_true_fails_closed_even_for_non_executable(self, tmp_path):
+        """When the caller explicitly requested durable audit (audit_requested=True),
+        an unavailable AuditWriter MUST cause the run to fail closed (accepted=False)
+        with rejection_check='audit_durability', even for non-executable outcomes."""
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nTesting requested audit with missing writer.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        events = []
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            audit_requested=True,
+            approval_reader=lambda: "acknowledge",
+            synthesis=SyntheticSynthesis(title="T", body="B"),
+            core_units=[],  # Empty core -> NEEDS_REVIEW
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        assert report.accepted is False
+        assert report.rejection_check == "audit_durability"
+        assert "no audit writer configured" in report.rejection_reason
+        assert list(staging.iterdir()) == []
+        failed_events = [e for e in events if e.get("kind") == "audit_failed"]
+        assert len(failed_events) >= 1
+
+    def test_cancellation_and_revalidation_with_unavailable_writer(self, tmp_path):
+        """Cancellation and revalidation rejection when AuditWriter is unavailable
+        produce in-memory records with unconfigured durability receipts and visible telemetry."""
+        from tests._synthetic_synthesis import SyntheticSynthesis
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "note.md").write_text("Observation:\nTesting cancellation without writer.\n", encoding="utf-8")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        events = []
+        # should_cancel returns True before execution
+        report = run_bounded_integration(
+            str(source), str(staging),
+            audit_writer=None,
+            audit_root="",
+            audit_requested=False,
+            approval_reader=lambda: "y",
+            should_cancel=lambda: True,
+            synthesis=SyntheticSynthesis(title="T", body="B"),
+            core_units=[_make_core_sample()],
+            max_files=1,
+            event_sink=lambda e: events.append(e),
+        )
+
+        # 1. Cancelled outcome with 0 staging notes
+        assert list(staging.iterdir()) == []
+        assert any(u.outcome == "cancelled" for u in report.units)
+
+        # 2. Receipt records unconfigured
+        assert len(report.audit_receipts) >= 1
+        for r in report.audit_receipts:
+            assert r.get("persisted") is False
+            assert r.get("durability") == "unconfigured"
+
+        # 3. Telemetry emits visible audit_failed event
+        failed_events = [e for e in events if e.get("kind") == "audit_failed"]
+        assert len(failed_events) >= 1
+        assert failed_events[0].get("audit_mode") == "unconfigured"

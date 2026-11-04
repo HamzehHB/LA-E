@@ -33,6 +33,7 @@ def test_stage_order_contract():
 def test_full_path_exposes_intermediates():
     pipe = EvidenceFirstPipeline()
     result = pipe.run_unit(_unit(), corpus=[_other()], core_units=[])
+    assert result is not None
     assert result.retrieval_result is not None
     assert result.comparisons
     assert result.relation_result is not None
@@ -52,6 +53,7 @@ def test_classification_not_early_gate_and_cross_type(tmp_path):
     query = _unit(text="Observation: i observed that people often share calm morning rituals")
     other = _other(text="Research: this study shows calm morning rituals improve focus")
     out = pipe.run_unit(query, corpus=[other], core_units=[])
+    assert out is not None
     assert out.retrieval_result.candidates, "cross-type evidence must remain retrievable"
     texts = " ".join(c.text for c in out.retrieval_result.candidates)
     assert "study" in texts
@@ -62,6 +64,7 @@ def test_provenance_evidence_identity_preserved():
     query = _unit()
     other = _other()
     out = pipe.run_unit(query, corpus=[other], core_units=[])
+    assert out is not None
     assert out.retrieval_result.query_source == "inbox"
     assert out.proposal.provenance[0].startswith("query:q1@inbox#")
     assert out.comparisons[0].candidate_unit_id == "c1"
@@ -73,6 +76,7 @@ def test_provenance_evidence_identity_preserved():
 def test_filter_non_authoritative_and_actions_safe():
     pipe = EvidenceFirstPipeline()
     out = pipe.run_unit(_unit(), corpus=[], core_units=[])
+    assert out is not None
     assert out.filter_outcome.is_authoritative is False
     assert out.filter_outcome.requires_human_review is True
     assert out.proposal.is_authoritative is False

@@ -49,6 +49,7 @@ _RUN_SCOPED_EVENT_KINDS = frozenset({
     "human_review_required", "approval_decided", "consent_required",
     "revalidation_result", "execution_result", "completed",
     "sync_approval_required",
+    "audit_persisted", "audit_failed",
 })
 
 
@@ -93,6 +94,7 @@ class _Pending:
         self.state = ApprovalState.PENDING
         self._lock = threading.Lock()
         self._event = threading.Event()
+        self._wait_entered = threading.Event()
         self._result = None
 
     def resolve(self, value) -> bool:
@@ -118,6 +120,7 @@ class _Pending:
             return True
 
     def wait(self, timeout: float):
+        self._wait_entered.set()
         if not self._event.wait(timeout):
             with self._lock:
                 if self.state == ApprovalState.PENDING:
@@ -223,6 +226,13 @@ class _PublishingGate:
         while True:
             request = self._inner.build_request(
                 query, proposal, confidence, note)
+            req_act = (getattr(request, "proposal_action", "") or "").strip().upper()
+            prop_act = (getattr(proposal, "action", "") or "").strip().upper()
+            if req_act and prop_act and req_act != prop_act:
+                raise AdapterError(
+                    "validation_error",
+                    f"Action mismatch: approval request declared '{req_act}' but proposal specifies '{prop_act}'"
+                )
             self._launcher.register_approval(
                 request, note, proposal=proposal, confidence=confidence)
             text = self._inner.display(request)
@@ -236,7 +246,7 @@ class _PublishingGate:
                     raw = "eof"
                 except Exception as exc:
                     raw = f"reader_error:{type(exc).__name__}"
-            if raw == "cancel" or (bool(self._launcher._active_run_id) and self._launcher._active_run_id in self._launcher._cancel_flags):
+            if raw in ("cancel", "cancelled") or (bool(self._launcher._active_run_id) and self._launcher._active_run_id in self._launcher._cancel_flags):
                 outcome = self._inner.decide(request, "cancel")
                 self.last_active_proposal = proposal
                 self.last_active_note = note
@@ -266,7 +276,8 @@ class Launcher:
     def __init__(self, paths=None, llm_config=None, web_root=None,
                  synthesis_factory=None, pipeline_factory=None,
                  picker=None, open_browser: bool = True,
-                 on_ready=None) -> None:
+                 on_ready=None, is_test_mode: bool = False,
+                 test_authorizer_factory=None) -> None:
         # Per-launch, memory-only credentials (never logged/persisted).
         self.token = secrets.token_urlsafe(32)
         self.instance_id = f"inst-{uuid.uuid4().hex[:12]}"
@@ -285,6 +296,10 @@ class Launcher:
         self._picker = picker
         self._open_browser = open_browser
         self._on_ready = on_ready
+        self._is_test_mode = bool(is_test_mode)
+        if test_authorizer_factory is not None and not callable(test_authorizer_factory):
+            raise TypeError("test_authorizer_factory must be callable or None")
+        self._test_authorizer_factory = test_authorizer_factory
         # UI-validated session destinations (memory only, never persisted
         # to configuration files). Set only by pick_folder() after the
         # existing backend validation accepts the selected path; consumed
@@ -410,14 +425,29 @@ class Launcher:
         body = ""
         if note is not None:
             body = getattr(note, "markdown", "") or ""
+        evidence_list = list(getattr(proposal, "evidence", ())) if proposal else []
+        provenance_list = list(getattr(proposal, "provenance", ())) if proposal else []
+        if not provenance_list:
+            src = getattr(request, "query_source", "") or ""
+            if src:
+                provenance_list = [src]
+        uncertainties_list = list(getattr(proposal, "uncertainties", ())) if proposal else []
+        req_action = (getattr(request, "proposal_action", "") or "").strip().upper()
+        prop_action = (getattr(proposal, "action", "") or "").strip().upper()
+        if req_action and prop_action and req_action != prop_action:
+            raise AdapterError(
+                "validation_error",
+                f"Action mismatch: approval request declared '{req_action}' but proposal specifies '{prop_action}'"
+            )
+        action = req_action or prop_action
         payload = {
             "kind": "human_review_required",
             "stage": "human_review",
             "message": "explicit decision requested",
             "proposal_hash": getattr(request, "proposal_hash", ""),
             "query_unit_id": getattr(request, "query_unit_id", ""),
-            "proposal_action": getattr(request, "proposal_action", ""),
-            "title": getattr(request, "title", ""),
+            "proposal_action": action,
+            "title": getattr(request, "title", "") or getattr(proposal, "title", ""),
             "body": body,
             "confidence_level": getattr(request, "confidence_level", ""),
             "confidence_score": getattr(request, "confidence_score", 0.0),
@@ -426,6 +456,12 @@ class Launcher:
             # from the proposal action. Already computed by classification;
             # exposed read-only for the UI's CLASS field. Not authorization.
             "classification_type": getattr(proposal, "classification_type", ""),
+            "destination": getattr(request, "destination", "") or getattr(proposal, "destination", ""),
+            "reason": getattr(request, "reason", "") or getattr(proposal, "reason", ""),
+            "evidence": evidence_list,
+            "provenance": provenance_list,
+            "uncertainties": uncertainties_list,
+            "is_executable": (action == "CREATE"),
         }
         with self._lock:
             key = getattr(request, "proposal_hash", "")
@@ -435,13 +471,17 @@ class Launcher:
             pending = _Pending(self._active_run_id, key, payload,
                                proposal=proposal, note=note,
                                confidence=confidence)
+            if bool(self._active_run_id) and self._active_run_id in self._cancel_flags:
+                pending.resolve("cancelled")
             self._pending_approval = pending
         self._sink(payload)
 
-    def _approval_reader(self):
+    def _approval_reader(self) -> str:
         """Blocking reader handed to the gate; timeout rejects (fail closed)."""
         with self._lock:
             pending = self._pending_approval
+            if pending is not None and bool(self._active_run_id) and self._active_run_id in self._cancel_flags:
+                pending.resolve("cancelled")
         if pending is None:
             return ""
         decision = pending.wait(APPROVAL_TIMEOUT_SECONDS)
@@ -466,20 +506,36 @@ class Launcher:
             return "y" if decision == "approve" else "n"
         return ""
 
-    def approve(self, proposal_hash, query_unit_id, decision):
+    def approve(self, proposal_hash, query_unit_id, decision, run_id: str = "",
+                proposal_action: str = ""):
         """Answer the single pending approval exactly and only once."""
         if decision not in APPROVE_DECISIONS:
             raise AdapterError("validation_error",
                                "decision must be approve or reject")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AdapterError("validation_error",
+                               "run_id is required and cannot be empty")
+        clean_run_id = run_id.strip()
         with self._lock:
-            if bool(self._active_run_id) and self._active_run_id in self._cancel_flags:
+            if clean_run_id in self._cancel_flags or (bool(self._active_run_id) and self._active_run_id in self._cancel_flags):
                 raise AdapterError("conflict", "run has been cancelled")
+            if clean_run_id in self._reports:
+                raise AdapterError("conflict", "run has already reached a terminal state")
             pending = self._pending_approval
             if pending is None or pending.key != proposal_hash:
                 raise AdapterError(
                     "validation_error",
                     "no pending approval for this proposal hash")
+            if pending.run_id != clean_run_id:
+                raise AdapterError("conflict", "run_id does not match the pending review run")
             action = pending.payload.get("proposal_action", "")
+            if proposal_action and isinstance(proposal_action, str) and proposal_action.strip():
+                req_act = proposal_action.strip().upper()
+                if req_act != action.strip().upper():
+                    raise AdapterError(
+                        "validation_error",
+                        f"Action mismatch: request specified '{req_act}' but pending proposal action is '{action}'"
+                    )
             if action != "CREATE" and decision == "approve":
                 raise AdapterError(
                     "validation_error",
@@ -619,7 +675,8 @@ class Launcher:
     def start_run(self, input_text, source_mode="personal_vault",
                   retrieval_mode="lexical", app_language="en",
                   staging_language="en", audit_language="en",
-                  source_type="chat_input", input_id=None):
+                  source_type="chat_input", input_id=None,
+                  resumed_from_run_id="", resumed_from_record_id=""):
         """Begin one bounded text-input run; returns immediately.
 
         Language fields are validated at the boundary and never silently
@@ -668,20 +725,26 @@ class Launcher:
         worker = threading.Thread(
             target=self._run_thread,
             args=(run_id, input_text, source_mode, retrieval_mode,
-                  staging_language, audit_language, source_type, input_id),
+                  staging_language, audit_language, source_type, input_id,
+                  resumed_from_run_id, resumed_from_record_id),
             daemon=True)
         worker.start()
-        return {"run_id": run_id, "accepted": True, "reason": "",
-                "retrieval_mode": retrieval_mode,
-                "app_language": app_language,
-                "staging_language": staging_language,
-                "audit_language": audit_language,
-                "source_type": source_type}
+        res_payload = {"run_id": run_id, "accepted": True, "reason": "",
+                       "retrieval_mode": retrieval_mode,
+                       "app_language": app_language,
+                       "staging_language": staging_language,
+                       "audit_language": audit_language,
+                       "source_type": source_type}
+        if resumed_from_run_id:
+            res_payload["resumed_from_run_id"] = resumed_from_run_id
+        if resumed_from_record_id:
+            res_payload["resumed_from_record_id"] = resumed_from_record_id
+        return res_payload
 
     def _run_thread(self, run_id, input_text, mode_value,
                     retrieval_mode="lexical", staging_language="en",
                     audit_language="en", source_type="chat_input",
-                    input_id=None):
+                    input_id=None, resumed_from_run_id="", resumed_from_record_id=""):
         from src.living_authenticity.knowledge.input.processor import (
             process_input,
             record_input_failure_audit,
@@ -694,235 +757,360 @@ class Launcher:
         )
 
         try:
-            with self._lock:
-                if not self._active_run_id:
-                    self._active_run_id = run_id
-            self._sink({"kind": "run_started", "stage": "input",
-                        "message": "run initiated", "run_id": run_id})
+            from contextlib import nullcontext
+            from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
 
-            if self._cancelled(run_id):
-                self._sink({"kind": "stopped", "stage": "input",
-                            "message": "run cancelled by user request",
-                            "run_id": run_id, "outcome": "STOPPED"})
-                self._sink({"kind": "run_rejected", "stage": "input",
-                            "message": "run cancelled before downstream processing",
-                            "run_id": run_id, "outcome": "STOPPED",
-                            "recovery_options": ["fix_input", "stop"]})
-                cancelled_result = InputEvaluationResult(
-                    outcome=InputOutcome.STOPPED,
-                    valid=False,
-                    can_proceed=False,
-                    input_id=input_id or "inp-cancelled",
-                    run_id=run_id,
-                    source_type=source_type,
-                    operating_mode=mode_value,
-                    validation_status="stopped",
-                    classification_category="cancellation",
-                    reason="run cancelled by user request",
-                    error_code="stopped_by_user",
-                    message_key="ui.recovery.stoppedTitle",
-                    recovery_options=("fix_input", "stop"),
-                )
-                session_audit = self._session_destinations.get("audit", "")
-                authorized_audit = (session_audit.strip() if isinstance(session_audit, str) else "")
-                if not authorized_audit:
-                    authorized_audit = resolve_authorized_audit_root(self.paths())
-                if authorized_audit and Path(authorized_audit).is_dir():
-                    writer = AuditWriter(authorized_audit)
-                    record_input_failure_audit(
-                        writer,
-                        run_id=run_id,
-                        validation_result=cancelled_result,
-                        operating_mode=mode_value,
-                        input_text=input_text,
-                    )
+            auth_ctx = nullcontext()
+            if self._is_test_mode and self._test_authorizer_factory is not None:
+                authorizer = self._test_authorizer_factory(f"run_{run_id}")
+                auth_ctx = authorized_test_mode(authorizer)
+
+            with auth_ctx:
                 with self._lock:
-                    self._reports[run_id] = {
-                        "run_id": run_id,
-                        "accepted": False,
-                        "outcome": "STOPPED",
-                        "reason": "run cancelled by user",
-                        "processed": 0,
-                        "executed": 0,
-                        "held": 0,
-                        "terminal_outcome": "stopped_by_user",
-                    }
-                return
+                    if not self._active_run_id:
+                        self._active_run_id = run_id
+                self._sink({"kind": "run_started", "stage": "input",
+                            "message": "run initiated", "run_id": run_id})
+                if resumed_from_run_id:
+                    self._sink({"kind": "status", "stage": "input", "run_id": run_id,
+                                "resumed_from_run_id": resumed_from_run_id,
+                                "message": f"run resumed from previous paused run {resumed_from_run_id}"})
 
-            self._sink({"kind": "stage_started", "stage": "input",
-                        "message": "validating input and establishing provenance",
-                        "run_id": run_id})
-
-            input_result = process_input(
-                input_text,
-                source_type=source_type,
-                source_mode=mode_value,
-                input_id=input_id,
-                run_id=run_id,
-            )
-
-            prov = input_result.provenance
-            if not input_result.valid or prov is None:
-                reason = input_result.reason or "input validation failed"
-                outcome_str = input_result.outcome.value
-                terminal_outcome = (
-                    "input_clarification_required"
-                    if input_result.outcome == InputOutcome.NEEDS_CLARIFICATION
-                    else "input_validation_failed"
-                )
-
-                self._sink({
-                    "kind": "stopped",
-                    "stage": "input",
-                    "message": f"input validation failed: {reason}",
-                    "run_id": run_id,
-                    "error_code": input_result.error_code,
-                    "outcome": outcome_str,
-                })
-                self._sink({
-                    "kind": "run_rejected",
-                    "stage": "input",
-                    "message": f"input rejected: {reason}",
-                    "run_id": run_id,
-                    "error_code": input_result.error_code,
-                    "outcome": outcome_str,
-                    "recovery_options": list(input_result.recovery_options),
-                })
-
-                session_audit = self._session_destinations.get("audit", "")
-                authorized_audit = (session_audit.strip()
-                                    if isinstance(session_audit, str) else "")
-                if not authorized_audit:
-                    authorized_audit = resolve_authorized_audit_root(self.paths())
-                input_audit_persisted = False
-                if authorized_audit:
-                    try:
+                if self._cancelled(run_id):
+                    self._sink({"kind": "stopped", "stage": "input",
+                                "message": "run cancelled by user request",
+                                "run_id": run_id, "outcome": "STOPPED"})
+                    self._sink({"kind": "run_rejected", "stage": "input",
+                                "message": "run cancelled before downstream processing",
+                                "run_id": run_id, "outcome": "STOPPED",
+                                "recovery_options": ["fix_input", "stop"]})
+                    cancelled_result = InputEvaluationResult(
+                        outcome=InputOutcome.STOPPED,
+                        valid=False,
+                        can_proceed=False,
+                        input_id=input_id or "inp-cancelled",
+                        run_id=run_id,
+                        source_type=source_type,
+                        operating_mode=mode_value,
+                        validation_status="stopped",
+                        classification_category="cancellation",
+                        reason="run cancelled by user request",
+                        error_code="stopped_by_user",
+                        message_key="ui.recovery.stoppedTitle",
+                        recovery_options=("fix_input", "stop"),
+                    )
+                    session_audit = self._session_destinations.get("audit", "")
+                    authorized_audit = (session_audit.strip() if isinstance(session_audit, str) else "")
+                    if not authorized_audit:
+                        authorized_audit = resolve_authorized_audit_root(self.paths())
+                    if authorized_audit and Path(authorized_audit).is_dir():
                         writer = AuditWriter(authorized_audit)
                         record_input_failure_audit(
                             writer,
                             run_id=run_id,
-                            validation_result=input_result,
+                            validation_result=cancelled_result,
                             operating_mode=mode_value,
                             input_text=input_text,
+                            resumed_from_run_id=resumed_from_run_id,
                         )
-                        input_audit_persisted = True
-                    except Exception:
-                        input_audit_persisted = False
+                    with self._lock:
+                        self._reports[run_id] = {
+                            "run_id": run_id,
+                            "accepted": False,
+                            "outcome": "STOPPED",
+                            "reason": "run cancelled by user",
+                            "processed": 0,
+                            "executed": 0,
+                            "held": 0,
+                            "terminal_outcome": "stopped_by_user",
+                        }
+                    return
 
-                with self._lock:
-                    self._reports[run_id] = {
-                        "run_id": run_id,
-                        "accepted": False,
-                        "outcome": outcome_str,
-                        "reason": reason,
-                        "error_code": input_result.error_code,
-                        "message_key": input_result.message_key,
-                        "recovery_options": list(input_result.recovery_options),
-                        "processed": 0,
-                        "executed": 0,
-                        "held": 0,
-                        "audit_persisted": input_audit_persisted,
-                        "terminal_outcome": terminal_outcome,
-                    }
-                return
+                self._sink({"kind": "stage_started", "stage": "input",
+                            "message": "validating input and establishing provenance",
+                            "run_id": run_id})
 
-            if self._cancelled(run_id):
-                self._sink({"kind": "stopped", "stage": "input",
-                            "message": "run cancelled by user after validation",
-                            "run_id": run_id, "outcome": "STOPPED"})
-                self._sink({"kind": "run_rejected", "stage": "input",
-                            "message": "run stopped by user",
-                            "run_id": run_id, "outcome": "STOPPED",
-                            "recovery_options": ["fix_input", "stop"]})
-                cancelled_result = InputEvaluationResult(
-                    outcome=InputOutcome.STOPPED,
-                    valid=False,
-                    can_proceed=False,
-                    input_id=prov.input_id,
-                    run_id=run_id,
+                input_result = process_input(
+                    input_text,
                     source_type=source_type,
-                    operating_mode=mode_value,
-                    content_hash=prov.input_hash,
-                    validation_status="stopped",
-                    classification_category="cancellation",
-                    reason="run cancelled by user after validation",
-                    error_code="stopped_by_user",
-                    message_key="ui.recovery.stoppedTitle",
-                    recovery_options=("fix_input", "stop"),
+                    source_mode=mode_value,
+                    input_id=input_id,
+                    run_id=run_id,
                 )
-                session_audit = self._session_destinations.get("audit", "")
-                authorized_audit = (session_audit.strip() if isinstance(session_audit, str) else "")
-                if not authorized_audit:
-                    authorized_audit = resolve_authorized_audit_root(self.paths())
-                if authorized_audit and Path(authorized_audit).is_dir():
-                    writer = AuditWriter(authorized_audit)
-                    record_input_failure_audit(
-                        writer,
-                        run_id=run_id,
-                        validation_result=cancelled_result,
-                        operating_mode=mode_value,
-                        input_text=input_text,
+
+                prov = input_result.provenance
+                if not input_result.valid or prov is None:
+                    reason = input_result.reason or "input validation failed"
+                    outcome_str = input_result.outcome.value
+                    terminal_outcome = (
+                        "input_clarification_required"
+                        if input_result.outcome == InputOutcome.NEEDS_CLARIFICATION
+                        else "input_validation_failed"
                     )
+
+                    self._sink({
+                        "kind": "stopped",
+                        "stage": "input",
+                        "message": f"input validation failed: {reason}",
+                        "run_id": run_id,
+                        "error_code": input_result.error_code,
+                        "outcome": outcome_str,
+                    })
+                    self._sink({
+                        "kind": "run_rejected",
+                        "stage": "input",
+                        "message": f"input rejected: {reason}",
+                        "run_id": run_id,
+                        "error_code": input_result.error_code,
+                        "outcome": outcome_str,
+                        "recovery_options": list(input_result.recovery_options),
+                    })
+
+                    session_audit = self._session_destinations.get("audit", "")
+                    authorized_audit = (session_audit.strip()
+                                        if isinstance(session_audit, str) else "")
+                    if not authorized_audit:
+                        authorized_audit = resolve_authorized_audit_root(self.paths())
+                    input_audit_persisted = False
+                    if authorized_audit:
+                        try:
+                            writer = AuditWriter(authorized_audit)
+                            record_input_failure_audit(
+                                writer,
+                                run_id=run_id,
+                                validation_result=input_result,
+                                operating_mode=mode_value,
+                                input_text=input_text,
+                                resumed_from_run_id=resumed_from_run_id,
+                            )
+                            input_audit_persisted = True
+                        except Exception:
+                            input_audit_persisted = False
+
+                    if input_audit_persisted:
+                        self._sink({
+                            "kind": "audit_persisted",
+                            "stage": "audit",
+                            "run_id": run_id,
+                            "message": f"input validation audit persisted ({terminal_outcome})",
+                            "audit_mode": "normal",
+                            "audit_partition": "failed",
+                            "audit_partitions": ["failed"],
+                        })
+                    else:
+                        self._sink({
+                            "kind": "audit_failed",
+                            "stage": "audit",
+                            "run_id": run_id,
+                            "message": "input validation audit persistence failed",
+                            "audit_mode": "unconfigured" if not authorized_audit else "failed",
+                            "audit_partition": "failed",
+                        })
+
+                    with self._lock:
+                        self._reports[run_id] = {
+                            "run_id": run_id,
+                            "accepted": False,
+                            "outcome": outcome_str,
+                            "reason": reason,
+                            "error_code": input_result.error_code,
+                            "message_key": input_result.message_key,
+                            "recovery_options": list(input_result.recovery_options),
+                            "processed": 0,
+                            "executed": 0,
+                            "held": 0,
+                            "audit_persisted": input_audit_persisted,
+                            "terminal_outcome": terminal_outcome,
+                        }
+                    return
+
+                if self._cancelled(run_id):
+                    self._sink({"kind": "stopped", "stage": "input",
+                                "message": "run cancelled by user after validation",
+                                "run_id": run_id, "outcome": "STOPPED"})
+                    self._sink({"kind": "run_rejected", "stage": "input",
+                                "message": "run stopped by user",
+                                "run_id": run_id, "outcome": "STOPPED",
+                                "recovery_options": ["fix_input", "stop"]})
+                    cancelled_result = InputEvaluationResult(
+                        outcome=InputOutcome.STOPPED,
+                        valid=False,
+                        can_proceed=False,
+                        input_id=prov.input_id,
+                        run_id=run_id,
+                        source_type=source_type,
+                        operating_mode=mode_value,
+                        content_hash=prov.input_hash,
+                        validation_status="stopped",
+                        classification_category="cancellation",
+                        reason="run cancelled by user after validation",
+                        error_code="stopped_by_user",
+                        message_key="ui.recovery.stoppedTitle",
+                        recovery_options=("fix_input", "stop"),
+                    )
+                    session_audit = self._session_destinations.get("audit", "")
+                    authorized_audit = (session_audit.strip() if isinstance(session_audit, str) else "")
+                    if not authorized_audit:
+                        authorized_audit = resolve_authorized_audit_root(self.paths())
+                    if authorized_audit and Path(authorized_audit).is_dir():
+                        writer = AuditWriter(authorized_audit)
+                        record_input_failure_audit(
+                            writer,
+                            run_id=run_id,
+                            validation_result=cancelled_result,
+                            operating_mode=mode_value,
+                            input_text=input_text,
+                            resumed_from_run_id=resumed_from_run_id,
+                        )
+                    with self._lock:
+                        self._reports[run_id] = {
+                            "run_id": run_id,
+                            "accepted": False,
+                            "outcome": "STOPPED",
+                            "reason": "run cancelled by user",
+                            "processed": 0,
+                            "executed": 0,
+                            "held": 0,
+                            "terminal_outcome": "stopped_by_user",
+                        }
+                    return
+
+                self._sink({"kind": "stage_completed", "stage": "input",
+                            "message": f"input accepted (id={prov.input_id}, type={prov.resolved_type}, bytes={prov.byte_length})",
+                            "run_id": run_id,
+                            "input_id": prov.input_id,
+                            "input_hash": prov.input_hash,
+                            "outcome": "ACCEPTED"})
+
+                report = self._execute_run(
+                    run_id, input_text, mode_value,
+                    retrieval_mode=retrieval_mode,
+                    staging_language=staging_language,
+                    audit_language=audit_language,
+                    input_provenance=prov,
+                    resumed_from_run_id=resumed_from_run_id,
+                    resumed_from_record_id=resumed_from_record_id,
+                )
+                summary = self._report_summary(report)
+                summary["run_id"] = run_id
                 with self._lock:
-                    self._reports[run_id] = {
-                        "run_id": run_id,
-                        "accepted": False,
-                        "outcome": "STOPPED",
-                        "reason": "run cancelled by user",
-                        "processed": 0,
-                        "executed": 0,
-                        "held": 0,
-                        "terminal_outcome": "stopped_by_user",
-                    }
-                return
-
-            self._sink({"kind": "stage_completed", "stage": "input",
-                        "message": f"input accepted (id={prov.input_id}, type={prov.resolved_type}, bytes={prov.byte_length})",
-                        "run_id": run_id,
-                        "input_id": prov.input_id,
-                        "input_hash": prov.input_hash,
-                        "outcome": "ACCEPTED"})
-
-            report = self._execute_run(
-                run_id, input_text, mode_value,
-                retrieval_mode=retrieval_mode,
-                staging_language=staging_language,
-                audit_language=audit_language,
-                input_provenance=prov,
-            )
-            summary = self._report_summary(report)
-            with self._lock:
-                sync_info = self._vault_sync_run_info.pop(run_id, None)
-                if sync_info is not None:
-                    summary["vault_sync"] = sync_info
-                self._reports[run_id] = summary
-            if summary.get("audit_warning"):
-                self._sink({"kind": "warning", "stage": "audit",
-                            "message": summary["audit_warning"]})
-            self._sink({"kind": "run_completed", "stage": "",
-                        "message": "run finished" + (" (with audit warnings)" if summary.get("audit_warning") else "")})
+                    sync_info = self._vault_sync_run_info.pop(run_id, None)
+                    if sync_info is not None:
+                        summary["vault_sync"] = sync_info
+                    self._reports[run_id] = summary
+                if summary.get("audit_warning"):
+                    self._sink({"kind": "warning", "stage": "audit",
+                                "message": summary["audit_warning"]})
+                self._sink({"kind": "run_completed", "stage": "",
+                            "message": "run finished" + (" (with audit warnings)" if summary.get("audit_warning") else "")})
         except Exception as exc:  # bounded; never leaks a raw traceback
+            from src.living_authenticity.security.diagnostic import (
+                safe_exception_diagnostic,
+            )
+            safe_stop_reason, safe_errors = safe_exception_diagnostic(
+                exc, stage="infrastructure", category="operational_error"
+            )
+            session_audit = self._session_destinations.get("audit", "")
+            authorized_audit = (session_audit.strip()
+                                if isinstance(session_audit, str) else "")
+            if not authorized_audit:
+                authorized_audit = resolve_authorized_audit_root(self.paths())
+
+            audit_persisted = False
+            error_rec_id = ""
+            if authorized_audit and Path(authorized_audit).is_dir():
+                try:
+                    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+                    from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+                    from src.living_authenticity.knowledge.governance.audit.persistence import (
+                        validate_persistence_receipt,
+                    )
+                    writer = AuditWriter(authorized_audit)
+                    rec = AuditRecord(
+                        run_id=run_id,
+                        operating_mode=mode_value,
+                        terminal_outcome="infrastructure_error",
+                        validation_result="FAILED",
+                        stop_reason=safe_stop_reason,
+                        errors=safe_errors,
+                        resumed_from_run_id=resumed_from_run_id,
+                        resumed_from_record_id=resumed_from_record_id,
+                    )
+                    receipt = writer.append(rec)
+                    is_valid, _ = validate_persistence_receipt(
+                        receipt,
+                        expected_record_id=rec.record_id or None,
+                    )
+                    if is_valid and receipt.get("persisted") is True:
+                        error_rec_id = receipt.get("record_id", "")
+                        audit_persisted = True
+                    else:
+                        audit_persisted = False
+                except Exception:
+                    audit_persisted = False
+
+            if audit_persisted:
+                self._sink({
+                    "kind": "audit_persisted",
+                    "stage": "audit",
+                    "run_id": run_id,
+                    "message": f"operational error audit persisted ({type(exc).__name__})",
+                    "audit_mode": "normal",
+                    "audit_partition": "errors",
+                    "audit_partitions": ["errors"],
+                })
+            else:
+                self._sink({
+                    "kind": "audit_failed",
+                    "stage": "audit",
+                    "run_id": run_id,
+                    "message": "operational error audit persistence failed",
+                    "audit_mode": "unconfigured" if not authorized_audit else "failed",
+                    "audit_partition": "errors",
+                })
+
             with self._lock:
                 existing = self._reports.get(run_id, {})
-                rep = {"run_id": run_id, "error": type(exc).__name__}
-                if "outcome" in existing:
-                    rep["outcome"] = existing["outcome"]
-                if "reason" in existing:
-                    rep["reason"] = existing["reason"]
-                if "terminal_outcome" in existing:
-                    rep["terminal_outcome"] = existing["terminal_outcome"]
+                rep = {
+                    "run_id": run_id,
+                    "error": type(exc).__name__,
+                    "outcome": existing.get("outcome", "FAILED"),
+                    "reason": safe_stop_reason,
+                    "terminal_outcome": existing.get("terminal_outcome", "infrastructure_error"),
+                    "audit_persisted": audit_persisted,
+                    "processed": 0,
+                    "executed": 0,
+                    "held": 0,
+                }
+                if resumed_from_run_id:
+                    rep["resumed_from_run_id"] = resumed_from_run_id
+                if resumed_from_record_id:
+                    rep["resumed_from_record_id"] = resumed_from_record_id
                 self._reports[run_id] = rep
                 self._paused_run = {
                     "run_id": run_id,
+                    "error_record_id": error_rec_id,
                     "input_text": input_text,
                     "source_mode": mode_value,
                     "retrieval_mode": retrieval_mode,
                     "error": type(exc).__name__,
-                    "error_message": str(exc),
+                    "error_message": safe_stop_reason,
                     "timestamp": _utcnow(),
                 }
-            self._sink({"kind": "run_rejected", "stage": "paused",
-                        "message": "run paused on error: " + (str(exc) or type(exc).__name__)})
+                if resumed_from_run_id:
+                    self._paused_run["resumed_from_run_id"] = resumed_from_run_id
+                if resumed_from_record_id:
+                    self._paused_run["resumed_from_record_id"] = resumed_from_record_id
+
+            self._sink({
+                "kind": "run_rejected",
+                "stage": "paused",
+                "run_id": run_id,
+                "message": f"run paused on error: {safe_stop_reason}",
+                "outcome": "FAILED",
+                "terminal_outcome": "infrastructure_error",
+                "recovery_options": ["fix_input", "stop"],
+            })
         finally:
             with self._lock:
                 if self._pending_approval and getattr(self._pending_approval, "run_id", "") == run_id:
@@ -1129,15 +1317,52 @@ class Launcher:
         elif not has_audits and len(units) > 0:
             audit_warning = "No audit records were constructed or persisted for this run."
 
+        has_emergency = any(isinstance(r, dict) and r.get("emergency") for r in receipts)
+        if has_emergency and not audit_warning:
+            audit_warning = (
+                "Primary audit persistence failed; durable emergency operational record "
+                "written to errors partition (audit_emergency.jsonl)."
+            )
+
+        audit_status = (
+            "emergency_persisted"
+            if has_emergency
+            else ("persistence_failed" if not audit_persisted else "normal_persisted")
+        )
+        audit_mode = (
+            "emergency"
+            if has_emergency
+            else ("failed" if not audit_persisted else "normal")
+        )
+
+        run_outcome = str(getattr(report, "run_outcome", ""))
+        accepted = bool(getattr(report, "accepted", False))
+        is_terminal_success = bool(accepted and run_outcome == "full_success")
         return {
             "run_id": "",
-            "accepted": bool(getattr(report, "accepted", False)),
+            "accepted": accepted,
             "reason": str(getattr(report, "rejection_reason", "")),
+            "rejection_check": str(getattr(report, "rejection_check", "")),
             "processed": int(getattr(report, "files_processed", 0)),
             "executed": executed_count,
             "held": held_count,
             "audit_persisted": audit_persisted,
             "audit_warning": audit_warning,
+            "audit_status": audit_status,
+            "audit_mode": audit_mode,
+            "run_outcome": run_outcome,
+            "is_terminal_success": is_terminal_success,
+            "files_seen": int(getattr(report, "files_seen", 0)),
+            "files_failed": int(getattr(report, "files_failed", 0)),
+            "files_failed_operational": int(getattr(report, "files_failed_operational", 0)),
+            "files_failed_validation": int(getattr(report, "files_failed_validation", 0)),
+            "files_skipped": int(getattr(report, "files_skipped", 0)),
+            "units_attempted": int(getattr(report, "units_attempted", len(units))),
+            "units_cancelled": sum(1 for u in units if getattr(u, "outcome", "") == "cancelled"),
+            "units_failed_operational": int(getattr(report, "units_failed_operational", 0)),
+            "recoverable_errors": int(getattr(report, "recoverable_errors", 0)),
+            "resumed_from_run_id": str(getattr(report, "resumed_from_run_id", "")),
+            "resumed_from_record_id": str(getattr(report, "resumed_from_record_id", "")),
         }
 
     def run_status(self, run_id):
@@ -1253,11 +1478,33 @@ class Launcher:
                 f"({len(vault_units)} vault unit(s), {len(core_units)} core unit(s), {vault_files} file(s) discovered, {vault_skipped} skipped)"
             ),
         })
+        if not core_units:
+            core_folder_name = Path(core_root).name if core_root else "01 Core"
+            self._sink({
+                "kind": "status",
+                "stage": "retrieval",
+                "run_id": run_id,
+                "message": (
+                    f"Vault Mode: no approved Core units found in the vault's Core directory ('{core_folder_name}'); "
+                    "proposals will transparently require human review (NEEDS_REVIEW) without automated assumptions."
+                ),
+            })
+        if vault_skipped > 0:
+            self._sink({
+                "kind": "status",
+                "stage": "retrieval",
+                "run_id": run_id,
+                "message": (
+                    f"Vault note discovery: {vault_files} note(s) included, "
+                    f"{vault_skipped} item(s) excluded (.obsidian/system folders, non-markdown files, unreadable, or oversized)."
+                ),
+            })
         return list(vault_units), core_units, vault_context
 
     def _execute_run(self, run_id, input_text, mode_value,
                      retrieval_mode="lexical", staging_language="en",
-                     audit_language="en", input_provenance=None):
+                     audit_language="en", input_provenance=None,
+                     resumed_from_run_id="", resumed_from_record_id=""):
         from src.living_authenticity.knowledge import integration as _integration
         from src.living_authenticity.knowledge.integration.guard import (
             resolve_authorized_audit_failed,
@@ -1416,6 +1663,12 @@ class Launcher:
                                 try:
                                     reconcile_res = self._vault_sync_session.reconcile()
                                 except Exception as exc:
+                                    from src.living_authenticity.security.diagnostic import (
+                                        safe_exception_diagnostic,
+                                    )
+                                    safe_reason, safe_errs = safe_exception_diagnostic(
+                                        exc, stage="synchronization", category="operational_error"
+                                    )
                                     session_audit = self._session_destinations.get("audit", "")
                                     auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
                                     if not auth_audit:
@@ -1430,8 +1683,10 @@ class Launcher:
                                             vault_id=active_vault_id,
                                             terminal_outcome="infrastructure_error",
                                             validation_result="FAILED",
-                                            stop_reason=str(exc),
-                                            errors=(str(exc),),
+                                            stop_reason=safe_reason,
+                                            errors=safe_errs,
+                                            resumed_from_run_id=resumed_from_run_id,
+                                            resumed_from_record_id=resumed_from_record_id,
                                         )
                                         writer.append(rec)
                                     with self._lock:
@@ -1439,7 +1694,7 @@ class Launcher:
                                             "run_id": run_id,
                                             "accepted": False,
                                             "outcome": "FAILED",
-                                            "reason": f"Vault vector index reconciliation failed: {exc}",
+                                            "reason": f"Vault vector index reconciliation failed: {safe_reason}",
                                             "processed": 0,
                                             "executed": 0,
                                             "held": 0,
@@ -1447,11 +1702,17 @@ class Launcher:
                                         }
                                     raise AdapterError(
                                         "validation_error",
-                                        f"Vault vector index reconciliation failed: {exc}",
+                                        f"Vault vector index reconciliation failed: {safe_reason}",
                                     ) from exc
 
                                 if not reconcile_res.get("fresh", False):
-                                    err_msg = reconcile_res.get("error") or "reconciliation failed to produce a fresh index"
+                                    from src.living_authenticity.security.diagnostic import (
+                                        safe_exception_diagnostic,
+                                    )
+                                    raw_err = reconcile_res.get("error") or "reconciliation failed to produce a fresh index"
+                                    safe_reason, safe_errs = safe_exception_diagnostic(
+                                        raw_err, stage="synchronization", category="operational_error"
+                                    )
                                     session_audit = self._session_destinations.get("audit", "")
                                     auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
                                     if not auth_audit:
@@ -1466,8 +1727,10 @@ class Launcher:
                                             vault_id=active_vault_id,
                                             terminal_outcome="infrastructure_error",
                                             validation_result="FAILED",
-                                            stop_reason=err_msg,
-                                            errors=(err_msg,),
+                                            stop_reason=safe_reason,
+                                            errors=safe_errs,
+                                            resumed_from_run_id=resumed_from_run_id,
+                                            resumed_from_record_id=resumed_from_record_id,
                                         )
                                         writer.append(rec)
                                     with self._lock:
@@ -1475,7 +1738,7 @@ class Launcher:
                                             "run_id": run_id,
                                             "accepted": False,
                                             "outcome": "FAILED",
-                                            "reason": f"Vault vector index is not fresh: {err_msg}",
+                                            "reason": f"Vault vector index is not fresh: {safe_reason}",
                                             "processed": 0,
                                             "executed": 0,
                                             "held": 0,
@@ -1483,7 +1746,7 @@ class Launcher:
                                         }
                                     raise AdapterError(
                                         "validation_error",
-                                        f"Vault vector index is not fresh: {err_msg}",
+                                        f"Vault vector index is not fresh: {safe_reason}",
                                     )
 
                                 if self._cancelled(run_id):
@@ -1516,6 +1779,7 @@ class Launcher:
                                     terminal_outcome="sync_rejected_by_user",
                                     validation_result="STOPPED",
                                     stop_reason="Vault synchronization rejected by human operator",
+                                    resumed_from_run_id=resumed_from_run_id,
                                 )
                                 writer.append(rec)
                             with self._lock:
@@ -1562,6 +1826,7 @@ class Launcher:
                                     terminal_outcome="stopped_by_user",
                                     validation_result="STOPPED",
                                     stop_reason="run cancelled by user request",
+                                    resumed_from_run_id=resumed_from_run_id,
                                 )
                                 writer.append(rec)
                             with self._lock:
@@ -1838,12 +2103,18 @@ class Launcher:
                 run_id=run_id,
                 event_sink=self._sink,
                 operating_mode=mode_value,
+                allow_test_output=self._is_test_mode,
                 audit_root=authorized_audit,
                 authorized_audit_root=authorized_audit,
                 authorized_audit_passed=authorized_passed,
                 authorized_audit_failed=authorized_failed,
                 guarded_roots=resolve_guarded_roots(paths),
                 should_cancel=lambda: self._cancelled(run_id),
+                staging_language=staging_language,
+                audit_language=audit_language,
+                resumed_from_run_id=resumed_from_run_id,
+                resumed_from_record_id=resumed_from_record_id,
+                recoverable_errors=1 if bool(resumed_from_run_id) else 0,
             )
             with self._lock:
                 self._vault_sync_run_info[run_id] = {
@@ -2167,7 +2438,16 @@ class Launcher:
         status, path, reason = choose(canonical)
         if status != STATUS_CONFIGURED:
             return (status, "", reason)
-        result = validate_purpose(canonical, path, self.paths())
+        from contextlib import nullcontext
+        from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
+
+        auth_ctx = nullcontext()
+        if self._is_test_mode and self._test_authorizer_factory is not None:
+            authorizer = self._test_authorizer_factory(f"pick_folder_{canonical}")
+            auth_ctx = authorized_test_mode(authorizer)
+
+        with auth_ctx:
+            result = validate_purpose(canonical, path, self.paths(), allow_test_output=self._is_test_mode)
         if (result[0] == STATUS_CONFIGURED
                 and isinstance(path, str) and path.strip()):
             clean_path = path.strip()
@@ -2479,14 +2759,20 @@ class Launcher:
         d["source_text"] = text
         return d
 
-    def accept_proposal(self, run_id: str = "", proposal_hash: str = "") -> dict:
+    def accept_proposal(self, run_id: str = "", proposal_hash: str = "",
+                        proposal_action: str = "") -> dict:
         """Acknowledge and accept a non-actionable proposal (NEEDS_REVIEW / DO_NOT_IMPORT / non-CREATE).
 
+        Requires a valid, nonempty run_id matching the active pending review.
         Requires a valid, nonempty proposal_hash matching the active pending review.
         Preserves non-executability, rejects CREATE actions, and deterministically
         rejects stale, duplicate, or mismatched requests without state mutation.
         """
         import string
+
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AdapterError("validation_error", "run_id is required and cannot be empty")
+        clean_run_id = run_id.strip()
 
         if not isinstance(proposal_hash, str) or not proposal_hash.strip():
             raise AdapterError("validation_error", "proposal_hash is required and cannot be empty")
@@ -2494,19 +2780,16 @@ class Launcher:
         if len(clean_hash) != 64 or not all(c in string.hexdigits for c in clean_hash):
             raise AdapterError("validation_error", "proposal_hash must be a valid 64-character hexadecimal hash")
 
-        clean_run_id = run_id.strip() if isinstance(run_id, str) else ""
-
         with self._lock:
             # Active cancel check
-            if bool(self._active_run_id) and self._active_run_id in self._cancel_flags:
+            if clean_run_id in self._cancel_flags or (bool(self._active_run_id) and self._active_run_id in self._cancel_flags):
                 raise AdapterError("conflict", "run has been cancelled")
+
+            if clean_run_id in self._reports:
+                raise AdapterError("conflict", "run has already reached a terminal state")
 
             pending = self._pending_approval
             if pending is None:
-                if clean_run_id and clean_run_id in self._reports:
-                    raise AdapterError("conflict", "run has already reached a terminal state")
-                if clean_run_id:
-                    raise AdapterError("conflict", "no pending review for this run")
                 raise AdapterError("validation_error", "no pending review awaiting acknowledgment")
 
             # Check if pending request is already terminal/cancelled/timed out
@@ -2518,16 +2801,25 @@ class Launcher:
             if pending_state != ApprovalState.PENDING:
                 raise AdapterError("conflict", "review already answered or not in pending state")
 
+            # Validate exact run_id match
+            if pending.run_id != clean_run_id:
+                raise AdapterError("conflict", "run_id does not match the pending review run")
+
             # Validate proposal hash match (exact identity)
             if pending.key.lower() != clean_hash:
                 raise AdapterError("validation_error", "proposal_hash does not match the active proposal")
 
-            # Validate run_id if supplied
-            if clean_run_id and pending.run_id and pending.run_id != clean_run_id:
-                raise AdapterError("conflict", "run_id does not match the pending review run")
+            # Validate action consistency if supplied
+            action = pending.payload.get("proposal_action", "")
+            if proposal_action and isinstance(proposal_action, str) and proposal_action.strip():
+                req_act = proposal_action.strip().upper()
+                if req_act != action.strip().upper():
+                    raise AdapterError(
+                        "validation_error",
+                        f"Action mismatch: request specified '{req_act}' but pending proposal action is '{action}'"
+                    )
 
             # Keep acknowledgment distinct from approval: CREATE cannot be accepted via accept_proposal
-            action = pending.payload.get("proposal_action", "")
             if action == "CREATE":
                 raise AdapterError(
                     "validation_error",
@@ -2539,7 +2831,7 @@ class Launcher:
                 raise AdapterError("conflict", "review already answered or not in pending state")
 
             prop_hash = pending.key
-            assigned_run_id = clean_run_id or pending.run_id
+            assigned_run_id = clean_run_id
             self._pending_approval = None
 
             self._sink({
@@ -2568,13 +2860,34 @@ class Launcher:
         retrieval_mode: str | None = None,
     ) -> dict:
         """Fix input or config for a paused/errored run and restart it."""
+        from src.living_authenticity.knowledge.analysis.retrieval.strategy import (
+            RetrievalStrategyRegistry,
+            UnsupportedStrategyError,
+        )
+
         with self._lock:
             paused = self._paused_run
             if not paused or (run_id and paused.get("run_id") != run_id):
                 raise AdapterError("validation_error", "no paused run matching run_id")
+            prev_run_id = paused.get("run_id", "") or run_id
+            prev_record_id = paused.get("error_record_id", "")
             text = input_text if input_text is not None else paused.get("input_text", "")
             src_mode = source_mode if source_mode is not None else paused.get("source_mode", self._active_source_mode)
             ret_mode = retrieval_mode if retrieval_mode is not None else paused.get("retrieval_mode", self._active_retrieval_mode)
+
+            # Pre-validate before clearing paused state to preserve run on invalid corrections
+            if not isinstance(text, str) or not text.strip():
+                raise AdapterError("validation_error", "input_text is required and cannot be empty")
+            if src_mode not in SOURCE_MODES:
+                raise AdapterError(
+                    "validation_error",
+                    "source_mode must be one of: " + ", ".join(SOURCE_MODES))
+            try:
+                strategy_defn = RetrievalStrategyRegistry().validate(ret_mode)
+                ret_mode = strategy_defn.name
+            except UnsupportedStrategyError as exc:
+                raise AdapterError("validation_error", str(exc))
+
             self._paused_run = None
 
         return self.start_run(
@@ -2584,21 +2897,107 @@ class Launcher:
             app_language=self._app_language,
             staging_language=self._staging_language,
             audit_language=self._audit_language,
+            resumed_from_run_id=prev_run_id,
+            resumed_from_record_id=prev_record_id,
         )
 
     def stop_paused_run(self, run_id: str = "") -> dict:
         """Stop and cleanly terminate a paused/errored run."""
+        from src.living_authenticity.knowledge.governance.audit import AuditWriter
+        from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+        from src.living_authenticity.knowledge.integration.guard import (
+            resolve_authorized_audit_root,
+        )
+
         with self._lock:
             paused = self._paused_run
-            if paused and (not run_id or paused.get("run_id") == run_id):
-                self._paused_run = None
-                self._sink({
-                    "kind": "stopped",
-                    "stage": "",
-                    "message": "paused run stopped by user",
-                })
-                return {"stopped": True, "run_id": run_id or paused.get("run_id", "")}
-        return {"stopped": True, "run_id": run_id}
+            if not paused or (run_id and paused.get("run_id") != run_id):
+                return {"stopped": True, "run_id": run_id}
+            target_run_id = paused.get("run_id", "") or run_id
+            self._paused_run = None
+
+        session_audit = self._session_destinations.get("audit", "")
+        auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+        if not auth_audit:
+            auth_audit = resolve_authorized_audit_root(self.paths())
+
+        audit_persisted = False
+        receipt = None
+        if auth_audit and Path(auth_audit).is_dir():
+            try:
+                from src.living_authenticity.knowledge.governance.audit.persistence import (
+                    validate_persistence_receipt,
+                )
+                from src.living_authenticity.security.diagnostic import (
+                    sanitize_diagnostic_text,
+                )
+                safe_err_msg = sanitize_diagnostic_text(paused.get("error_message", ""))
+                writer = AuditWriter(auth_audit)
+                rec = AuditRecord(
+                    run_id=target_run_id,
+                    operating_mode=paused.get("source_mode", self._active_source_mode),
+                    terminal_outcome="stopped_by_user",
+                    validation_result="STOPPED",
+                    stop_reason="paused run stopped by user",
+                    errors=(f"Paused on {paused.get('error', 'Error')}: {safe_err_msg}",) if safe_err_msg else ("paused run stopped by user",),
+                    resumed_from_run_id=paused.get("resumed_from_run_id", ""),
+                    resumed_from_record_id=paused.get("error_record_id", ""),
+                )
+                receipt = writer.append(rec)
+                is_valid, _ = validate_persistence_receipt(
+                    receipt,
+                    expected_record_id=rec.record_id or None,
+                )
+                audit_persisted = bool(is_valid and receipt.get("persisted") is True)
+            except Exception:
+                audit_persisted = False
+
+        partition = "failed"
+        if audit_persisted and isinstance(receipt, dict):
+            partition = receipt.get("partition", "failed")
+
+        if audit_persisted:
+            self._sink({
+                "kind": "audit_persisted",
+                "stage": "audit",
+                "run_id": target_run_id,
+                "message": f"paused run termination audit persisted ({partition} partition)",
+                "audit_mode": "normal",
+                "audit_partition": partition,
+                "audit_partitions": [partition],
+            })
+        else:
+            self._sink({
+                "kind": "audit_failed",
+                "stage": "audit",
+                "run_id": target_run_id,
+                "message": "paused run termination audit persistence failed",
+                "audit_mode": "unconfigured" if not auth_audit else "failed",
+                "audit_partition": partition,
+            })
+
+        with self._lock:
+            self._reports[target_run_id] = {
+                "run_id": target_run_id,
+                "accepted": False,
+                "outcome": "STOPPED",
+                "reason": "paused run stopped by user",
+                "processed": 0,
+                "executed": 0,
+                "held": 0,
+                "terminal_outcome": "stopped_by_user",
+                "audit_persisted": audit_persisted,
+            }
+
+        self._sink({
+            "kind": "stopped",
+            "stage": "recovery",
+            "run_id": target_run_id,
+            "message": "paused run stopped by user",
+            "outcome": "STOPPED",
+            "terminal_outcome": "stopped_by_user",
+        })
+        return {"stopped": True, "run_id": target_run_id, "terminal_outcome": "stopped_by_user"}
 
     def reveal_folder(self, purpose: str) -> dict:
         """List files in the synced directory for the given purpose without leaking secrets."""

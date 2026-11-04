@@ -56,6 +56,7 @@ export interface RunRequest {
   audit_language: "en" | "fa";
   source_type?: string;
   input_id?: string;
+  resumed_from_run_id?: string;
 }
 
 /** @category transport — POST /api/run response */
@@ -67,6 +68,7 @@ export interface RunResponse {
   retrieval_mode?: "lexical" | "semantic" | "hybrid";
   source_type?: string;
   input_id?: string;
+  resumed_from_run_id?: string;
 }
 
 /** @category transport — POST /api/approve */
@@ -75,6 +77,8 @@ export interface ApproveRequest {
   query_unit_id: string;
   /** Explicit UI decision; maps to backend y/yes-equivalent semantics. */
   decision: "approve" | "reject";
+  run_id: string;
+  proposal_action?: string;
 }
 
 /** @category transport — POST /api/approve response */
@@ -301,7 +305,8 @@ export interface VaultSyncStatusResponse {
 /** @category transport — POST /api/run/accept request */
 export interface AcceptProposalRequest {
   proposal_hash: string;
-  run_id?: string;
+  run_id: string;
+  proposal_action?: string;
 }
 
 /** @category transport — POST /api/run/accept */
@@ -335,7 +340,9 @@ export type RunEventKind =
   | "revalidation_result"
   | "execution_result"
   | "completed"
-  | "sync_approval_required";
+  | "sync_approval_required"
+  | "audit_persisted"
+  | "audit_failed";
 
 /** @category transport */
 export interface RunEvent {
@@ -359,6 +366,7 @@ export interface RunEvent {
   error_code?: string;
   recovery_options?: string[];
   input_id?: string;
+  resumed_from_run_id?: string;
   input_hash?: string;
   vault_id?: string;
   diff?: VaultChangeDiff;
@@ -366,4 +374,25 @@ export interface RunEvent {
   reason?: string;
   status?: string;
   phase?: "started" | "completed" | "failed" | "cancelled" | "stopped";
+  destination?: string;
+  evidence?: string[];
+  provenance?: string[];
+  uncertainties?: string[];
+  is_executable?: boolean;
+  audit_mode?: "normal" | "emergency" | "failed" | "unconfigured";
+  audit_partition?: "passed" | "failed" | "errors" | "mixed";
+  audit_partitions?: string[];
+  record_id?: string;
+  durability?: string;
+  source_file?: string;
+  run_outcome?: string;
+  files_seen?: number;
+  files_failed?: number;
+  files_failed_operational?: number;
+  files_failed_validation?: number;
+  files_skipped?: number;
+  units_attempted?: number;
+  units_cancelled?: number;
+  units_failed_operational?: number;
+  recoverable_errors?: number;
 }

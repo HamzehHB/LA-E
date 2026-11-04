@@ -16,17 +16,21 @@ def _write(directory, name, text=SAMPLE):
     return target
 
 
-def _run(source, staging, spy=None):
+def _run(source, staging, spy=None, audit_root=None):
     cores = [_core()]
     synthesis = SyntheticSynthesis()
+    if audit_root is None:
+        audit_root = str(Path(staging).parent / "audit")
+        Path(audit_root).mkdir(parents=True, exist_ok=True)
     if spy is not None:
         return run_bounded_integration(
             source, staging, guarded_roots=(), approval_reader=_yes,
             core_units=cores, max_files=1, executor=spy,
-            synthesis=synthesis)
+            synthesis=synthesis, audit_root=audit_root, authorized_audit_root=audit_root)
     return run_bounded_integration(
         source, staging, guarded_roots=(), approval_reader=_yes,
-        core_units=cores, max_files=1, synthesis=synthesis)
+        core_units=cores, max_files=1, synthesis=synthesis,
+        audit_root=audit_root, authorized_audit_root=audit_root)
 
 
 def _layouts(tmp_path):

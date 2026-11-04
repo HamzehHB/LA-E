@@ -134,17 +134,22 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
     ) -> None:
         if observer is None or not callable(observer):
             return
+        from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
         payload = {
             "kind": "status",
             "stage": "retrieval",
             "operation": operation,
             "phase": phase,
-            "message": message,
+            "message": sanitize_diagnostic_text(message),
         }
         if run_id:
             payload["run_id"] = run_id
         if extra:
-            payload.update(extra)
+            sanitized_extra = {
+                k: sanitize_diagnostic_text(v) if isinstance(v, str) else v
+                for k, v in extra.items()
+            }
+            payload.update(sanitized_extra)
         try:
             observer(payload)
         except Exception as obs_exc:
@@ -186,6 +191,7 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
         corpus: Sequence[Any] = (),
         observer: Any = None,
         run_id: str = "",
+        should_cancel: Any = None,
     ) -> RetrievalResult:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError(
@@ -193,6 +199,33 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
             )
         self._telemetry_failures = []
         eff_obs = observer if observer is not None else self._observer
+
+        def _is_canc() -> bool:
+            if should_cancel is None:
+                return False
+            if callable(should_cancel):
+                return bool(should_cancel())
+            return bool(should_cancel)
+
+        if _is_canc():
+            self._emit(
+                eff_obs,
+                "query_preparation",
+                f"Vector retrieval cancelled before query preparation for unit '{query.id}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=query.id,
+                query_source=query.source,
+                query_position=query.position,
+                strategy=self._name,
+                candidates=(),
+                corpus_size=None,
+                query_terms=(),
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "query_preparation"},
+            )
 
         # Capability 1: Query Preparation
         self._emit(
@@ -298,6 +331,26 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
 
             return result
 
+        if _is_canc():
+            self._emit(
+                eff_obs,
+                "candidate_retrieval",
+                f"Vector retrieval cancelled before candidate retrieval for unit '{query.id}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=query.id,
+                query_source=query.source,
+                query_position=query.position,
+                strategy=self._name,
+                candidates=(),
+                corpus_size=None,
+                query_terms=(),
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "candidate_retrieval"},
+            )
+
         # Capability 2: Candidate Retrieval
         # Emitted BEFORE acquiring the search table, inspecting collection, or generating embeddings
         self._emit(
@@ -370,6 +423,26 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
             },
             run_id=run_id,
         )
+
+        if _is_canc():
+            self._emit(
+                eff_obs,
+                "relevance_assessment",
+                f"Vector retrieval cancelled before relevance assessment for unit '{query.id}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=query.id,
+                query_source=query.source,
+                query_position=query.position,
+                strategy=self._name,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=(),
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "relevance_assessment"},
+            )
 
         # Capability 3: Relevance Assessment
         self._emit(
@@ -447,6 +520,26 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
             extra={"assessed_count": len(assessments)},
             run_id=run_id,
         )
+
+        if _is_canc():
+            self._emit(
+                eff_obs,
+                "candidate_identification",
+                f"Vector retrieval cancelled before candidate identification for unit '{query.id}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=query.id,
+                query_source=query.source,
+                query_position=query.position,
+                strategy=self._name,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=(),
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "candidate_identification"},
+            )
 
         # Capability 4: Candidate Identification
         self._emit(
@@ -547,6 +640,26 @@ class LanceDBVectorRetriever(KnowledgeRetriever):
 
         if getattr(self, "_telemetry_failures", None):
             metadata["telemetry_delivery_failures"] = list(self._telemetry_failures)
+
+        if _is_canc():
+            self._emit(
+                eff_obs,
+                "retrieval_evidence_recording",
+                f"Vector retrieval cancelled before evidence recording for unit '{query.id}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=query.id,
+                query_source=query.source,
+                query_position=query.position,
+                strategy=self._name,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=(),
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "retrieval_evidence_recording"},
+            )
 
         # Capability 5: Retrieval Evidence Recording
         self._emit(

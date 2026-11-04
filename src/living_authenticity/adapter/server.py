@@ -373,14 +373,24 @@ def _make_handler(launcher: Launcher):
             data = self._read_json()
             if data is None:
                 return
+            act1 = data.get("proposal_action")
+            act2 = data.get("action")
+            clean_act1 = str(act1).strip().upper() if act1 is not None and str(act1).strip() else ""
+            clean_act2 = str(act2).strip().upper() if act2 is not None and str(act2).strip() else ""
+            if clean_act1 and clean_act2 and clean_act1 != clean_act2:
+                self._error(400, "validation_error",
+                            f"Contradictory action fields: proposal_action ('{clean_act1}') does not match action ('{clean_act2}')")
+                return
+            proposal_action = clean_act1 or clean_act2
             try:
                 result = launcher.approve(
                     data.get("proposal_hash"),
                     data.get("query_unit_id"),
-                    data.get("decision"))
+                    data.get("decision"),
+                    run_id=str(data.get("run_id") or ""),
+                    proposal_action=proposal_action)
             except AdapterError as exc:
                 status_code = 409 if (exc.kind == "conflict"
-                                      or "pending" in exc.message
                                       or "already" in exc.message
                                       or "cancelled" in exc.message) else 400
                 self._error(status_code, exc.kind, exc.message)
@@ -541,10 +551,23 @@ def _make_handler(launcher: Launcher):
             data = self._read_json()
             if data is None:
                 data = {}
-            run_id = data.get("run_id", "")
-            proposal_hash = data.get("proposal_hash", "")
+            run_id = str(data.get("run_id") or "")
+            proposal_hash = str(data.get("proposal_hash") or "")
+            act1 = data.get("proposal_action")
+            act2 = data.get("action")
+            clean_act1 = str(act1).strip().upper() if act1 is not None and str(act1).strip() else ""
+            clean_act2 = str(act2).strip().upper() if act2 is not None and str(act2).strip() else ""
+            if clean_act1 and clean_act2 and clean_act1 != clean_act2:
+                self._error(400, "validation_error",
+                            f"Contradictory action fields: proposal_action ('{clean_act1}') does not match action ('{clean_act2}')")
+                return
+            proposal_action = clean_act1 or clean_act2
             try:
-                result = launcher.accept_proposal(run_id=run_id, proposal_hash=proposal_hash)
+                result = launcher.accept_proposal(
+                    run_id=run_id,
+                    proposal_hash=proposal_hash,
+                    proposal_action=proposal_action,
+                )
             except AdapterError as exc:
                 status_code = 409 if (exc.kind == "conflict"
                                       or "already" in exc.message

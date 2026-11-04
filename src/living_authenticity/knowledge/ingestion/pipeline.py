@@ -146,11 +146,12 @@ class IngestionPipeline:
             obs(payload)
             return True
         except Exception as exc:
+            from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
             err = {
                 "operation": operation,
                 "kind": kind,
                 "run_id": run_id,
-                "error": str(exc) or type(exc).__name__,
+                "error": sanitize_diagnostic_text(str(exc)) or type(exc).__name__,
             }
             if errors_collector is not None:
                 errors_collector.append(err)

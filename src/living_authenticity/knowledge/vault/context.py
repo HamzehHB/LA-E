@@ -10,9 +10,9 @@ import yaml
 
 from src.living_authenticity.security.path_boundary import PathBoundary
 
-_MAX_FILES = 10
-_MAX_BYTES_PER_FILE = 131072
-_MAX_TOTAL_BYTES = 2097152
+_MAX_FILES = 500
+_MAX_BYTES_PER_FILE = 1048576
+_MAX_TOTAL_BYTES = 10485760
 _ALLOWED_SUFFIXES = frozenset({".md"})
 
 # ``Knowledge-Schema.yaml`` (tracked, machine-independent) is the single
@@ -44,6 +44,14 @@ def _bounded_vault_files(root, max_files, max_bytes_per_file, max_total_bytes,
             skipped += 1
             continue
         if child.suffix.lower() not in _ALLOWED_SUFFIXES:
+            skipped += 1
+            continue
+        try:
+            rel_parts = child.relative_to(root).parts
+        except Exception:
+            skipped += 1
+            continue
+        if any(part.startswith('.') for part in rel_parts):
             skipped += 1
             continue
         if child.is_symlink() or not child.is_file():

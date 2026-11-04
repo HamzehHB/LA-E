@@ -310,6 +310,7 @@ def test_launcher_edit_proposal_unblocks_approval_reader_thread(tmp_path):
         llm_config={"llm": {"provider": "disabled"}},
         open_browser=False,
     )
+    launcher._active_run_id = "test-edit-run"
     gate = _PublishingGate(launcher)
     query = _query()
     initial_proposal = _proposal()
@@ -361,7 +362,7 @@ def test_launcher_edit_proposal_unblocks_approval_reader_thread(tmp_path):
     assert launcher._pending_approval.key == h1
 
     # Main thread approves H1
-    launcher.approve(h1, query.id, "approve")
+    launcher.approve(h1, query.id, "approve", run_id="test-edit-run")
 
     t.join(timeout=5.0)
     assert not t.is_alive(), "Worker thread failed to complete after approval"
@@ -376,3 +377,30 @@ def test_launcher_edit_proposal_unblocks_approval_reader_thread(tmp_path):
     assert active_note is not None
     assert active_proposal.title == "Thread Edited Title"
     assert active_note.markdown == "Thread edited body text."
+
+
+def test_launcher_edit_proposal_rejects_non_create_proposal():
+    """Verify that editing is strictly forbidden on non-CREATE proposals."""
+    import pytest
+    from src.living_authenticity.adapter.app import Launcher, _Pending, AdapterError
+
+    launcher = Launcher()
+    query = _query()
+    proposal = _proposal(action="NEEDS_REVIEW")
+    note = _make_note(query, proposal, "Body text")
+
+    with launcher._lock:
+        launcher._pending_approval = _Pending(
+            key="hash-non-create",
+            payload={"proposal_action": "NEEDS_REVIEW", "query_unit_id": query.id},
+            proposal=proposal,
+            note=note,
+            confidence=None,
+            run_id="run-non-create-edit",
+        )
+
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.edit_proposal(title="Attempted Edit", body="Attempted new body.")
+
+    assert exc_info.value.kind == "validation_error"
+    assert "only CREATE proposals can be edited" in str(exc_info.value.message)

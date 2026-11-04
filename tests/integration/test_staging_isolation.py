@@ -281,12 +281,169 @@ def test_authorized_staging_inside_guarded_root_runs_end_to_end(tmp_path):
     source.mkdir()
     _write(source, "note.md")
     cores = [_method_core()]
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
     report = run_bounded_integration(
         str(source), authorized, guarded_roots=(data_root,),
         authorized_staging_root=authorized, approval_reader=_yes,
-        core_units=cores, max_files=1, synthesis=SyntheticSynthesis())
+        core_units=cores, max_files=1, synthesis=SyntheticSynthesis(),
+        audit_root=str(audit_root), authorized_audit_root=str(audit_root))
     assert report.accepted is True
     assert report.staging_root == authorized
     assert any(unit.outcome == "executed" for unit in report.units)
     assert list(Path(authorized).iterdir()), "expected a staging artifact"
 
+
+def test_staging_and_audit_inside_authorized_test_output_accepted():
+    from src.living_authenticity.knowledge.integration import check_audit_eligible
+    from Config.settings import ROOT as REPOSITORY_ROOT
+    import shutil
+
+    test_staging = REPOSITORY_ROOT / "tests" / "output" / "staging_isolation_test_tmp"
+    test_staging.mkdir(parents=True, exist_ok=True)
+    test_audit = REPOSITORY_ROOT / "tests" / "output" / "audit_isolation_test_tmp"
+    test_audit.mkdir(parents=True, exist_ok=True)
+    try:
+        # Default allow_test_output=False must reject even inside tests/output
+        stg_def, r_def, _ = check_staging_eligible(str(test_staging), ())
+        assert stg_def is False
+        assert r_def == "staging inside repository workspace"
+
+        aud_def, r_aud_def, _ = check_audit_eligible(
+            str(test_audit), authorized_audit_root=str(test_audit), allow_test_output=False
+        )
+        assert aud_def is False
+        assert r_aud_def == "audit inside repository workspace"
+
+        # Bare allow_test_output=True without authorization must be rejected (narrow capability)
+        stg_unauth, r_unauth, _ = check_staging_eligible(
+            str(test_staging), (), allow_test_output=True
+        )
+        assert stg_unauth is False
+        assert r_unauth == "staging inside repository workspace"
+
+        aud_unauth, r_aud_unauth, _ = check_audit_eligible(
+            str(test_audit), authorized_audit_root=str(test_audit), allow_test_output=True
+        )
+        assert aud_unauth is False
+        assert r_aud_unauth == "audit inside repository workspace"
+
+        # Explicit allow_test_output=True inside authorized_test_mode accepts strict descendants
+        from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
+        from tests._test_authorizer import issue_test_authorizer
+        with authorized_test_mode(issue_test_authorizer("test execution")):
+            staging_eligible, staging_reason, _ = check_staging_eligible(
+                str(test_staging), (), allow_test_output=True
+            )
+            assert staging_eligible is True, f"staging descendant inside tests/output must be accepted: {staging_reason}"
+
+            audit_eligible, audit_reason, _ = check_audit_eligible(
+                str(test_audit), authorized_audit_root=str(test_audit), allow_test_output=True
+            )
+            assert audit_eligible is True, f"audit descendant inside tests/output must be accepted: {audit_reason}"
+
+            # Exact tests/output root must be strictly rejected even with allow_test_output=True
+            exact_root = REPOSITORY_ROOT / "tests" / "output"
+            stg_exact, r_stg_exact, _ = check_staging_eligible(
+                str(exact_root), (), allow_test_output=True
+            )
+            assert stg_exact is False
+            assert r_stg_exact == "staging inside repository workspace"
+
+            aud_exact, r_aud_exact, _ = check_audit_eligible(
+                str(exact_root), authorized_audit_root=str(exact_root), allow_test_output=True
+            )
+            assert aud_exact is False
+            assert r_aud_exact == "audit inside repository workspace"
+    finally:
+        if test_staging.exists():
+            shutil.rmtree(test_staging, ignore_errors=True)
+        if test_audit.exists():
+            shutil.rmtree(test_audit, ignore_errors=True)
+
+
+def test_staging_and_audit_inside_repository_source_tree_strictly_rejected():
+    from src.living_authenticity.knowledge.integration import check_audit_eligible
+    from Config.settings import ROOT as REPOSITORY_ROOT
+
+    source_dir = REPOSITORY_ROOT / "src"
+    staging_eligible, staging_reason, staging_check = check_staging_eligible(str(source_dir), ())
+    assert staging_eligible is False
+    assert staging_reason == "staging inside repository workspace"
+    assert staging_check == "destination"
+
+    audit_eligible, audit_reason, audit_check = check_audit_eligible(
+        str(source_dir), authorized_audit_root=str(source_dir)
+    )
+    assert audit_eligible is False
+    assert audit_reason == "audit inside repository workspace"
+    assert audit_check == "audit"
+
+
+
+def test_operating_mode_test_cannot_bypass_isolation_without_allow_test_output(tmp_path):
+    """Passing operating_mode='test' must never bypass isolation for tests/output unless allow_test_output=True."""
+    import shutil
+    from Config.settings import ROOT as REPOSITORY_ROOT
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+
+    test_out_dir = REPOSITORY_ROOT / "tests" / "output" / "operating_mode_bypass_probe"
+    test_out_dir.mkdir(parents=True, exist_ok=True)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("Observation:\nPeople often lose calmness in modern life.\n", encoding="utf-8")
+
+    sample = "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n"
+    cores = [KnowledgeUnit(
+        id="core1", source="core", original_text=sample,
+        meaning=sample, cleaned_text=sample,
+        normalized_text=sample,
+        context="", proposed_type="", position=0,
+    )]
+
+    try:
+        # 1. operating_mode='test' with allow_test_output=False must be rejected
+        report_rejected = run_bounded_integration(
+            str(source), str(test_out_dir),
+            operating_mode="test",
+            allow_test_output=False,
+            guarded_roots=(),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+        )
+        assert report_rejected.accepted is False
+        assert report_rejected.rejection_check == "destination"
+        assert report_rejected.rejection_reason == "staging inside repository workspace"
+
+        # 2. operating_mode='test' with allow_test_output omitted (defaults to None -> False) must also be rejected
+        report_default = run_bounded_integration(
+            str(source), str(test_out_dir),
+            operating_mode="test",
+            guarded_roots=(),
+            approval_reader=lambda: "y",
+            synthesis=SyntheticSynthesis(),
+            core_units=cores,
+        )
+        assert report_default.accepted is False
+        assert report_default.rejection_check == "destination"
+        assert report_default.rejection_reason == "staging inside repository workspace"
+
+        # 3. Bare allow_test_output=True without authorization is rejected
+        eligible_bare, reason_bare, _ = check_staging_eligible(
+            str(test_out_dir), (), allow_test_output=True
+        )
+        assert eligible_bare is False
+
+        # 4. Explicit allow_test_output=True inside authorized_test_mode is accepted
+        from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
+        from tests._test_authorizer import issue_test_authorizer
+        with authorized_test_mode(issue_test_authorizer("test execution")):
+            eligible, reason, check = check_staging_eligible(
+                str(test_out_dir), (), allow_test_output=True
+            )
+            assert eligible is True
+    finally:
+        if test_out_dir.exists():
+            shutil.rmtree(test_out_dir, ignore_errors=True)

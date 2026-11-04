@@ -88,7 +88,7 @@ def tkinter_pick(purpose: str):
 
 
 def validate_purpose(purpose: str, path: str,
-                     paths=None) -> tuple:
+                     paths=None, allow_test_output: bool = False) -> tuple:
     """Backend-authoritative validation of one selected path.
 
     Returns ``(status, display, reason)``. Reuses the existing guards:
@@ -99,15 +99,12 @@ def validate_purpose(purpose: str, path: str,
     from src.living_authenticity.knowledge.integration.guard import (
         check_audit_eligible,
         check_staging_eligible,
+        is_test_mode_authorized,
         resolve_authorized_audit_failed,
         resolve_authorized_audit_passed,
         resolve_authorized_audit_root,
         resolve_authorized_staging_root,
         resolve_guarded_roots,
-    )
-    from src.living_authenticity.knowledge.integration.vector import (
-        check_vector_store_eligible,
-        resolve_production_vector_db,
     )
     from src.living_authenticity.security.path_boundary import PathBoundary
 
@@ -119,14 +116,24 @@ def validate_purpose(purpose: str, path: str,
     if not candidate.is_dir():
         return (STATUS_INVALID, "",
                 "selected path is not an existing directory")
-    if PathBoundary(str(REPOSITORY_ROOT)).is_allowed(path):
-        return (STATUS_INVALID, "",
-                "selected path is inside the repository workspace")
+    test_output_root = (REPOSITORY_ROOT / "tests" / "output").resolve()
+    candidate_resolved = candidate.expanduser().resolve()
+    is_inside_repo = PathBoundary(str(REPOSITORY_ROOT)).is_allowed(path)
+    is_strict_descendant = (
+        test_output_root in candidate_resolved.parents
+        and candidate_resolved != test_output_root
+    )
+    is_test_auth = bool(allow_test_output) and is_test_mode_authorized(allow_test_output)
+    if is_inside_repo:
+        if not (is_test_auth and is_strict_descendant):
+            return (STATUS_INVALID, "",
+                    "selected path is inside the repository workspace")
 
     guarded = resolve_guarded_roots(paths)
     if purpose == "staging":
         eligible, reason, _check = check_staging_eligible(
-            path, guarded, resolve_authorized_staging_root(paths))
+            path, guarded, resolve_authorized_staging_root(paths),
+            allow_test_output=allow_test_output)
         return ((STATUS_CONFIGURED if eligible else STATUS_INVALID),
                 display_for(path), reason)
     if purpose == "audit":
@@ -134,10 +141,15 @@ def validate_purpose(purpose: str, path: str,
             path, guarded,
             resolve_authorized_audit_root(paths),
             resolve_authorized_audit_passed(paths),
-            resolve_authorized_audit_failed(paths))
+            resolve_authorized_audit_failed(paths),
+            allow_test_output=allow_test_output)
         return ((STATUS_CONFIGURED if eligible else STATUS_INVALID),
                 display_for(path), reason)
     if purpose == "vector_db":
+        from src.living_authenticity.knowledge.integration.vector import (
+            check_vector_store_eligible,
+            resolve_production_vector_db,
+        )
         data = paths if isinstance(paths, dict) else {}
         vault_value = data.get("obsidian", {}).get("vault", "")
         vault = vault_value if isinstance(vault_value, str) else ""
@@ -146,7 +158,8 @@ def validate_purpose(purpose: str, path: str,
             resolve_production_vector_db(data),
             vault,
             resolve_authorized_audit_root(data),
-            resolve_authorized_staging_root(data))
+            resolve_authorized_staging_root(data),
+            allow_test_output=allow_test_output)
         return ((STATUS_CONFIGURED if eligible else STATUS_INVALID),
                 display_for(path), reason)
     # vault / local_llm / embedding_model: validated as a usable external
@@ -155,14 +168,14 @@ def validate_purpose(purpose: str, path: str,
 
 
 def pick_and_validate(purpose: str, picker=None,
-                      paths=None) -> tuple:
+                      paths=None, allow_test_output: bool = False) -> tuple:
     """Run the native picker, then validate the result authoritatively."""
     purpose = normalize_purpose(purpose)
     choose = picker if picker is not None else tkinter_pick
     status, path, reason = choose(purpose)
     if status != STATUS_CONFIGURED:
         return (status, "", reason)
-    return validate_purpose(purpose, path, paths)
+    return validate_purpose(purpose, path, paths, allow_test_output=allow_test_output)
 
 
 __all__ = [

@@ -4,3 +4,7 @@
 pytest
 pip-tools
 pip-audit
+# Environment packaging tools (pip, setuptools) are excluded from compiled requirements
+# by pip-tools as unsafe packages. Minimum secure versions (e.g. setuptools>=84.1.0 for
+# setuptools advisory GHSA-xmj3-9gf7-h52w, alongside pip upgrade for pip advisory PYSEC-2026-3721)
+# are documented in SETUP.md and upgraded via python -m pip install --upgrade pip "setuptools>=84.1.0".

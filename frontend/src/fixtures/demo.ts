@@ -26,6 +26,7 @@ export const IDLE_RUN: CurrentRunView = {
   error: null,
   stopped: false,
   stop_reason: "",
+  audit_status: "pending",
 };
 
 export const FIXTURE_RUN: CurrentRunView = {
@@ -45,6 +46,7 @@ export const FIXTURE_RUN: CurrentRunView = {
   error: null,
   stopped: false,
   stop_reason: "",
+  audit_status: "pending",
 };
 
 export const FIXTURE_RUN_NEEDS_REVIEW: CurrentRunView = {

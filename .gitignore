@@ -65,3 +65,6 @@ tests/local/
 frontend/node_modules/
 frontend/dist/
 frontend/*.log
+
+# ---------- Local Audit Records ----------
+docs/audit/

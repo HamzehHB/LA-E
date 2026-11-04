@@ -9,3 +9,7 @@ anyio==4.14.2
 # CVE-2026-97687/97688/97689: force the patched urllib3 (transitive via
 # lance-namespace-urllib3-client); keeps the rest of the pin set stable.
 urllib3>=2.8.0
+# PYSEC-2026-4320: force patched certifi (transitive via httpx/httpcore).
+certifi>=2026.10.19
+# CVE-2026-112940/112913/112907: force patched filelock (transitive via torch/huggingface-hub).
+filelock>=4.2.1

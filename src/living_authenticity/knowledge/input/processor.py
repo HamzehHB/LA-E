@@ -397,6 +397,7 @@ def record_input_failure_audit(
     validation_result: InputEvaluationResult,
     operating_mode: str = "examples",
     input_text: object = None,
+    resumed_from_run_id: str = "",
 ):
     """Persist an audit record for an unaccepted Input stage evaluation (REJECTED, NEEDS_CLARIFICATION, STOPPED).
 
@@ -445,6 +446,7 @@ def record_input_failure_audit(
         execution_attempted=False,
         execution_executed=False,
         errors=(reason_str,),
+        resumed_from_run_id=resumed_from_run_id,
     )
     if audit_writer is not None:
         return audit_writer.append(record)

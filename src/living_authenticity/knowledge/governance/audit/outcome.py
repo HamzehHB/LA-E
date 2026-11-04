@@ -88,6 +88,8 @@ class AuditRecord:
     input_hash_source: str = ""
     narrative: str = ""
     narrative_language: str = "en"
+    resumed_from_run_id: str = ""
+    resumed_from_record_id: str = ""
 
     def __post_init__(self) -> None:
         from .clock import local_now_iso
@@ -332,6 +334,8 @@ def build_audit_record(request, outcome, revalidation=None, execution=None,
         warnings=_str_tuple("warnings"),
         core_relevance=_text("core_relevance"),
         core_basis=_text("core_basis"),
+        resumed_from_run_id=_text("resumed_from_run_id"),
+        resumed_from_record_id=_text("resumed_from_record_id"),
         narrative=narrative_text,
         narrative_language=narr_lang,
     )

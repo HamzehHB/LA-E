@@ -135,6 +135,8 @@ class TokenOverlapRetriever(KnowledgeRetriever):
         query: KnowledgeUnit,
         corpus: Sequence[Any],
         observer: Any = None,
+        run_id: str = "",
+        should_cancel: Any = None,
     ) -> RetrievalResult:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError(
@@ -147,7 +149,9 @@ class TokenOverlapRetriever(KnowledgeRetriever):
             max_candidates=self._max_candidates,
             observer=eff_obs,
         )
-        return coordinator.run(query, corpus)
+        return coordinator.run(
+            query, corpus, run_id=run_id, should_cancel=should_cancel
+        )
 
 
 # Short, stable alias used as the default retriever.

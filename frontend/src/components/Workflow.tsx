@@ -46,14 +46,14 @@ export function CurrentAudit() {
         <div className="title-cluster">
           <span className="pulsing-radar" aria-hidden="true" />
           <h2>{t("ui.current.title")}</h2>
-          <span className="badge ok">{state.run.current_stage || "active"}</span>
+          <span className="badge ok">{state.run.current_stage || t("ui.status.active")}</span>
           {state.run.current_stage === "retrieval" && activeSubstep && (
             <span
               className={`badge info ${activeSubstep.isRunning ? "running" : activeSubstep.phase === "completed" ? "completed" : "unknown"}`}
               data-phase={activeSubstep.phase}
             >
               {activeSubstep.isRunning ? "▶ " : activeSubstep.phase === "completed" ? "✓ " : "• "}
-              {activeSubstep.operation.replace(/_/g, " ")} {activeSubstep.isRunning ? "(running)" : activeSubstep.phase === "completed" ? "(completed)" : `(${activeSubstep.phase})`}
+              {t((`ui.substep.${activeSubstep.operation}`) as Parameters<typeof translate>[1]) || activeSubstep.operation.replace(/_/g, " ")} {activeSubstep.isRunning ? `(${t("ui.substep.running")})` : activeSubstep.phase === "completed" ? `(${t("ui.substep.completed")})` : `(${t((`ui.substep.${activeSubstep.phase}`) as Parameters<typeof translate>[1]) || activeSubstep.phase})`}
             </span>
           )}
         </div>
@@ -150,29 +150,38 @@ export function Workflow() {
                 aria-label={`${s.label}: ${t(
                   (s.state === "completed"
                     ? "ui.stage.completed"
-                    : s.state === "current"
-                      ? "ui.stage.current"
-                      : s.state === "stopped"
-                        ? "ui.stage.stopped"
-                        : "ui.stage.pending") as Parameters<typeof translate>[1]
+                    : s.state === "logged"
+                      ? "ui.stage.logged"
+                      : s.state === "failed"
+                        ? "ui.stage.failed"
+                        : s.state === "current"
+                          ? "ui.stage.current"
+                          : s.state === "stopped"
+                            ? "ui.stage.stopped"
+                            : "ui.stage.pending") as Parameters<typeof translate>[1]
                 )}`}
               >
                 <span className="node" aria-hidden="true" />
                 <div className="timeline-content">
                   <span className="grp">{s.label}</span>
                   {showRetrievalSubsteps && (
-                    <ol className="timeline-substeps" aria-label="Retrieval Substeps">
-                      {retrievalSubsteps.map((sub) => (
-                        <li
-                          key={sub.key}
-                          className={`substep-pill substep-${sub.state}`}
-                          data-substep={sub.key}
-                          data-state={sub.state}
-                        >
-                          <span className="substep-dot" aria-hidden="true" />
-                          <span className="substep-label">{sub.label}</span>
-                        </li>
-                      ))}
+                    <ol className="timeline-substeps" aria-label={t("ui.workflow.substepsAria")}>
+                      {retrievalSubsteps.map((sub) => {
+                        const subKey = `ui.substep.${sub.key}` as Parameters<typeof translate>[1];
+                        const subLabel = t(subKey) || sub.label;
+                        return (
+                          <li
+                            key={sub.key}
+                            className={`substep-pill substep-${sub.state}`}
+                            data-substep={sub.key}
+                            data-state={sub.state}
+                            aria-label={`${subLabel}: ${t((`ui.substep.${sub.state}`) as Parameters<typeof translate>[1]) || sub.state}`}
+                          >
+                            <span className="substep-dot" aria-hidden="true" />
+                            <span className="substep-label">{subLabel}</span>
+                          </li>
+                        );
+                      })}
                     </ol>
                   )}
                 </div>

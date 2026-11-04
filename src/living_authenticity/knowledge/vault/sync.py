@@ -427,21 +427,23 @@ class VaultSyncSession:
                 }
 
             except Exception as exc:
+                from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
+                safe_err = sanitize_diagnostic_text(str(exc))
                 logger.exception("Vault synchronization failed")
                 self._status = SYNC_STATE_FAILED
-                self._error_message = str(exc)
+                self._error_message = safe_err
                 self._emit(
                     kind="warning",
                     stage="synchronization",
-                    message=f"Vault synchronization failed for {self._vault_id}: {exc}",
-                    metadata={"vault_id": self._vault_id, "error": str(exc)},
+                    message=f"Vault synchronization failed for {self._vault_id}: {safe_err}",
+                    metadata={"vault_id": self._vault_id, "error": safe_err},
                 )
                 return {
                     "authorized": self._authorized,
                     "vault_id": self._vault_id,
                     "status": self._status,
                     "fresh": False,
-                    "error": str(exc),
+                    "error": safe_err,
                 }
 
     def _index_single_file(self, file_path: Path) -> int:

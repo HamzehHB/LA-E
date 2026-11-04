@@ -797,6 +797,27 @@ ol.timeline li[data-state="stopped"] .grp {
   color: var(--danger);
 }
 
+/* Emergency Audit Persisted: Purple / Violet (#8b5cf6) */
+ol.timeline li[data-state="logged"] .node {
+  border-color: #8b5cf6;
+  background: #8b5cf6;
+}
+ol.timeline li[data-state="logged"] .grp {
+  color: #8b5cf6;
+}
+ol.timeline li[data-state="logged"]:not(:last-child)::after {
+  background: #8b5cf6;
+}
+
+/* Audit Persistence Failed: Red / Danger */
+ol.timeline li[data-state="failed"] .node {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+ol.timeline li[data-state="failed"] .grp {
+  color: var(--danger);
+}
+
 /* Terminal Success: ALL completed nodes turn GREEN */
 ol.timeline[data-terminal="success"] li[data-state="completed"] .node {
   border-color: var(--ok);

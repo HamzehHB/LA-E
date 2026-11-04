@@ -240,12 +240,13 @@ class ControlledExecutor:
         return _reject(request.proposal_hash, action, destination,
                        "staging write failed", "destination", provenance)
 
-    def quarantine_artifact(self, staging_root: Path | str, artifact_path: str) -> str:
+    def quarantine_artifact(self, staging_root: Path | str, artifact_path: str, collision_safe: bool = False) -> str:
         """Quarantine an unreconciled artifact within staging root using atomic move."""
-        return quarantine_artifact(staging_root, artifact_path)
+        return quarantine_artifact(staging_root, artifact_path, collision_safe=collision_safe)
 
 
-def quarantine_artifact(staging_root: Path | str, artifact_path: str) -> QuarantineOutcome:
+def quarantine_artifact(staging_root: Path | str, artifact_path: str,
+                        collision_safe: bool = False) -> QuarantineOutcome:
     """Quarantine an unreconciled artifact within staging root with atomic no-overwrite guarantees."""
     if not staging_root or not artifact_path:
         return QuarantineOutcome("", success=False, status="quarantine_failed", error="missing parameters")
@@ -277,7 +278,23 @@ def quarantine_artifact(staging_root: Path | str, artifact_path: str) -> Quarant
         return QuarantineOutcome("", success=False, status="quarantine_failed", error=f"target invalid: {exc}")
 
     if resolved_target.exists():
-        return QuarantineOutcome("", success=False, status="quarantine_failed", target_path=rel_target, error="quarantine destination already exists")
+        if collision_safe:
+            unique_suffix = uuid.uuid4().hex[:8]
+            unique_name = f"{resolved_source.stem}.{unique_suffix}{resolved_source.suffix}"
+            if target_dir.is_dir():
+                target = target_dir / unique_name
+                rel_target = f".unreconciled/{unique_name}"
+            else:
+                target = stg / f".unreconciled.{unique_name}"
+                rel_target = f".unreconciled.{unique_name}"
+            try:
+                resolved_target = boundary.validate(target)
+            except Exception as exc:
+                return QuarantineOutcome("", success=False, status="quarantine_failed", error=f"target invalid: {exc}")
+            if resolved_target.exists():
+                return QuarantineOutcome("", success=False, status="quarantine_failed", target_path=rel_target, error="quarantine destination already exists")
+        else:
+            return QuarantineOutcome("", success=False, status="quarantine_failed", target_path=rel_target, error="quarantine destination already exists")
 
     try:
         atomic_publish_exclusive(resolved_source, resolved_target)
@@ -287,6 +304,22 @@ def quarantine_artifact(staging_root: Path | str, artifact_path: str) -> Quarant
             return QuarantineOutcome("", success=False, status="partial_cleanup_failed", target_path=rel_target, source_removed=False, error="target created but source removal failed")
         return QuarantineOutcome("", success=False, status="quarantine_failed", target_path="", source_removed=False, error="quarantine destination missing")
     except FileExistsError as exc:
+        if collision_safe:
+            unique_suffix = uuid.uuid4().hex[:8]
+            unique_name = f"{resolved_source.stem}.{unique_suffix}{resolved_source.suffix}"
+            if target_dir.is_dir():
+                fallback_target = target_dir / unique_name
+                fallback_rel = f".unreconciled/{unique_name}"
+            else:
+                fallback_target = stg / f".unreconciled.{unique_name}"
+                fallback_rel = f".unreconciled.{unique_name}"
+            try:
+                resolved_fallback = boundary.validate(fallback_target)
+                atomic_publish_exclusive(resolved_source, resolved_fallback)
+                if resolved_fallback.exists() and not resolved_source.exists():
+                    return QuarantineOutcome(fallback_rel, success=True, status="quarantined", target_path=fallback_rel, source_removed=True)
+            except Exception:
+                pass
         return QuarantineOutcome("", success=False, status="quarantine_failed", target_path=rel_target, source_removed=False, error=f"destination exists: {exc}")
     except OSError as exc:
         if resolved_target.exists() and not resolved_source.exists():

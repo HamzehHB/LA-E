@@ -89,7 +89,7 @@ def _query_text(query) -> str:
     return ""
 
 
-def _safe_stop_entry(child, query, proposal, reason, unit_result=None):
+def _safe_stop_entry(child, query, proposal, reason, unit_result=None, resumed_from_run_id: str = "", resumed_from_record_id: str = ""):
     confidence = getattr(unit_result, "confidence", None) \
         if unit_result is not None else None
     filter_outcome = getattr(unit_result, "filter_outcome", None) \
@@ -109,6 +109,8 @@ def _safe_stop_entry(child, query, proposal, reason, unit_result=None):
         query_source=query.source, query_position=query.position,
         proposal_hash="", proposal_action=proposal.action,
         approval_approved=False, outcome="llm_safe_stop", reason=reason,
+        resumed_from_run_id=resumed_from_run_id,
+        resumed_from_record_id=resumed_from_record_id,
         query_text=_query_text(query),
         proposal_title=getattr(proposal, "title", ""),
         proposal_reason=getattr(proposal, "reason", ""),
@@ -158,7 +160,7 @@ def _synthesize_candidates(synthesis, unit_result, vault_context=None):
 
 
 def _rendered_note_for_candidate(query, proposal, classification, confidence,
-                                 candidate, generator):
+                                  candidate, generator):
     from src.living_authenticity.knowledge.output.outcome import GeneratedNote
 
     base = generator.generate(query, proposal=proposal,
@@ -187,7 +189,8 @@ def _rendered_note_for_candidate(query, proposal, classification, confidence,
 
 
 def _entry_display_fields(child, query, proposal, confidence,
-                          unit_result, llm_result):
+                          unit_result, llm_result,
+                          resumed_from_run_id: str = "", resumed_from_record_id: str = ""):
     """Copies of pipeline evidence for review display (informational)."""
     retrieval = unit_result.retrieval_result if unit_result else None
     comparisons = unit_result.comparisons if unit_result else ()
@@ -196,12 +199,14 @@ def _entry_display_fields(child, query, proposal, confidence,
     classification = unit_result.classification if unit_result else None
     filter_outcome = unit_result.filter_outcome if unit_result else None
     return {
+        "resumed_from_run_id": resumed_from_run_id,
+        "resumed_from_record_id": resumed_from_record_id,
         "query_text": _query_text(query),
         "proposed_destination": getattr(proposal, "destination", ""),
         "llm_candidates": tuple((
             {"title": c.title, "body": c.body,
-             "suggested_type": c.suggested_type,
-             "reason": c.reason, "uncertainty": c.uncertainty}
+              "suggested_type": c.suggested_type,
+              "reason": c.reason, "uncertainty": c.uncertainty}
             for c in llm_result.candidates
         )) if llm_result is not None else (),
         "confidence_level": confidence.level if confidence else "",
@@ -288,7 +293,7 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
                      operating_mode="", run_id="", record_id="",
                      human_review_state="", stop_reason="",
                      validation_result="", artifact_sha256="",
-                     proposal=None, narrative_language="en") -> dict:
+                     proposal=None, narrative_language="en", resumed_from_run_id: str = "", resumed_from_record_id: str = "") -> dict:
     """Build the traceability mapping attached to one audit record.
 
     Identifiers and hashes only; never credentials, never raw secrets.
@@ -414,7 +419,8 @@ def _trace_for_audit(query=None, unit_result=None, llm_result=None,
             "artifact_sha256": artifact_sha256,
             "core_relevance": getattr(core, "relevance", "") if core else "",
             "core_basis": getattr(core, "basis", "") if core else "",
-            "narrative_language": narrative_language or "en"}
+            "narrative_language": narrative_language or "en",
+            "resumed_from_run_id": resumed_from_run_id, "resumed_from_record_id": resumed_from_record_id}
 
 
 def _govern_candidate(child, query, proposal, confidence, note, gate,
@@ -429,7 +435,10 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                       audit_writer=None, audit_receipts=None,
                       audit_guard_error="", event_sink=None,
                       should_cancel=None, audit_language="en",
-                      interactive: bool = False):
+                      interactive: bool = False,
+                      allow_test_output: bool = False,
+                      audit_requested: bool = False,
+                      resumed_from_run_id: str = "", resumed_from_record_id: str = ""):
     """Govern one candidate: approval, guard re-check, revalidation."""
     from src.living_authenticity.knowledge.governance.audit.clock import (
         local_now_iso,
@@ -451,13 +460,19 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     if not isinstance(note.markdown, str) or not note.markdown.strip():
         raise ValueError("note.markdown must not be empty for CREATE proposal governance")
 
-    def _emit(kind, stage, message):
+    def _emit(kind, stage, message, **kwargs):
         if event_sink is None:
             return
         try:
-            event_sink({"kind": kind, "run_id": run_id, "stage": stage,
-                        "message": message if isinstance(message, str) else "",
-                        "timestamp": ""})
+            payload = {
+                "kind": kind,
+                "run_id": run_id,
+                "stage": stage,
+                "message": message if isinstance(message, str) else "",
+                "timestamp": "",
+            }
+            payload.update(kwargs)
+            event_sink(payload)
         except Exception:
             pass
 
@@ -480,24 +495,26 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
     if not isinstance(active_note.markdown, str) or not active_note.markdown.strip():
         raise ValueError("active_note.markdown must not be empty")
     note = active_note
-    _emit("approval_decided", "human_review",
-          "approved" if outcome.approved else "rejected")
-    live_ok, live_reason, _live = check_staging_eligible(
-        pinned_staging, guarded, authorized_staging)
-    display = _entry_display_fields(
-        child, query, proposal, confidence, unit_result, llm_result)
-    import uuid as _uuid
-    record_id = "rec-" + _uuid.uuid4().hex[:12]
-    human_state = "approved" if outcome.approved else "rejected"
-    base_trace = _trace_for_audit(
-        query=query, unit_result=unit_result, llm_result=llm_result,
-        prompt_sha256=prompt_sha256, synthesis=synthesis,
-        llm_config=llm_config, operating_mode=operating_mode,
-        run_id=run_id, record_id=record_id,
-        human_review_state=human_state,
-        narrative_language=audit_language)
-    if should_cancel is not None and should_cancel():
+    cancelled = (
+        (should_cancel is not None and should_cancel())
+        or getattr(outcome, "input_value", "").strip().lower() in ("cancel", "cancelled")
+    )
+    if cancelled:
         _emit("stopped", "cancellation", "run cancelled during approval")
+        display = _entry_display_fields(
+            child, query, proposal, confidence, unit_result, llm_result,
+            resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id)
+        import uuid as _uuid
+        record_id = "rec-" + _uuid.uuid4().hex[:12]
+        base_trace = _trace_for_audit(
+            query=query, unit_result=unit_result, llm_result=llm_result,
+            prompt_sha256=prompt_sha256, synthesis=synthesis,
+            llm_config=llm_config, operating_mode=operating_mode,
+            run_id=run_id, record_id=record_id,
+            human_review_state="cancelled",
+            narrative_language=audit_language, resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id)
         audits.append(build_audit_record(
             request, outcome, None, None, proposal, trace={
                 **base_trace, "outcome": "cancelled",
@@ -509,12 +526,35 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             query_source=query.source, query_position=query.position,
             proposal_hash=request.proposal_hash,
             proposal_action=proposal.action,
-            approval_approved=bool(outcome.approved),
+            approval_approved=False,
             outcome="cancelled",
             reason="run cancelled during approval",
-            note_markdown=note.markdown, **display,
+            note_markdown=note.markdown,
+            record_id=record_id,
+            **display,
         ))
         return
+    _emit("approval_decided", "human_review",
+          "approved" if outcome.approved else "rejected")
+    is_test = bool(allow_test_output)
+    live_ok, live_reason, _live = check_staging_eligible(
+        pinned_staging, guarded, authorized_staging,
+        allow_test_output=is_test)
+    display = _entry_display_fields(
+        child, query, proposal, confidence, unit_result, llm_result,
+        resumed_from_run_id=resumed_from_run_id,
+        resumed_from_record_id=resumed_from_record_id)
+    import uuid as _uuid
+    record_id = "rec-" + _uuid.uuid4().hex[:12]
+    human_state = "approved" if outcome.approved else "rejected"
+    base_trace = _trace_for_audit(
+        query=query, unit_result=unit_result, llm_result=llm_result,
+        prompt_sha256=prompt_sha256, synthesis=synthesis,
+        llm_config=llm_config, operating_mode=operating_mode,
+        run_id=run_id, record_id=record_id,
+        human_review_state=human_state,
+        narrative_language=audit_language, resumed_from_run_id=resumed_from_run_id,
+        resumed_from_record_id=resumed_from_record_id)
     if not live_ok:
         _emit("stopped", "staging_guard", live_reason)
         audits.append(build_audit_record(request, outcome, None, None,
@@ -529,7 +569,9 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             proposal_action=proposal.action,
             approval_approved=bool(outcome.approved),
             outcome="rejected_staging_guard", reason=live_reason,
-            note_markdown=note.markdown, **display,
+            note_markdown=note.markdown,
+            record_id=record_id,
+            **display,
         ))
         return
     revalidation = validator.revalidate(
@@ -551,7 +593,9 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             approval_approved=bool(outcome.approved),
             outcome="revalidation_failed",
             reason=revalidation.reason,
-            note_markdown=note.markdown, **display,
+            note_markdown=note.markdown,
+            record_id=record_id,
+            **display,
         ))
         return
     # Cooperative cancellation boundary immediately before the controlled
@@ -575,38 +619,78 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             revalidation_valid=True,
             outcome="cancelled",
             reason="run cancelled before execution",
-            note_markdown=note.markdown, **display,
+            note_markdown=note.markdown,
+            record_id=record_id,
+            **display,
         ))
         return
+    pre_record_id = "rec-" + _uuid.uuid4().hex[:12]
     pre_trace = {
         **base_trace,
+        "record_id": pre_record_id,
         "audit_phase": "pre_execution",
         "validation_result": "approved_pending_execution",
     }
     pre_record = build_audit_record(
         request, outcome, revalidation, None, proposal, trace=pre_trace)
-    if audit_writer is not None:
-        if not persist_record(audit_writer, pre_record, audit_receipts):
-            audits.append(build_audit_record(
-                request, outcome, revalidation, None, proposal, trace={
-                    **base_trace,
-                    "validation_result": "audit_persistence_failed",
-                    "stop_reason": "audit persistence failed before execution",
-                }))
-            entries.append(IntegrationUnitEntry(
-                source_file=str(child), query_unit_id=query.id,
-                query_source=query.source, query_position=query.position,
-                proposal_hash=request.proposal_hash,
-                proposal_action=proposal.action,
-                approval_approved=bool(outcome.approved),
-                revalidation_valid=True,
-                outcome="audit_persistence_failed",
-                reason="audit persistence failed before execution",
-                note_markdown=note.markdown, **display,
-            ))
-            _emit("stopped", "audit_persistence",
-                  "audit persistence failed before execution")
-            return
+    audits.append(pre_record)
+    if audit_writer is None:
+        fail_rec_id = "rec-" + _uuid.uuid4().hex[:12]
+        audits.append(build_audit_record(
+            request, outcome, revalidation, None, proposal, trace={
+                **base_trace,
+                "record_id": fail_rec_id,
+                "validation_result": "audit_persistence_failed",
+                "stop_reason": "audit writer missing or unusable",
+            }))
+        entries.append(IntegrationUnitEntry(
+            source_file=str(child), query_unit_id=query.id,
+            query_source=query.source, query_position=query.position,
+            proposal_hash=request.proposal_hash,
+            proposal_action=proposal.action,
+            approval_approved=bool(outcome.approved),
+            revalidation_valid=True,
+            outcome="audit_persistence_failed",
+            reason="audit writer missing or unusable",
+            note_markdown=note.markdown,
+            record_id=fail_rec_id,
+            **display,
+        ))
+        _emit("stopped", "audit_persistence",
+              "audit writer missing or unusable")
+        return
+
+    from src.living_authenticity.knowledge.governance.audit.persistence import (
+        persist_record_resilient,
+    )
+    pre_res = persist_record_resilient(
+        audit_writer, pre_record, receipts=audit_receipts, history=audits
+    )
+    if not pre_res.get("persisted"):
+        fail_rec_id = "rec-" + _uuid.uuid4().hex[:12]
+        audits.append(build_audit_record(
+            request, outcome, revalidation, None, proposal, trace={
+                **base_trace,
+                "record_id": fail_rec_id,
+                "validation_result": "audit_persistence_failed",
+                "stop_reason": "audit persistence failed before execution",
+            }))
+        entries.append(IntegrationUnitEntry(
+            source_file=str(child), query_unit_id=query.id,
+            query_source=query.source, query_position=query.position,
+            proposal_hash=request.proposal_hash,
+            proposal_action=proposal.action,
+            approval_approved=bool(outcome.approved),
+            revalidation_valid=True,
+            outcome="audit_persistence_failed",
+            reason="audit persistence failed before execution",
+            note_markdown=note.markdown,
+            record_id=fail_rec_id,
+            **display,
+        ))
+        _emit("stopped", "audit_persistence",
+              "audit persistence failed before execution")
+        return
     execution = runner.execute(
         request, outcome, proposal, confidence, note,
         staging_root=pinned_staging,
@@ -660,7 +744,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                 generate_lifecycle_narrative,
             )
 
-            q_res = quarantine_artifact(pinned_staging, execution.artifact_path)
+            q_res = quarantine_artifact(pinned_staging, execution.artifact_path, collision_safe=True)
             post_receipt["artifact_path"] = execution.artifact_path
             is_q = bool(getattr(q_res, "success", False) or (isinstance(q_res, str) and q_res and getattr(q_res, "status", "") != "partial_cleanup_failed"))
             is_partial = getattr(q_res, "status", "") == "partial_cleanup_failed"
@@ -705,8 +789,23 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             state = "executed"
             _emit("warning", "audit_persistence",
                   "audit recorded in emergency journal")
+            _emit("audit_persisted", "audit", "unit audit persisted (emergency)",
+                  query_unit_id=query.id, proposal_hash=request.proposal_hash,
+                  record_id=post_receipt.get("record_id", ""),
+                  durability="confirmed", emergency=True,
+                  audit_mode="emergency", audit_partition="errors",
+                  audit_partitions=["errors"])
         else:
             state = "executed"
+            if post_receipt and post_receipt.get("persisted"):
+                dur = post_receipt.get("durability", "written")
+                cat = post_receipt.get("storage_category", "passed")
+                _emit("audit_persisted", "audit", f"unit audit persisted ({dur})",
+                      query_unit_id=query.id, proposal_hash=request.proposal_hash,
+                      record_id=post_receipt.get("record_id", ""),
+                      durability=dur, emergency=False,
+                      audit_mode="normal", audit_partition=cat,
+                      audit_partitions=[cat])
     elif (execution.failed_check == "destination"
             and "no overwrite" in (execution.reason or "")):
         state = "rejected_existing_artifact"
@@ -733,7 +832,9 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             if state == "audit_persistence_failed"
             else execution.artifact_path
         ) or "",
-        note_markdown=note.markdown, **display,
+        note_markdown=note.markdown,
+        record_id=getattr(post_record, "record_id", "") or (post_receipt.get("record_id", "") if post_receipt else ""),
+        **display,
     ))
     if details is not None:
         details.append(IntegrationUnitDetail(
@@ -766,7 +867,10 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                  operating_mode="", run_id="", audit_writer=None,
                  audit_receipts=None, audit_guard_error="",
                  event_sink=None, should_cancel=None,
-                 audit_language="en", interactive: bool = False):
+                 audit_language="en", interactive: bool = False,
+                 allow_test_output: bool = False,
+                 audit_requested: bool = False,
+                 resumed_from_run_id: str = "", resumed_from_record_id: str = ""):
     """Govern one unit through the mandatory AI synthesis step.
 
     The mandatory synthesis step always runs: synthesis produces 1..N candidates
@@ -796,13 +900,19 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
         )
         generator = DeterministicObsidianGenerator()
 
-    def _emit(kind, stage, message):
+    def _emit(kind, stage, message, **kwargs):
         if event_sink is None:
             return
         try:
-            event_sink({"kind": kind, "run_id": run_id, "stage": stage,
-                        "message": message if isinstance(message, str) else "",
-                        "timestamp": ""})
+            payload = {
+                "kind": kind,
+                "run_id": run_id,
+                "stage": stage,
+                "message": message if isinstance(message, str) else "",
+                "timestamp": "",
+            }
+            payload.update(kwargs)
+            event_sink(payload)
         except Exception:
             pass
 
@@ -814,7 +924,9 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
         reason = _llm_safe_reason(exc)
         _emit("stopped", "llm_synthesis", reason)
         entries.append(_safe_stop_entry(
-            child, query, proposal, reason, unit_result=unit_result))
+            child, query, proposal, reason, unit_result=unit_result,
+            resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id))
         try:
             from src.living_authenticity.knowledge.governance.audit.outcome import (
                 build_audit_record as _build,
@@ -834,7 +946,7 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                 human_review_state="not_requested",
                 stop_reason=reason,
                 validation_result="llm_safe_stop",
-                narrative_language=audit_language)
+                narrative_language=audit_language, resumed_from_run_id=resumed_from_run_id, resumed_from_record_id=resumed_from_record_id)
             _request = _Request(proposal_hash="",
                                 query_unit_id=query.id,
                                 query_source=query.source,
@@ -923,7 +1035,7 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
 
             cancelled = (
                 (should_cancel is not None and should_cancel())
-                or raw_decision == "cancel"
+                or raw_decision in ("cancel", "cancelled")
             )
             timed_out = raw_decision == "timeout"
             dec_norm = raw_decision.strip().lower()
@@ -985,7 +1097,11 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                 _emit("status", "human_review", stop_reason)
 
             display = _entry_display_fields(
-                child, query, proposal, confidence, unit_result, llm_result)
+                child, query, proposal, confidence, unit_result, llm_result,
+                resumed_from_run_id=resumed_from_run_id,
+                resumed_from_record_id=resumed_from_record_id)
+            import uuid as _uuid_held
+            _held_id = "rec-" + _uuid_held.uuid4().hex[:12]
             entries.append(IntegrationUnitEntry(
                 source_file=str(child), query_unit_id=query.id,
                 query_source=query.source, query_position=query.position,
@@ -999,10 +1115,9 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                 uncertainty=candidate.uncertainty,
                 note_markdown=getattr(note, "markdown", ""),
                 human_review_state=human_review_state,
+                record_id=_held_id,
                 **display,
             ))
-            import uuid as _uuid_held
-            _held_id = "rec-" + _uuid_held.uuid4().hex[:12]
             from src.living_authenticity.knowledge.governance.audit.persistence import (
                 persist_record_resilient,
             )
@@ -1026,7 +1141,7 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
                     stop_reason=stop_reason,
                     validation_result=outcome_status,
                     proposal=proposal,
-                    narrative_language=audit_language)
+                    narrative_language=audit_language, resumed_from_run_id=resumed_from_run_id, resumed_from_record_id=resumed_from_record_id)
                 _held_request = _HeldRequest(
                     proposal_hash=prop_hash, query_unit_id=query.id,
                     query_source=query.source,
@@ -1136,5 +1251,8 @@ def _handle_unit(child, unit_result, gate=None, validator=None,
             event_sink=event_sink, should_cancel=should_cancel,
             audit_language=audit_language,
             interactive=interactive,
+            allow_test_output=allow_test_output,
+            audit_requested=audit_requested,
+            resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id,
         )
-

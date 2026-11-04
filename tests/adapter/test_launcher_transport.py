@@ -427,6 +427,7 @@ def test_cancelled_run_does_not_execute(tmp_path):
 
     entries: list = []
     audits: list = []
+    events: list = []
     _govern_candidate(
         "child.md", query, proposal, None, note,
         ExplicitApprovalGate(), Revalidator(), ControlledExecutor(),
@@ -434,7 +435,12 @@ def test_cancelled_run_does_not_execute(tmp_path):
         authorized_staging="",
         audit_writer=AuditWriter(str(audit_root)),
         should_cancel=lambda: True,
+        event_sink=lambda e: events.append(e),
     )
+
+    # Invariant: Cancellation before decision emits stopped:cancellation, NEVER approval_decided
+    assert any(e.get("kind") == "stopped" and e.get("stage") == "cancellation" for e in events)
+    assert not any(e.get("kind") == "approval_decided" for e in events)
 
     # Nothing was written to staging: cancellation stopped execution.
     assert list(staging.iterdir()) == [], "a cancelled run must not execute"
@@ -584,6 +590,31 @@ def test_post_config_updates_localization_and_loads(tmp_path, monkeypatch):
         assert loaded["language"]["audit"] == "en"
     finally:
         server.shutdown()
+
+
+def test_cancellation_signalled_before_register_approval_resolves_immediately_without_blocking():
+    """If cancellation was requested before register_approval or _approval_reader,
+    the pending approval is immediately resolved as cancelled and does not wait.
+    """
+    import time
+    launcher = _launcher()
+    run_id = "run-test-pre-cancel"
+    launcher._active_run_id = run_id
+    launcher._cancel_flags.add(run_id)
+
+    class MockReq:
+        proposal_hash = "prop-hash-pre-1"
+        confidence_score = 0.8
+    launcher.register_approval(MockReq(), None)
+
+    assert launcher._pending_approval is not None
+    assert launcher._pending_approval.state.value == "cancelled"
+    start_time = time.monotonic()
+    res = launcher._approval_reader()
+    elapsed = time.monotonic() - start_time
+    assert res == "cancel"
+    assert elapsed < 0.1, f"must return immediately without waiting, took {elapsed}s"
+
 
 
 def test_run_thread_handles_terminal_audit_persistence_failure():
@@ -1022,12 +1053,124 @@ def test_late_approval_after_cancel_raises_conflict_409(running):
     # Late approve via HTTP POST
     status, data = _request(
         server, "POST", "/api/approve",
-        body={"proposal_hash": "prop-hash-late-1", "query_unit_id": "", "decision": "approve"},
+        body={"proposal_hash": "prop-hash-late-1", "query_unit_id": "", "decision": "approve", "run_id": run_id},
         token=launcher.token,
     )
     assert status == 409, f"expected 409 Conflict for late approval, got {status}: {data}"
     payload = json.loads(data)
     assert payload["error"]["kind"] == "conflict"
+
+
+def test_full_run_cancellation_during_pending_approval_terminates_promptly_without_execution(tmp_path):
+    """End-to-end synchronization test: an active run waiting for human approval
+    terminates promptly when cancelled, creates no staging artifacts, records
+    an error audit, and rejects late approval attempts.
+    """
+    import time
+    import json
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "live_staging"
+    audit_dir = tmp_path / "live_audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=None,
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Observed Calm Morning Rituals",
+            body="People often share calm morning rituals and the pattern repeats daily.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        # Input text satisfying the 50-letter threshold that produces a novel CREATE proposal
+        input_text = (
+            "Observation:\n"
+            "I observed that people often share calm morning rituals and I notice that the pattern repeats daily. "
+            "This consistent experiential sequence demonstrates profound mindfulness and grounded self-presence."
+        )
+
+        # 1. Start a real background run via the application endpoint
+        status_code, body = _request(
+            server, "POST", "/api/run",
+            body={"input_text": input_text, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert status_code == 202, f"run creation failed: {body}"
+        run_id = json.loads(body)["run_id"]
+
+        # 2. Poll until the run reaches human review and publishes a pending approval
+        start_wait = time.monotonic()
+        pending = None
+        while time.monotonic() - start_wait < 10.0:
+            with launcher._lock:
+                if launcher._pending_approval is not None and launcher._pending_approval.run_id == run_id:
+                    pending = launcher._pending_approval
+                    break
+            time.sleep(0.05)
+
+        assert pending is not None, "run must enter human review and register pending approval"
+        # Deterministically synchronize: confirm the approval thread has actively entered its blocking wait()
+        assert pending._wait_entered.wait(timeout=5.0), "approval thread must have entered wait state"
+        prop_hash = pending.key
+        unit_id = pending.payload.get("query_unit_id", "")
+        assert pending.payload.get("proposal_action") == "CREATE"
+
+        # 3. Cancel the run via the application cancellation endpoint while waiting for approval
+        cancel_start = time.monotonic()
+        c_status, c_body = _request(
+            server, "POST", "/api/cancel",
+            body={"run_id": run_id},
+            token=launcher.token,
+        )
+        assert c_status == 200, f"cancellation request failed: {c_body}"
+        c_data = json.loads(c_body)
+        assert c_data.get("status") in ("cancel_requested", "already_completed")
+
+        # 4. Verify the waiting run terminates promptly within a bounded timeout (< 2.0s)
+        # NOT waiting for APPROVAL_TIMEOUT_SECONDS (which is 60 or 300s)
+        terminated = False
+        while time.monotonic() - cancel_start < 2.0:
+            st = launcher.run_status(run_id)
+            if st.get("status") in ("stopped", "already_completed") or not launcher._active_run_id:
+                terminated = True
+                break
+            time.sleep(0.05)
+
+        cancel_duration = time.monotonic() - cancel_start
+        assert terminated, f"run failed to terminate promptly after cancellation, took {cancel_duration}s"
+        assert cancel_duration < 1.5, f"cancellation must terminate promptly, took {cancel_duration}s"
+
+        # 5. Verify NO staging artifact was created
+        staging_files = list(staging_dir.iterdir())
+        assert len(staging_files) == 0, f"cancelled run must never execute writes to staging: {staging_files}"
+
+        # 6. Verify cancellation state and audit record in audit/errors/
+        errors_audit_file = audit_dir / "errors" / "audit.jsonl"
+        assert errors_audit_file.is_file(), "cancellation must be recorded in errors/ partition"
+        audit_lines = [json.loads(l) for l in errors_audit_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert any(
+            r.get("run_id") == run_id and (r.get("outcome") == "cancelled" or r.get("terminal_outcome") == "cancelled")
+            for r in audit_lines
+        ), f"audit records missing cancelled record: {audit_lines}"
+
+        # 7. Verify late approval request is rejected with 409 Conflict
+        app_status, app_body = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": unit_id, "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert app_status == 409, f"expected 409 Conflict for late approval after cancellation, got {app_status}: {app_body}"
+        assert len(list(staging_dir.iterdir())) == 0, "staging must remain untouched after late approval rejection"
+    finally:
+        server.shutdown()
 
 
 def test_journals_fails_closed_when_audit_boundary_cannot_be_created(tmp_path):
@@ -1218,7 +1361,7 @@ def test_non_create_proposal_web_governance_path(tmp_path):
         # Invariant: Attempting to approve a non-executable proposal via /api/approve MUST fail closed
         status, data = _request(
             server, "POST", "/api/approve",
-            body={"proposal_hash": prop_hash, "query_unit_id": "ku-transport-needs-review", "decision": "approve"},
+            body={"proposal_hash": prop_hash, "query_unit_id": "ku-transport-needs-review", "decision": "approve", "run_id": run_id},
             token=launcher.token,
         )
         assert status == 400, f"approving non-CREATE proposal must return 400, got {status}: {data}"
@@ -1387,7 +1530,7 @@ def test_non_create_proposal_rejection_and_cancellation(tmp_path):
 
         status, data = _request(
             server, "POST", "/api/approve",
-            body={"proposal_hash": prop_hash, "query_unit_id": "ku-transport-rej", "decision": "reject"},
+            body={"proposal_hash": prop_hash, "query_unit_id": "ku-transport-rej", "decision": "reject", "run_id": run_id},
             token=launcher.token,
         )
         assert status == 200
@@ -2484,7 +2627,7 @@ def test_real_pipeline_runtime_handoff_and_stale_decision_rejection(tmp_path):
 
         status_approve_stale, data_approve_stale = _request(
             server, "POST", "/api/approve",
-            body={"proposal_hash": proposal_hash, "query_unit_id": query_unit_id, "decision": "approve"},
+            body={"proposal_hash": proposal_hash, "query_unit_id": query_unit_id, "decision": "approve", "run_id": run_id},
             token=launcher.token,
         )
         assert status_approve_stale in (400, 409), f"Stale approve must be rejected with 400 or 409, got {status_approve_stale}"
@@ -2521,6 +2664,25 @@ def test_accept_proposal_requires_exact_proposal_identity():
         )
         with launcher._lock:
             launcher._pending_approval = pending
+
+        # 0a. Missing run_id -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"proposal_hash": valid_hash}, token=launcher.token)
+        assert st == 400, f"Missing run_id must be 400, got {st}: {data}"
+        assert "run_id is required" in json.loads(data)["error"]["message"].lower()
+        assert launcher._pending_approval is pending
+        assert pending.state == ApprovalState.PENDING
+
+        # 0b. Blank run_id -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": "   ", "proposal_hash": valid_hash}, token=launcher.token)
+        assert st == 400, f"Blank run_id must be 400, got {st}: {data}"
+        assert "run_id is required" in json.loads(data)["error"]["message"].lower()
+        assert launcher._pending_approval is pending
+
+        # 0c. Action mismatch -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": valid_hash, "action": "CREATE"}, token=launcher.token)
+        assert st == 400, f"Action mismatch must be 400, got {st}: {data}"
+        assert "action mismatch" in json.loads(data)["error"]["message"].lower()
+        assert launcher._pending_approval is pending
 
         # 1. Missing proposal_hash -> 400
         st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id}, token=launcher.token)
@@ -2801,3 +2963,1529 @@ def test_report_summary_accounts_for_every_expected_record_1_to_1():
     summary_unconfigured = launcher._report_summary(rep_unconfigured)
     assert summary_unconfigured["audit_persisted"] is False
     assert "Audit infrastructure is unconfigured" in summary_unconfigured["audit_warning"]
+
+
+
+def test_proposal_payload_completeness_and_run_binding_in_review():
+    """Verify register_approval payload completeness and approve run-binding validation.
+
+    1. register_approval payload includes all analytical fields: destination, reason,
+       evidence, provenance, uncertainties, is_executable.
+    2. /api/approve validates run_id matches pending.run_id (rejects mismatch with 409).
+    3. /api/approve rejects duplicate decision on already terminal run (409).
+    4. /api/approve rejects non-CREATE approvals (400).
+    5. /api/approve accepts valid matching CREATE approval (200).
+    """
+    from src.living_authenticity.adapter.app import _Pending, ApprovalState
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.governance.approval.outcome import ApprovalRequest
+
+    launcher, server = _server()
+    try:
+        run_id = "run-payload-test-1"
+        prop_hash = "c" * 64
+
+        proposal = Proposal(
+            query_unit_id="qu-1",
+            query_source="source-doc-1.md",
+            query_position=0,
+            action="CREATE",
+            title="Observed Phenomenological Pattern",
+            destination="01 - Observations/Observed Pattern.md",
+            reason="Strong empirical grounding without existing duplicate",
+            evidence=("Quote anchor 1: observed calmness", "Quote anchor 2: repeating cycle"),
+            provenance=("source-doc-1.md",),
+            uncertainties=("Subjective boundary condition",),
+            classification_type="Observation",
+        )
+        req = ApprovalRequest(
+            query_unit_id="qu-1",
+            query_source="source-doc-1.md",
+            query_position=0,
+            proposal_action="CREATE",
+            title="Observed Phenomenological Pattern",
+            destination="01 - Observations/Observed Pattern.md",
+            reason="Strong empirical grounding without existing duplicate",
+            confidence_level="high",
+            confidence_score=0.92,
+            proposal_hash=prop_hash,
+        )
+
+        with launcher._lock:
+            launcher._active_run_id = run_id
+        launcher.register_approval(req, proposal=proposal)
+
+        # 1. Verify emitted payload completeness
+        events = launcher.events.since(0)
+        review_events = [e for e in events if e.get("kind") == "human_review_required"]
+        assert len(review_events) == 1
+        payload = review_events[0]
+        assert payload["proposal_hash"] == prop_hash
+        assert payload["title"] == "Observed Phenomenological Pattern"
+        assert payload["destination"] == "01 - Observations/Observed Pattern.md"
+        assert payload["reason"] == "Strong empirical grounding without existing duplicate"
+        assert payload["evidence"] == ["Quote anchor 1: observed calmness", "Quote anchor 2: repeating cycle"]
+        assert payload["provenance"] == ["source-doc-1.md"]
+        assert payload["uncertainties"] == ["Subjective boundary condition"]
+        assert payload["is_executable"] is True
+
+        # 2a. Reject approve with missing run_id -> 400
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "qu-1", "decision": "approve"},
+            token=launcher.token,
+        )
+        assert st == 400, f"Missing run_id must be 400, got {st}: {data}"
+        assert "run_id is required" in json.loads(data)["error"]["message"].lower()
+
+        # 2b. Reject approve with blank run_id -> 400
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "qu-1", "decision": "approve", "run_id": "   "},
+            token=launcher.token,
+        )
+        assert st == 400, f"Blank run_id must be 400, got {st}: {data}"
+        assert "run_id is required" in json.loads(data)["error"]["message"].lower()
+
+        # 2c. Reject approve with action mismatch -> 400
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "qu-1", "decision": "approve", "run_id": run_id, "action": "NEEDS_REVIEW"},
+            token=launcher.token,
+        )
+        assert st == 400, f"Action mismatch must be 400, got {st}: {data}"
+        assert "action mismatch" in json.loads(data)["error"]["message"].lower()
+
+        # 2. Reject approve with mismatched run_id -> 409
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "qu-1", "decision": "approve", "run_id": "different-run-id"},
+            token=launcher.token,
+        )
+        assert st == 409, f"Mismatched run_id must be 409, got {st}: {data}"
+        assert "run_id does not match" in json.loads(data)["error"]["message"]
+
+        # 3. Reject non-CREATE approve -> 400
+        # Register a non-CREATE pending
+        non_create_pending = _Pending(
+            run_id=run_id,
+            key="d" * 64,
+            payload={"proposal_action": "NEEDS_REVIEW", "query_unit_id": "qu-2"},
+        )
+        with launcher._lock:
+            launcher._pending_approval = non_create_pending
+
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": "d" * 64, "query_unit_id": "qu-2", "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert st == 400, f"Approving non-CREATE must be 400, got {st}: {data}"
+        assert "not executable and cannot be approved" in json.loads(data)["error"]["message"]
+
+        # Restore CREATE pending
+        create_pending = _Pending(
+            run_id=run_id,
+            key=prop_hash,
+            payload={"proposal_action": "CREATE", "query_unit_id": "qu-1"},
+        )
+        with launcher._lock:
+            launcher._pending_approval = create_pending
+
+        # 4. Valid matching approve succeeds -> 200
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "qu-1", "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert st == 200, f"Valid approve must succeed with 200, got {st}: {data}"
+        resp = json.loads(data)
+        assert resp["approved"] is True
+        assert resp["proposal_hash"] == prop_hash
+
+        # 5. Reject replay on terminal run -> 409
+        with launcher._lock:
+            launcher._reports[run_id] = {"accepted": True}
+            launcher._pending_approval = None
+
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": "qu-1", "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert st == 409, f"Approve on terminal run must be 409, got {st}: {data}"
+    finally:
+        server.shutdown()
+
+
+def test_end_to_end_create_approval_loop_with_revalidation_and_staging(tmp_path):
+    """Execute end-to-end real CREATE review loop from input submission to staged note generation.
+
+    Path:
+    input submission -> EvidenceFirstPipeline -> CREATE proposal -> human_review_required
+    -> frontend review payload validation -> POST /api/approve -> revalidation gate -> controlled execution
+    -> staged artifact on disk -> durable audit persistence -> truthful run completion summary
+    """
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=None,
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Observed Calm Morning Rituals",
+            body="People often share calm morning rituals and the pattern repeats daily.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        input_text = (
+            "Observation:\n"
+            "I observed that people often share calm morning rituals and I notice that the pattern repeats daily. "
+            "This consistent experiential sequence demonstrates profound mindfulness and grounded self-presence."
+        )
+
+        st, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": input_text, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert st == 202
+        run_id = json.loads(data)["run_id"]
+
+        # Wait for human_review_required event
+        for _ in range(60):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+
+        assert launcher._pending_approval is not None, "Pending approval was not registered by real pipeline"
+        proposal_hash = launcher._pending_approval.key
+        query_unit_id = launcher._pending_approval.payload.get("query_unit_id", "")
+        action = launcher._pending_approval.payload.get("proposal_action", "")
+        assert proposal_hash, "Pending approval must have a valid proposal hash"
+
+        # STRICT ASSERTION: Pipeline must produce CREATE proposal; non-CREATE fallback is forbidden
+        assert action == "CREATE", f"Real pipeline must produce CREATE proposal, got {action}"
+        assert launcher._pending_approval.payload.get("is_executable") is True
+        assert launcher._pending_approval.run_id == run_id
+
+        # Verify review payload has all required fields for human decision
+        events = launcher.events.since(0)
+        review_events = [e for e in events if e.get("kind") == "human_review_required" and "proposal_hash" in e]
+        assert len(review_events) >= 1
+        rev_ev = review_events[0]
+        assert rev_ev["proposal_hash"] == proposal_hash
+        assert rev_ev["proposal_action"] == "CREATE"
+        assert rev_ev["is_executable"] is True
+        assert "destination" in rev_ev
+        assert "evidence" in rev_ev and len(rev_ev["evidence"]) > 0
+        assert "provenance" in rev_ev and len(rev_ev["provenance"]) > 0
+        assert "body" in rev_ev
+        assert "confidence_score" in rev_ev
+
+        # Approve via POST /api/approve
+        st_appr, data_appr = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": proposal_hash, "query_unit_id": query_unit_id, "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert st_appr == 200, f"approve failed: {st_appr} - {data_appr}"
+
+        # Wait for run to reach terminal completion
+        for _ in range(60):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    break
+            time.sleep(0.1)
+
+        assert run_id in launcher._reports, "Run did not complete after human approval"
+        report = launcher._reports[run_id]
+        assert report["accepted"] is True
+        assert report["executed"] == 1
+        assert report["held"] == 0
+        assert report["audit_persisted"] is True
+
+        # Verify revalidation and execution events were emitted
+        all_events = launcher.events.since(0)
+        reval_events = [e for e in all_events if e.get("kind") == "revalidation_result"]
+        assert len(reval_events) >= 1
+
+        exec_events = [e for e in all_events if e.get("kind") == "execution_result"]
+        assert len(exec_events) >= 1
+
+        # Verify staging file was written to disk
+        staged_files = list(staging_dir.rglob("*.md"))
+        assert len(staged_files) >= 1, "Staged artifact was not created"
+
+        # Verify durable audit record on disk in audit/passed/
+        passed_log = audit_dir / "passed" / "audit.jsonl"
+        assert passed_log.exists(), "audit/passed/audit.jsonl was not created"
+        records = [json.loads(l) for l in passed_log.read_text(encoding="utf-8").strip().splitlines()]
+        matching_audits = [r for r in records if r.get("proposal_hash") == proposal_hash]
+        assert len(matching_audits) == 1
+        audit_rec = matching_audits[0]
+        assert audit_rec["run_id"] == run_id
+        assert audit_rec["approval_approved"] is True
+        assert audit_rec["execution_executed"] is True
+        assert audit_rec["terminal_outcome"] == "executed"
+    finally:
+        server.shutdown()
+
+
+def test_end_to_end_non_create_acknowledgment_workflow_and_audit(tmp_path):
+    """Execute end-to-end non-CREATE review loop over HTTP wire protocol.
+
+    Verifies:
+    1. Input produces non-CREATE (NEEDS_REVIEW) proposal.
+    2. Rejection of missing/blank/mismatched run_id without state mutation.
+    3. Rejection of approval attempt on non-executable proposal.
+    4. Valid acknowledgment resolves pending review.
+    5. Terminal report shows held=1, executed=0, audit_persisted=True.
+    6. Zero staging files created (zero mutation).
+    7. Durable audit record in audit/failed/audit.jsonl with exact run_id, proposal_hash,
+       human_review_state='acknowledged_non_executable', approval_approved=False, execution_executed=False.
+    8. Replay rejection on terminal run (409 conflict).
+    """
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=None,
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Autonomous Deliberation",
+            body="Synthesizing empirical notes.",
+        ),
+    )
+    server = LauncherServer(launcher)
+    server.serve_in_thread()
+
+    try:
+        input_text = "Empirical investigation of reflective agency and ontological congruence in cognitive agents."
+
+        st, data = _request(
+            server, "POST", "/api/run",
+            body={"input_text": input_text, "source_mode": "examples"},
+            token=launcher.token,
+        )
+        assert st == 202
+        run_id = json.loads(data)["run_id"]
+
+        # Wait for human_review_required event
+        for _ in range(60):
+            with launcher._lock:
+                if launcher._pending_approval is not None:
+                    break
+            time.sleep(0.1)
+
+        assert launcher._pending_approval is not None
+        pending = launcher._pending_approval
+        prop_hash = pending.key
+        query_unit_id = pending.payload.get("query_unit_id", "")
+        action = pending.payload.get("proposal_action", "")
+
+        assert action == "NEEDS_REVIEW", f"Expected NEEDS_REVIEW, got {action}"
+        assert pending.payload.get("is_executable") is False
+        assert pending.run_id == run_id
+
+        # 1. Missing run_id -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"proposal_hash": prop_hash}, token=launcher.token)
+        assert st == 400
+        assert "run_id is required" in json.loads(data)["error"]["message"].lower()
+        assert launcher._pending_approval is pending
+
+        # 2. Blank run_id -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": "   ", "proposal_hash": prop_hash}, token=launcher.token)
+        assert st == 400
+        assert launcher._pending_approval is pending
+
+        # 3. Mismatched run_id -> 409
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": "other-run-id", "proposal_hash": prop_hash}, token=launcher.token)
+        assert st == 409
+        assert launcher._pending_approval is pending
+
+        # 4. Inconsistent action -> 400
+        st, data = _request(server, "POST", "/api/run/accept", body={"run_id": run_id, "proposal_hash": prop_hash, "action": "CREATE"}, token=launcher.token)
+        assert st == 400
+        assert launcher._pending_approval is pending
+
+        # 5. Non-executable proposal cannot be approved via /api/approve -> 400
+        st, data = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": query_unit_id, "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert st == 400
+        assert "not executable" in json.loads(data)["error"]["message"]
+        assert launcher._pending_approval is pending
+
+        # 6. Valid acknowledgment -> 200
+        st, data = _request(
+            server, "POST", "/api/run/accept",
+            body={"run_id": run_id, "proposal_hash": prop_hash},
+            token=launcher.token,
+        )
+        assert st == 200
+        resp = json.loads(data)
+        assert resp["accepted"] is True
+        assert resp["action"] == "NEEDS_REVIEW"
+        assert resp["run_id"] == run_id
+        assert resp["proposal_hash"] == prop_hash
+
+        # 7. Wait for run to finish
+        for _ in range(60):
+            with launcher._lock:
+                if run_id in launcher._reports:
+                    break
+            time.sleep(0.1)
+
+        assert run_id in launcher._reports
+        report = launcher._reports[run_id]
+        assert report["accepted"] is True
+        assert report["held"] == 1
+        assert report["executed"] == 0
+        assert report["audit_persisted"] is True
+        assert report["audit_warning"] == ""
+
+        # 8. Verify ZERO execution / staging files
+        staged_files = list(staging_dir.rglob("*.md"))
+        assert len(staged_files) == 0, f"No staging files should exist for non-CREATE, found: {staged_files}"
+
+        # 9. Verify durable audit record in audit/failed/audit.jsonl
+        audit_file = audit_dir / "failed" / "audit.jsonl"
+        assert audit_file.exists()
+        records = [json.loads(line) for line in audit_file.read_text(encoding="utf-8").strip().splitlines()]
+        matching = [r for r in records if r.get("proposal_hash") == prop_hash]
+        assert len(matching) == 1
+        audit_rec = matching[0]
+        assert audit_rec["run_id"] == run_id
+        assert audit_rec["proposal_hash"] == prop_hash
+        assert audit_rec["proposal_action"] == "NEEDS_REVIEW"
+        assert audit_rec["human_review_state"] == "acknowledged_non_executable"
+        assert audit_rec["approval_approved"] is False
+        assert audit_rec["execution_executed"] is False
+        assert audit_rec["execution_attempted"] is False
+        assert audit_rec["terminal_outcome"] == "held_non_executable"
+
+        # 10. Replay rejection on terminal run -> 409
+        st_dup, _ = _request(
+            server, "POST", "/api/run/accept",
+            body={"run_id": run_id, "proposal_hash": prop_hash},
+            token=launcher.token,
+        )
+        assert st_dup == 409
+
+        st_stale_appr, _ = _request(
+            server, "POST", "/api/approve",
+            body={"proposal_hash": prop_hash, "query_unit_id": query_unit_id, "decision": "approve", "run_id": run_id},
+            token=launcher.token,
+        )
+        assert st_stale_appr == 409
+    finally:
+        server.shutdown()
+
+
+def test_action_consistency_validation_fails_on_mismatch():
+    """Action mismatch between request and proposal must be rejected without state mutation."""
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.governance.approval.outcome import ApprovalRequest
+    from src.living_authenticity.adapter.app import AdapterError, Launcher
+
+    launcher = Launcher(paths={}, llm_config={"llm": {"provider": "disabled"}}, open_browser=False)
+
+    ku = KnowledgeUnit(id="ku-act-1", source="src", original_text="Text", meaning="Text", position=0)
+    prop = Proposal(query_unit_id="ku-act-1", query_source="src", query_position=0, action="CREATE", title="T")
+
+    # Mismatched proposal_action in request vs proposal.action
+    mismatched_req = ApprovalRequest(
+        query_unit_id="ku-act-1",
+        query_source="src",
+        query_position=0,
+        proposal_action="NEEDS_REVIEW",
+        title="T",
+        confidence_level="high",
+        confidence_score=0.9,
+        proposal_hash="b" * 64,
+    )
+
+    import pytest
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.register_approval(mismatched_req, proposal=prop)
+    assert exc_info.value.kind == "validation_error"
+    assert "action mismatch" in exc_info.value.message.lower()
+
+
+def test_contradictory_action_fields_in_request_rejected():
+    """When both proposal_action and action are present with conflicting values, request is rejected without state mutation."""
+    from src.living_authenticity.adapter.app import _Pending, ApprovalState
+    launcher, server = _server()
+    run_id = "run-contradictory-actions"
+    prop_hash = "f" * 64
+    launcher._active_run_id = run_id
+
+    # 1. Non-CREATE pending review
+    pending_non_create = _Pending(
+        run_id=run_id,
+        key=prop_hash,
+        payload={"proposal_action": "NEEDS_REVIEW", "query_unit_id": "qu-non-create"},
+    )
+    with launcher._lock:
+        launcher._pending_approval = pending_non_create
+
+    try:
+        # A. Contradictory fields in /api/run/accept -> 400 validation error
+        st, data = _request(
+            server, "POST", "/api/run/accept",
+            body={
+                "run_id": run_id,
+                "proposal_hash": prop_hash,
+                "proposal_action": "CREATE",
+                "action": "NEEDS_REVIEW",
+            },
+            token=launcher.token,
+        )
+        assert st == 400, f"Expected 400, got {st}: {data}"
+        resp = json.loads(data)
+        assert resp["error"]["kind"] == "validation_error"
+        assert "contradictory action fields" in resp["error"]["message"].lower()
+
+        # Invariant: State is completely unmutated
+        assert launcher._pending_approval is pending_non_create
+        assert pending_non_create.state == ApprovalState.PENDING
+
+        # B. Client-supplied CREATE metadata on non-CREATE proposal never authorizes execution
+        st_spoof, data_spoof = _request(
+            server, "POST", "/api/approve",
+            body={
+                "run_id": run_id,
+                "proposal_hash": prop_hash,
+                "query_unit_id": "qu-non-create",
+                "decision": "approve",
+                "action": "CREATE",
+                "proposal_action": "CREATE",
+            },
+            token=launcher.token,
+        )
+        assert st_spoof == 400
+        assert "action mismatch" in json.loads(data_spoof)["error"]["message"].lower()
+        assert launcher._pending_approval is pending_non_create
+        assert pending_non_create.state == ApprovalState.PENDING
+
+        # C. Non-CREATE proposal without action fields also cannot be approved
+        st_no_act, data_no_act = _request(
+            server, "POST", "/api/approve",
+            body={
+                "run_id": run_id,
+                "proposal_hash": prop_hash,
+                "query_unit_id": "qu-non-create",
+                "decision": "approve",
+            },
+            token=launcher.token,
+        )
+        assert st_no_act == 400
+        assert "not executable and cannot be approved" in json.loads(data_no_act)["error"]["message"].lower()
+        assert launcher._pending_approval is pending_non_create
+        assert pending_non_create.state == ApprovalState.PENDING
+
+        # 2. CREATE pending review
+        create_hash = "e" * 64
+        pending_create = _Pending(
+            run_id=run_id,
+            key=create_hash,
+            payload={"proposal_action": "CREATE", "query_unit_id": "qu-create"},
+        )
+        with launcher._lock:
+            launcher._pending_approval = pending_create
+
+        # Contradictory fields in /api/approve -> 400 validation error
+        st_appr, data_appr = _request(
+            server, "POST", "/api/approve",
+            body={
+                "run_id": run_id,
+                "proposal_hash": create_hash,
+                "query_unit_id": "qu-create",
+                "decision": "approve",
+                "proposal_action": "CREATE",
+                "action": "NEEDS_REVIEW",
+            },
+            token=launcher.token,
+        )
+        assert st_appr == 400, f"Expected 400, got {st_appr}: {data_appr}"
+        resp_appr = json.loads(data_appr)
+        assert resp_appr["error"]["kind"] == "validation_error"
+        assert "contradictory action fields" in resp_appr["error"]["message"].lower()
+
+        # Invariant: State is completely unmutated
+        assert launcher._pending_approval is pending_create
+        assert pending_create.state == ApprovalState.PENDING
+    finally:
+        server.shutdown()
+
+
+def test_launcher_trust_boundary_protects_test_output(tmp_path):
+    """Verify the test-only trust boundary in the adapter layer:
+    1. Launcher(is_test_mode=False) refuses tests/output for staging or audit.
+    2. /api/config cannot activate is_test_mode or bypass trust boundaries.
+    3. pick_folder rejects tests/output as inside repository workspace.
+    4. /api/run cannot elevate privilege via request body parameters.
+    """
+    import json
+    import shutil
+    from Config.settings import ROOT as REPOSITORY_ROOT
+    from src.living_authenticity.adapter import Launcher, LauncherServer
+    from src.living_authenticity.adapter.picker import STATUS_INVALID
+
+    test_staging = REPOSITORY_ROOT / "tests" / "output" / "probe_launcher_staging"
+    test_staging.mkdir(parents=True, exist_ok=True)
+    try:
+        # A. Launcher initialized with is_test_mode=False (default) and mock picker
+        launcher = Launcher(
+            paths={"staging": {"root": str(test_staging)}},
+            llm_config={"llm": {"provider": "disabled"}},
+            open_browser=False,
+            is_test_mode=False,
+            picker=lambda p: ("configured", str(test_staging), ""),
+        )
+        assert launcher._is_test_mode is False
+
+        # B. pick_folder strictly rejects tests/output (and its subdirectories)
+        res_staging = launcher.pick_folder("staging")
+        assert res_staging[0] == STATUS_INVALID
+        assert "inside the repository workspace" in res_staging[2]
+
+        res_audit = launcher.pick_folder("audit")
+        assert res_audit[0] == STATUS_INVALID
+        assert "inside the repository workspace" in res_audit[2]
+
+        from src.living_authenticity.adapter.picker import validate_purpose
+        status_stg, _, reason_stg = validate_purpose("staging", str(test_staging), launcher.paths())
+        assert status_stg == STATUS_INVALID
+        assert "inside the repository workspace" in reason_stg
+
+        # C. HTTP API validation via LauncherServer
+        server = LauncherServer(launcher)
+        server.serve_in_thread()
+        try:
+            # 1. /api/config cannot toggle test mode or bypass boundary
+            st_cfg, data_cfg = _request(
+                server, "POST", "/api/config",
+                body={"is_test_mode": True, "allow_test_output": True, "source_mode": "examples"},
+                token=launcher.token,
+            )
+            assert st_cfg == 200
+            assert launcher._is_test_mode is False
+
+            # 2. /api/folders/pick with mock picker returns invalid for tests/output
+            st_pick, data_pick = _request(
+                server, "POST", "/api/folders/pick",
+                body={"purpose": "staging"},
+                token=launcher.token,
+            )
+            assert st_pick == 200
+            resp_pick = json.loads(data_pick)
+            assert resp_pick["status"] == STATUS_INVALID
+            assert "inside the repository workspace" in resp_pick.get("reason", "")
+        finally:
+            server.shutdown()
+    finally:
+        if test_staging.exists():
+            shutil.rmtree(test_staging, ignore_errors=True)
+
+
+def test_retrieval_events_emitted_through_launcher_event_path_with_correct_stamps_and_cancellation(tmp_path):
+    """Verify that all 5 distinct Retrieval capabilities emit ordered, stamped events
+    through the actual Launcher event sink and that intermediate cancellation stops cleanly.
+    """
+    import time
+    import threading
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "stg"
+    audit_dir = tmp_path / "aud"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=None,
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Calm Morning Rituals",
+            body="People often share calm morning rituals and the pattern repeats daily.",
+        ),
+    )
+
+    input_text = (
+        "Observation:\n"
+        "I observed that people often share calm morning rituals and I notice that the pattern repeats daily. "
+        "This consistent experiential sequence demonstrates profound mindfulness and grounded self-presence."
+    )
+
+    # 1. Normal run through Launcher
+    res = launcher.start_run(input_text, source_mode="examples")
+    run_id = res["run_id"]
+
+    start = time.monotonic()
+    while time.monotonic() - start < 10.0:
+        with launcher._lock:
+            if launcher._pending_approval is not None and launcher._pending_approval.run_id == run_id:
+                launcher.approve(
+                    launcher._pending_approval.key,
+                    launcher._pending_approval.payload.get("query_unit_id", ""),
+                    "approve",
+                    run_id=run_id,
+                    proposal_action=launcher._pending_approval.payload.get("proposal_action", ""),
+                )
+                break
+        time.sleep(0.05)
+
+    start = time.monotonic()
+    while time.monotonic() - start < 5.0:
+        st = launcher.run_status(run_id)
+        if st.get("status") in ("completed", "stopped") or not launcher._active_run_id:
+            break
+        time.sleep(0.05)
+
+    ret_events = [
+        e for e in launcher.events.since(0)
+        if e.get("stage") == "retrieval" and e.get("operation")
+    ]
+    expected_ops = [
+        "query_preparation",
+        "candidate_retrieval",
+        "relevance_assessment",
+        "candidate_identification",
+        "retrieval_evidence_recording",
+    ]
+    seen_ops = [e["operation"] for e in ret_events if e.get("phase") == "completed"]
+    for op in expected_ops:
+        assert op in seen_ops, f"operation {op} must be emitted with phase=completed: {ret_events}"
+
+    for e in ret_events:
+        assert e.get("run_id") == run_id, f"event {e} must have run_id={run_id}"
+
+    completed_events = [e for e in ret_events if e.get("phase") == "completed"]
+    completed_ops = [e["operation"] for e in completed_events]
+    op_indices = [completed_ops.index(op) for op in expected_ops if op in completed_ops]
+    assert op_indices == sorted(op_indices), f"operations must complete in order: {completed_ops}"
+
+    # 2. Intermediate cancellation during retrieval
+    cancel_after_op = "candidate_retrieval"
+    cancelled_seen = []
+
+    staging_c2 = staging_dir / "c2"
+    audit_c2 = audit_dir / "c2"
+    staging_c2.mkdir(parents=True, exist_ok=True)
+    audit_c2.mkdir(parents=True, exist_ok=True)
+
+    launcher2 = _launcher(
+        paths={
+            "staging": {"root": str(staging_c2)},
+            "audit": {"root": str(audit_c2)},
+        },
+        pipeline_factory=None,
+    )
+
+    orig_append = launcher2.events.append
+
+    def hooked_append(payload: dict) -> int:
+        res = orig_append(payload)
+        if (
+            isinstance(payload, dict)
+            and payload.get("stage") == "retrieval"
+            and payload.get("operation") == cancel_after_op
+            and payload.get("phase") == "completed"
+        ):
+            active = launcher2._active_run_id
+            if active:
+                launcher2.request_cancel(active)
+                cancelled_seen.append(active)
+        return res
+
+    launcher2.events.append = hooked_append
+
+    res2 = launcher2.start_run(input_text, source_mode="examples")
+    run_id2 = res2["run_id"]
+
+    start = time.monotonic()
+    while time.monotonic() - start < 5.0:
+        st = launcher2.run_status(run_id2)
+        if not st.get("active") or not launcher2._active_run_id:
+            break
+        time.sleep(0.02)
+
+    assert len(cancelled_seen) == 1, "cancellation must be triggered exactly once upon candidate_retrieval completion"
+
+    all_events2 = launcher2.events.since(0)
+    ret_events2 = [
+        e for e in all_events2
+        if e.get("stage") == "retrieval" and e.get("operation")
+    ]
+
+    # 1. Verify cancellation is reflected in the appropriate next Retrieval substage event
+    cancelled_substage_events = [
+        e for e in ret_events2
+        if e.get("operation") == "relevance_assessment" and e.get("phase") == "cancelled"
+    ]
+    assert len(cancelled_substage_events) == 1, (
+        f"expected exactly one 'relevance_assessment' event with phase='cancelled', got: {ret_events2}"
+    )
+    canc_ev = cancelled_substage_events[0]
+    assert canc_ev.get("kind") == "status"
+    assert canc_ev.get("stage") == "retrieval"
+    assert "Retrieval cancelled before relevance assessment" in canc_ev.get("message", "")
+    assert canc_ev.get("run_id") == run_id2
+
+    # 2. Verify no later Retrieval substage is incorrectly reported as completed after cancellation
+    completed_ops2 = [e["operation"] for e in ret_events2 if e.get("phase") == "completed"]
+    assert "relevance_assessment" not in completed_ops2, (
+        f"cancelled substep 'relevance_assessment' must not be completed: {completed_ops2}"
+    )
+    assert "candidate_identification" not in completed_ops2, (
+        f"later substep 'candidate_identification' must not be completed: {completed_ops2}"
+    )
+    assert "retrieval_evidence_recording" not in completed_ops2, (
+        f"terminal substep 'retrieval_evidence_recording' must not be completed: {completed_ops2}"
+    )
+
+    # Also verify later substages were never started
+    started_ops2 = [e["operation"] for e in ret_events2 if e.get("phase") == "started"]
+    assert "candidate_identification" not in started_ops2, (
+        f"later substep 'candidate_identification' must not be started: {started_ops2}"
+    )
+    assert "retrieval_evidence_recording" not in started_ops2, (
+        f"terminal substep 'retrieval_evidence_recording' must not be started: {started_ops2}"
+    )
+
+    # 3. Verify event sequence remains correctly associated with the same run_id
+    for e in ret_events2:
+        assert e.get("run_id") == run_id2, f"event {e} has mismatched run_id; expected {run_id2}"
+
+    # Also check cancellation stopped event is present and attributed
+    stopped_events = [
+        e for e in all_events2
+        if e.get("stage") == "cancellation" and e.get("kind") == "stopped"
+    ]
+    assert len(stopped_events) == 1, f"expected cancellation stopped event: {all_events2}"
+    assert stopped_events[0].get("run_id") == run_id2
+
+    # Terminal state check
+    terminal_status = launcher2.run_status(run_id2)
+    assert terminal_status.get("active") is False
+    assert not launcher2._active_run_id
+
+
+def test_operational_error_persists_durable_error_audit_and_pauses_run(tmp_path, monkeypatch):
+    """When processing encounters an unhandled operational exception in _run_thread,
+    it durably writes an infrastructure_error record to errors/ partition,
+    emits audit_persisted telemetry, records FAILED outcome, and suspends the run."""
+    import time
+    import json
+
+    staging_dir = tmp_path / "staging"
+    audit_dir = tmp_path / "audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+    )
+
+    # Force an unhandled operational exception during run execution
+    def failing_execute(*args, **kwargs):
+        raise RuntimeError("Simulated infrastructure storage failure during execution")
+
+    monkeypatch.setattr(launcher, "_execute_run", failing_execute)
+
+    valid_text = (
+        "Observation:\n"
+        "I observed that quiet reflective practice consistently fosters emotional resilience in complex teams."
+    )
+    res = launcher.start_run(input_text=valid_text, source_mode="examples")
+    run_id = res["run_id"]
+
+    # Wait for the worker thread to encounter the exception and settle
+    for _ in range(50):
+        with launcher._lock:
+            if run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert run_id in launcher._reports
+    rep = launcher._reports[run_id]
+    assert rep["outcome"] == "FAILED"
+    assert rep["terminal_outcome"] == "infrastructure_error"
+    assert rep["audit_persisted"] is True
+
+    # Run must be paused with recovery options
+    assert launcher._paused_run is not None
+    assert launcher._paused_run["run_id"] == run_id
+    assert launcher._paused_run["error"] == "RuntimeError"
+
+    events = [e for e in launcher.events.since(0) if e.get("run_id") == run_id]
+    rejection_events = [e for e in events if e.get("kind") == "run_rejected" and e.get("stage") == "paused"]
+    assert len(rejection_events) == 1
+    assert rejection_events[0]["recovery_options"] == ["fix_input", "stop"]
+
+    audit_events = [e for e in events if e.get("kind") == "audit_persisted"]
+    assert len(audit_events) == 1
+    assert audit_events[0]["audit_mode"] == "normal"
+    assert audit_events[0]["audit_partition"] == "errors"
+    assert audit_events[0]["audit_partitions"] == ["errors"]
+
+    # Verify durable record on disk in errors/ partition
+    errors_file = audit_dir / "errors" / "audit.jsonl"
+    assert errors_file.exists()
+    records = [json.loads(line) for line in errors_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    matching = [r for r in records if r.get("run_id") == run_id]
+    assert len(matching) == 1
+    rec = matching[0]
+    assert rec["terminal_outcome"] == "infrastructure_error"
+    assert rec["validation_result"] == "FAILED"
+    assert "Simulated infrastructure storage failure" in rec["stop_reason"]
+    assert any("Simulated infrastructure storage failure" in err for err in rec.get("errors", ()))
+
+    # Verify passed and failed partitions do NOT have this record
+    assert not (audit_dir / "passed" / "audit.jsonl").exists()
+    assert not (audit_dir / "failed" / "audit.jsonl").exists()
+
+
+def test_stop_paused_run_persists_durable_stopped_audit(tmp_path):
+    """Explicit operator termination of a paused run records an explicit stopped_by_user
+    AuditRecord in the errors/ partition, emits audit_persisted and stopped events,
+    and cleanly resets paused state."""
+    import json
+
+    staging_dir = tmp_path / "staging"
+    audit_dir = tmp_path / "audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+    )
+
+    paused_run_id = "run-paused-err-01"
+    launcher._paused_run = {
+        "run_id": paused_run_id,
+        "input_text": "Sample text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "ConnectionError",
+        "error_message": "Network timeout to vector database",
+        "timestamp": "2026-11-04T00:00:00Z",
+    }
+
+    res = launcher.stop_paused_run(run_id=paused_run_id)
+    assert res["stopped"] is True
+    assert res["run_id"] == paused_run_id
+    assert res["terminal_outcome"] == "stopped_by_user"
+
+    # Paused state is cleared
+    assert launcher._paused_run is None
+
+    # Report is updated to STOPPED
+    rep = launcher._reports[paused_run_id]
+    assert rep["outcome"] == "STOPPED"
+    assert rep["terminal_outcome"] == "stopped_by_user"
+    assert rep["audit_persisted"] is True
+
+    # Events emitted
+    events = [e for e in launcher.events.since(0) if e.get("run_id") == paused_run_id]
+    stopped_events = [e for e in events if e.get("kind") == "stopped"]
+    assert len(stopped_events) == 1
+    assert stopped_events[0]["terminal_outcome"] == "stopped_by_user"
+
+    audit_events = [e for e in events if e.get("kind") == "audit_persisted"]
+    assert len(audit_events) == 1
+    assert audit_events[0]["audit_partition"] == "failed"
+
+    # Durable audit on disk in failed/
+    failed_file = audit_dir / "failed" / "audit.jsonl"
+    assert failed_file.exists()
+    records = [json.loads(line) for line in failed_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    matching = [r for r in records if r.get("run_id") == paused_run_id]
+    assert len(matching) == 1
+    assert matching[0]["terminal_outcome"] == "stopped_by_user"
+    assert matching[0]["validation_result"] == "STOPPED"
+    assert "paused run stopped by user" in matching[0]["stop_reason"]
+
+
+def test_fix_paused_run_prevalidates_and_preserves_paused_state_on_invalid_input(tmp_path):
+    """When operator attempts to fix a paused run with invalid parameters,
+    validation fails closed and the run remains paused (not destroyed or cleared)."""
+    import pytest
+    from src.living_authenticity.adapter.app import AdapterError
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(tmp_path / "staging")},
+            "audit": {"root": str(tmp_path / "audit")},
+        },
+    )
+
+    paused_id = "run-paused-err-02"
+    launcher._paused_run = {
+        "run_id": paused_id,
+        "input_text": "Original broken text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "SyntaxError",
+        "error_message": "Malformed syntax",
+        "timestamp": "2026-11-04T00:00:00Z",
+    }
+
+    # 1. Empty input text fails validation and preserves paused run
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=paused_id, input_text="   ")
+    assert exc_info.value.kind == "validation_error"
+    assert launcher._paused_run is not None
+    assert launcher._paused_run["run_id"] == paused_id
+
+    # 2. Invalid source mode fails validation and preserves paused run
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=paused_id, source_mode="unsupported_source_mode")
+    assert exc_info.value.kind == "validation_error"
+    assert launcher._paused_run is not None
+    assert launcher._paused_run["run_id"] == paused_id
+
+    # 3. Invalid retrieval mode fails validation and preserves paused run
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=paused_id, retrieval_mode="quantum_entanglement")
+    assert exc_info.value.kind == "validation_error"
+    assert launcher._paused_run is not None
+    assert launcher._paused_run["run_id"] == paused_id
+
+
+def test_fix_paused_run_resumes_with_provenance_and_preserves_error_history(tmp_path, monkeypatch):
+    """Resuming a paused run propagates resumed_from_run_id through the entire pipeline,
+    records successful execution in passed/ partition, and permanently preserves
+    the historical error record in errors/ partition."""
+    import time
+    import json
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "staging"
+    audit_dir = tmp_path / "audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Observed Resilience Routine",
+            body="Team resilience routines demonstrate consistent psychological safety patterns.",
+        ),
+    )
+
+    # 1. Trigger initial run that fails with an operational error
+    orig_execute = launcher._execute_run
+    fail_flag = [True]
+
+    def conditional_execute(*args, **kwargs):
+        if fail_flag[0]:
+            raise RuntimeError("Initial transient connection drop")
+        return orig_execute(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_execute_run", conditional_execute)
+
+    valid_text = (
+        "Observation:\n"
+        "I observed that consistent team resilience routines establish profound psychological safety over time."
+    )
+    first_res = launcher.start_run(input_text=valid_text, source_mode="examples")
+    first_run_id = first_res["run_id"]
+
+    for _ in range(50):
+        with launcher._lock:
+            if first_run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert launcher._reports[first_run_id]["terminal_outcome"] == "infrastructure_error"
+    assert launcher._paused_run is not None
+    assert launcher._paused_run["run_id"] == first_run_id
+
+    # 2. Fix the condition and resume run via fix_paused_run
+    fail_flag[0] = False
+
+    # Simulate automatic approval when review is required
+    def approve_worker():
+        for _ in range(50):
+            with launcher._lock:
+                pending = launcher._pending_approval
+                if pending is not None:
+                    launcher.approve(
+                        proposal_hash=pending.key,
+                        query_unit_id=pending.payload.get("query_unit_id", ""),
+                        decision="approve",
+                        run_id=pending.run_id,
+                        proposal_action=pending.payload.get("proposal_action", ""),
+                    )
+                    break
+            time.sleep(0.05)
+
+    import threading
+    t = threading.Thread(target=approve_worker, daemon=True)
+    t.start()
+
+    resumed_res = launcher.fix_paused_run(
+        run_id=first_run_id,
+        input_text=valid_text,
+    )
+    second_run_id = resumed_res["run_id"]
+    assert resumed_res["resumed_from_run_id"] == first_run_id
+    assert second_run_id != first_run_id
+
+    # Wait for resumed run to complete
+    for _ in range(60):
+        with launcher._lock:
+            if second_run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert second_run_id in launcher._reports
+    rep2 = launcher._reports[second_run_id]
+    assert rep2["accepted"] is True
+    assert rep2["executed"] == 1
+    assert rep2["audit_persisted"] is True
+
+    # 3. Verify passed/ partition has the new record with resumed_from_run_id linked
+    passed_file = audit_dir / "passed" / "audit.jsonl"
+    assert passed_file.exists()
+    passed_records = [json.loads(line) for line in passed_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    matching_passed = [r for r in passed_records if r.get("run_id") == second_run_id]
+    assert len(matching_passed) == 1
+    assert matching_passed[0]["resumed_from_run_id"] == first_run_id
+    assert matching_passed[0]["execution_executed"] is True
+    assert matching_passed[0]["terminal_outcome"] == "executed"
+
+    # 4. Invariant: Original error record in errors/ partition is PERMANENTLY preserved
+    errors_file = audit_dir / "errors" / "audit.jsonl"
+    assert errors_file.exists()
+    error_records = [json.loads(line) for line in errors_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    matching_errors = [r for r in error_records if r.get("run_id") == first_run_id]
+    assert len(matching_errors) == 1
+    assert matching_errors[0]["terminal_outcome"] == "infrastructure_error"
+    first_error_record_id = matching_errors[0]["record_id"]
+    assert first_error_record_id != ""
+    assert matching_passed[0]["resumed_from_record_id"] == first_error_record_id
+    assert rep2["resumed_from_record_id"] == first_error_record_id
+
+
+def test_fix_paused_run_with_needs_review_lands_in_failed_not_errors(tmp_path, monkeypatch):
+    """Scenario 4: When a paused run is resumed and downstream evaluation produces
+    a non-executable NEEDS_REVIEW governance outcome, the terminal record routes to
+    failed/ partition, preserving the historical error in errors/ without conflation."""
+    import time
+    from tests._synthetic_synthesis import SyntheticSynthesis
+
+    staging_dir = tmp_path / "staging"
+    audit_dir = tmp_path / "audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    class _Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+    from src.living_authenticity.knowledge.decision.proposal.outcome import Proposal
+    from src.living_authenticity.knowledge.analysis.classification.result import ClassificationResult
+    from src.living_authenticity.knowledge.decision.confidence.outcome import ConfidenceAssessment
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+
+    def _make_needs_review_unit():
+        query = KnowledgeUnit(
+            id="ku-transport-needs-review-resumed", source="chat_input:inp-001",
+            original_text="Ambiguous input text needing human review before staging.",
+            meaning="Ambiguous input text needing human review before staging.",
+            cleaned_text="Ambiguous input text needing human review before staging.",
+            normalized_text="Ambiguous input text needing human review before staging.",
+            position=0,
+        )
+        proposal = Proposal(
+            query_unit_id="ku-transport-needs-review-resumed", query_source="chat_input:inp-001",
+            query_position=0, action="NEEDS_REVIEW",
+            title="Needs Review Concept",
+            destination="Notes/NeedsReview.md",
+            reason="Ambiguity detected during analysis",
+            classification_type="Observation",
+        )
+        classification = ClassificationResult(
+            unit_id="ku-transport-needs-review-resumed", source="chat_input:inp-001", position=0,
+            proposed_type="Observation",
+            rationale="Ambiguous text categorized as observation",
+        )
+        candidate = _Obj(unit_id="vault-u1", source="vault/note.md",
+                         position=0, overlap_score=2, text="existing note excerpt")
+        retrieval = _Obj(candidates=(candidate,), note="lexical retrieval note")
+        comparison = _Obj(candidate_unit_id="vault-u1", category="related",
+                          shared_terms=("ambiguous", "review"))
+        relation = _Obj(proposals=())
+        core = _Obj(relevance="unresolved", basis="unresolved core relevance")
+        confidence = ConfidenceAssessment(
+            query_unit_id="ku-transport-needs-review-resumed", query_source="chat_input:inp-001",
+            query_position=0, proposal_action="NEEDS_REVIEW",
+            level="weak", basis="synthetic weak confidence basis",
+        )
+        filter_outcome = _Obj(verdict="needs_review", basis="synthetic filter review basis")
+
+        class _StubUnitResult:
+            def __init__(self):
+                self.query_unit = query
+                self.proposal = proposal
+                self.classification = classification
+                self.retrieval_result = retrieval
+                self.comparisons = (comparison,)
+                self.relation_result = relation
+                self.core_analysis = core
+                self.confidence = confidence
+                self.filter_outcome = filter_outcome
+
+        return _StubUnitResult()
+
+    class _MockPipeline:
+        def __init__(self, stage_observer=None):
+            self._stage_observer = stage_observer
+            self.ingestion = EvidenceFirstPipeline(stage_observer=stage_observer).ingestion
+
+        def run_ingestion(self, ingestion, corpus=(), core_units=()):
+            class _Result:
+                units = [_make_needs_review_unit()]
+            return _Result()
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+        pipeline_factory=lambda observer=None: _MockPipeline(stage_observer=observer),
+        synthesis_factory=lambda confirm=None, config=None: SyntheticSynthesis(
+            title="Needs Review Concept",
+            body="Synthesized candidate body requiring human review.",
+        ),
+    )
+
+    orig_execute = launcher._execute_run
+    fail_flag = [True]
+
+    def conditional_execute(*args, **kwargs):
+        if fail_flag[0]:
+            raise RuntimeError("Initial transient network timeout")
+        return orig_execute(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_execute_run", conditional_execute)
+
+    valid_text = (
+        "Observation:\n"
+        "I observed that quiet reflective practice consistently fosters emotional resilience in complex teams."
+    )
+    first_res = launcher.start_run(input_text=valid_text, source_mode="examples")
+    first_run_id = first_res["run_id"]
+
+    for _ in range(50):
+        with launcher._lock:
+            if first_run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert launcher._reports[first_run_id]["terminal_outcome"] == "infrastructure_error"
+    assert launcher._paused_run is not None
+
+    fail_flag[0] = False
+
+    # Thread to acknowledge non-executable proposal
+    def ack_worker():
+        for _ in range(50):
+            with launcher._lock:
+                pending = launcher._pending_approval
+                if pending is not None:
+                    launcher.accept_proposal(
+                        proposal_hash=pending.key,
+                        run_id=pending.run_id,
+                        proposal_action=pending.payload.get("proposal_action", "NEEDS_REVIEW"),
+                    )
+                    break
+            time.sleep(0.05)
+
+    import threading
+    t = threading.Thread(target=ack_worker, daemon=True)
+    t.start()
+
+    resumed_res = launcher.fix_paused_run(
+        run_id=first_run_id,
+        input_text=valid_text,
+    )
+    second_run_id = resumed_res["run_id"]
+    assert resumed_res["resumed_from_run_id"] == first_run_id
+
+    for _ in range(60):
+        with launcher._lock:
+            if second_run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert second_run_id in launcher._reports
+    rep2 = launcher._reports[second_run_id]
+    assert rep2["accepted"] is True
+    assert rep2["held"] == 1
+    assert rep2["executed"] == 0
+    assert rep2["audit_persisted"] is True
+
+    # 1. Terminal record for resumed run MUST be in failed/ (held non-executable)
+    failed_file = audit_dir / "failed" / "audit.jsonl"
+    assert failed_file.exists()
+    failed_records = [json.loads(line) for line in failed_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    matching_failed = [r for r in failed_records if r.get("run_id") == second_run_id]
+    assert len(matching_failed) == 1
+    assert matching_failed[0]["resumed_from_run_id"] == first_run_id
+    assert matching_failed[0]["terminal_outcome"] == "held_non_executable"
+    assert matching_failed[0]["execution_executed"] is False
+
+    # 2. Invariant: Original error record remains intact in errors/ partition
+    errors_file = audit_dir / "errors" / "audit.jsonl"
+    assert errors_file.exists()
+    error_records = [json.loads(line) for line in errors_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    matching_errors = [r for r in error_records if r.get("run_id") == first_run_id]
+    assert len(matching_errors) == 1
+    assert matching_errors[0]["terminal_outcome"] == "infrastructure_error"
+    assert matching_failed[0]["resumed_from_record_id"] == matching_errors[0]["record_id"]
+    assert rep2["resumed_from_record_id"] == matching_errors[0]["record_id"]
+
+    # 3. Passed partition must NOT contain second_run_id
+    passed_file = audit_dir / "passed" / "audit.jsonl"
+    if passed_file.exists():
+        passed_records = [json.loads(line) for line in passed_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+        assert not any(r.get("run_id") == second_run_id for r in passed_records)
+
+
+def test_fix_paused_run_fails_again_records_both_errors_without_false_success(tmp_path, monkeypatch):
+    """Scenario 5: When recovery is attempted but encounters another operational error,
+    both error records remain durably preserved and traceable in errors/, the second links
+    to the first via resumed_from_run_id, and no false success is reported."""
+    import time
+
+    staging_dir = tmp_path / "staging"
+    audit_dir = tmp_path / "audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+    )
+
+    call_count = [0]
+
+    def recurring_error(*args, **kwargs):
+        call_count[0] += 1
+        raise RuntimeError(f"Simulated operational crash attempt #{call_count[0]}")
+
+    monkeypatch.setattr(launcher, "_execute_run", recurring_error)
+
+    valid_text = (
+        "Observation:\n"
+        "I observed that quiet reflective practice consistently fosters emotional resilience in complex teams."
+    )
+    first_res = launcher.start_run(input_text=valid_text, source_mode="examples")
+    first_run_id = first_res["run_id"]
+
+    for _ in range(50):
+        with launcher._lock:
+            if first_run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert launcher._reports[first_run_id]["outcome"] == "FAILED"
+    assert launcher._reports[first_run_id]["terminal_outcome"] == "infrastructure_error"
+    assert launcher._paused_run is not None
+
+    # Attempt recovery while error still persists
+    resumed_res = launcher.fix_paused_run(
+        run_id=first_run_id,
+        input_text=valid_text,
+    )
+    second_run_id = resumed_res["run_id"]
+    assert resumed_res["resumed_from_run_id"] == first_run_id
+
+    for _ in range(50):
+        with launcher._lock:
+            if second_run_id in launcher._reports:
+                break
+        time.sleep(0.05)
+
+    assert second_run_id in launcher._reports
+    rep2 = launcher._reports[second_run_id]
+    assert rep2["outcome"] == "FAILED"
+    assert rep2["terminal_outcome"] == "infrastructure_error"
+    assert rep2["audit_persisted"] is True
+
+    # Both errors must be in errors/audit.jsonl
+    errors_file = audit_dir / "errors" / "audit.jsonl"
+    assert errors_file.exists()
+    records = [json.loads(line) for line in errors_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+    r1 = [r for r in records if r.get("run_id") == first_run_id]
+    r2 = [r for r in records if r.get("run_id") == second_run_id]
+    assert len(r1) == 1
+    assert len(r2) == 1
+    assert r1[0]["terminal_outcome"] == "infrastructure_error"
+    assert r2[0]["terminal_outcome"] == "infrastructure_error"
+    assert r2[0]["resumed_from_run_id"] == first_run_id
+    assert r2[0]["resumed_from_record_id"] == r1[0]["record_id"]
+    assert rep2["resumed_from_record_id"] == r1[0]["record_id"]
+
+
+def test_duplicate_recovery_attempts_fail_closed_without_duplicate_audits(tmp_path):
+    """Scenario 7: Attempting recovery multiple times on the same paused run fails closed;
+    the paused run cannot be resumed or stopped repeatedly to produce duplicate records."""
+    import pytest
+    from src.living_authenticity.adapter.app import AdapterError
+
+    staging_dir = tmp_path / "staging"
+    audit_dir = tmp_path / "audit"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(staging_dir)},
+            "audit": {"root": str(audit_dir)},
+        },
+    )
+
+    paused_id = "run-paused-err-07"
+    launcher._paused_run = {
+        "run_id": paused_id,
+        "input_text": "Observation: testing duplicate recovery attempts guard.",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "ConnectionError",
+        "error_message": "Network timeout",
+        "timestamp": "2026-11-04T00:00:00Z",
+    }
+
+    # 1. First resumption succeeds and clears _paused_run
+    res1 = launcher.fix_paused_run(
+        run_id=paused_id,
+        input_text="Observation: testing duplicate recovery attempts guard updated.",
+    )
+    assert res1["accepted"] is True
+    assert launcher._paused_run is None
+
+    # 2. Second resumption attempt on the same run_id must raise validation_error
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(
+            run_id=paused_id,
+            input_text="Observation: testing duplicate recovery attempts guard updated.",
+        )
+    assert exc_info.value.kind == "validation_error"
+
+    # 3. Late stop attempt on already-resumed run reports clean stop without new audit
+    res_stop = launcher.stop_paused_run(run_id=paused_id)
+    assert res_stop["stopped"] is True
+
+    # 4. errors/ partition has zero duplicate records for paused_id
+    errors_file = audit_dir / "errors" / "audit.jsonl"
+    if errors_file.exists():
+        records = [json.loads(line) for line in errors_file.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
+        assert len([r for r in records if r.get("run_id") == paused_id]) == 0
+
+
+def test_failed_audit_persistence_during_recovery_never_claims_durability(tmp_path, monkeypatch):
+    """Scenario 9: If audit persistence fails during recovery or stop, durability is never
+    falsely claimed; audit_failed is emitted and audit_persisted is False."""
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    launcher = _launcher(
+        paths={
+            "staging": {"root": str(tmp_path / "staging")},
+            "audit": {"root": str(tmp_path / "non_existent_dir")},
+        },
+    )
+
+    paused_id = "run-paused-err-09"
+    launcher._paused_run = {
+        "run_id": paused_id,
+        "input_text": "Sample text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Disk failure",
+        "timestamp": "2026-11-04T00:00:00Z",
+    }
+
+    # Force AuditWriter.append to fail
+    def failing_append(self, record):
+        raise OSError("Simulated hardware write failure")
+
+    monkeypatch.setattr(AuditWriter, "append", failing_append)
+
+    res = launcher.stop_paused_run(run_id=paused_id)
+    assert res["stopped"] is True
+    assert res["run_id"] == paused_id
+
+    rep = launcher._reports[paused_id]
+    assert rep["audit_persisted"] is False
+    assert rep["terminal_outcome"] == "stopped_by_user"
+
+    events = [e for e in launcher.events.since(0) if e.get("run_id") == paused_id]
+    failed_events = [e for e in events if e.get("kind") == "audit_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["audit_partition"] == "failed"
+
+    persisted_events = [e for e in events if e.get("kind") == "audit_persisted"]
+    assert len(persisted_events) == 0
+
+    # Also verify that a malformed receipt (e.g. persisted=False or unconfirmed durability) fails closed
+    paused_id_malformed = "run-paused-err-09-malformed"
+    launcher._paused_run = {
+        "run_id": paused_id_malformed,
+        "input_text": "Sample text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Disk failure",
+        "timestamp": "2026-11-04T00:00:00Z",
+    }
+    def malformed_append(self, record):
+        return {"persisted": False, "durability": "failed", "record_id": "bad-rec"}
+
+    monkeypatch.setattr(AuditWriter, "append", malformed_append)
+    res_malformed = launcher.stop_paused_run(run_id=paused_id_malformed)
+    assert res_malformed["stopped"] is True
+    assert launcher._reports[paused_id_malformed]["audit_persisted"] is False

@@ -49,6 +49,10 @@ class IntegrationUnitEntry:
     core_basis: str = ""
     classification_type: str = ""
     classification_rationale: str = ""
+    record_id: str = ""
+    error_history: tuple = field(default_factory=tuple)
+    resumed_from_run_id: str = ""
+    resumed_from_record_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "approval_approved", bool(self.approval_approved))
@@ -56,6 +60,7 @@ class IntegrationUnitEntry:
         object.__setattr__(self, "execution_attempted", bool(self.execution_attempted))
         object.__setattr__(self, "execution_permitted", bool(self.execution_permitted))
         object.__setattr__(self, "execution_executed", bool(self.execution_executed))
+        object.__setattr__(self, "error_history", tuple(self.error_history or ()))
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,14 @@ class IntegrationRunReport:
     audit_language: str = "en"
     is_authoritative: bool = False
     requires_human_review: bool = True
+    files_failed: int = 0
+    files_failed_operational: int = 0
+    files_failed_validation: int = 0
+    units_failed_operational: int = 0
+    recoverable_errors: int = 0
+    run_outcome: str = ""
+    resumed_from_run_id: str = ""
+    resumed_from_record_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "units", tuple(self.units))
@@ -125,8 +138,10 @@ class IntegrationRunReport:
                            tuple(self.audit_receipts))
         object.__setattr__(self, "is_authoritative", False)
         object.__setattr__(self, "requires_human_review", True)
+        total_failed = self.files_failed
+        if total_failed == 0 and (self.files_failed_operational > 0 or self.files_failed_validation > 0):
+            total_failed = self.files_failed_operational + self.files_failed_validation
+        object.__setattr__(self, "files_failed", total_failed)
 
 
 __all__ = ("IntegrationRunReport", "IntegrationUnitDetail", "IntegrationUnitEntry")
-
-

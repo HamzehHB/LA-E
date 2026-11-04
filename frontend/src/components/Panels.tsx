@@ -107,15 +107,15 @@ export function TranslateAction({
         disabled={loading}
         onClick={() => void handleTranslate()}
       >
-        {loading ? "Translating…" : t("ui.translate.action")}
+        {loading ? t("ui.translate.translating") : t("ui.translate.action")}
       </button>
       {open && record && record.translated_text && (
         <div role="note" className="translate-result">
           <div className="translate-meta">
             {isUnavailable && <span className="translate-badge status-unavailable">{record.status || "unavailable"}</span>}
-            {isUnverifiable && <span className="translate-badge translate-unverifiable">unverifiable</span>}
-            {isStale && <span className="translate-badge translate-stale">stale</span>}
-            {isCurrent && <span className="translate-badge status-current">current</span>}
+            {isUnverifiable && <span className="translate-badge translate-unverifiable">{t("ui.status.unverifiable")}</span>}
+            {isStale && <span className="translate-badge translate-stale">{t("ui.status.stale")}</span>}
+            {isCurrent && <span className="translate-badge status-current">{t("ui.status.current")}</span>}
             {record.source_kind && <span className="translate-kind">[{record.source_kind}]</span>}
             {record.translator && <span className="translate-translator">via {record.translator}</span>}
             {record.source_hash && (
@@ -124,7 +124,7 @@ export function TranslateAction({
               </span>
             )}
             {record.persisted === false && (
-              <span className="translate-badge on-demand">on-demand</span>
+              <span className="translate-badge on-demand">{t("ui.status.onDemand")}</span>
             )}
           </div>
           <p>{record.translated_text}</p>
@@ -145,6 +145,7 @@ export function ProcessingResult() {
     mockStopProcess,
     liveAvailable,
     liveApproval,
+    actionInFlight,
     liveApprove,
     liveEditProposal,
     liveAccept,
@@ -164,7 +165,7 @@ export function ProcessingResult() {
   const [showNoteModal, setShowNoteModal] = useState(false);
   const [fixQueryInput, setFixQueryInput] = useState("");
 
-  const executable = state.run.proposal_action === "CREATE";
+  const executable = state.run.proposal_action === "CREATE" && state.run.is_executable !== false;
   const isReviewAction = state.run.proposal_action === "NEEDS_REVIEW" || state.run.proposal_action === "DO_NOT_IMPORT";
   const livePending = liveAvailable && liveApproval !== null;
 
@@ -332,7 +333,7 @@ export function ProcessingResult() {
           </div>
         ) : hasSyncApproval && pendingSyncApproval ? (
           /* Vault Synchronization Human Approval Card */
-          <div className="safestop-card vault-sync-card" role="region" aria-label="Vault Synchronization Approval">
+          <div className="safestop-card vault-sync-card" role="region" aria-label={t("ui.vaultSync.modalAria")}>
             <div className="safestop-header">
               <span className="error-icon" aria-hidden="true" style={{ color: "var(--accent-color, #e5a50a)" }}>
                 ⚡
@@ -437,24 +438,24 @@ export function ProcessingResult() {
           ) : (
             <>
               <div className="safestop-fix-box">
-                <label htmlFor="fix-input">Correct input or parameters to resume:</label>
+                <label htmlFor="fix-input">{t("ui.recovery.correctInputHeading")}</label>
                 <input
                   id="fix-input"
                   type="text"
                   className="input-field"
                   value={fixQueryInput}
                   onChange={(e) => setFixQueryInput(e.target.value)}
-                  placeholder="Enter corrected query or instructions…"
+                  placeholder={t("ui.recovery.correctInputPlaceholder")}
                 />
               </div>
               <div className="safestop-actions">
                 {liveAvailable ? (
                   <>
                     <button type="button" className="btn approve" onClick={() => void liveFix(fixQueryInput)}>
-                      Fix & Resume
+                      {t("ui.recovery.fixResume")}
                     </button>
                     <button type="button" className="btn reject" onClick={() => void liveStop()}>
-                      Stop Run
+                      {t("ui.recovery.stopRun")}
                     </button>
                   </>
                 ) : (
@@ -472,41 +473,134 @@ export function ProcessingResult() {
           )}
         </div>
       ) : showProposal ? (
-        <div className="proposal-content">
+        <div className="proposal-content" role="region" aria-label={t("ui.review.proposalReviewAria")}>
           {showFixture && (
             <p role="note" className="demo-banner">
               {t("ui.demo.banner")}
             </p>
           )}
 
+          {/* Executability & Governance Boundary Explanatory Banner */}
+          <div
+            className={`proposal-executability-banner ${executable ? "exec-create" : "non-exec-review"}`}
+            role="note"
+            style={{
+              padding: "0.6rem 0.8rem",
+              borderRadius: "4px",
+              marginBottom: "0.75rem",
+              fontSize: "0.85rem",
+              lineHeight: "1.4",
+              background: executable ? "rgba(34, 197, 94, 0.1)" : "rgba(234, 179, 8, 0.12)",
+              border: `1px solid ${executable ? "rgba(34, 197, 94, 0.3)" : "rgba(234, 179, 8, 0.35)"}`,
+              color: executable ? "var(--text-color, #fff)" : "var(--accent-color, #e5a50a)",
+            }}
+          >
+            {executable ? (
+              <span>
+                ⚡ <strong>Executable Action ({state.run.proposal_action || "CREATE"}):</strong> {t("ui.review.execBanner")}
+              </span>
+            ) : (
+              <span>
+                🛡️ <strong>Non-Executable Proposal ({state.run.proposal_action || "NEEDS_REVIEW"}):</strong> {t("ui.review.nonExecBanner")}
+              </span>
+            )}
+          </div>
+
+          <div className="proposal-header-box" style={{ marginBottom: "0.5rem" }}>
+            <h3 className="proposal-title" style={{ margin: "0.25rem 0 0.5rem 0", fontSize: "1.1rem" }}>
+              {state.run.proposal_title || liveApproval?.title || t("ui.review.proposedTitle")}
+            </h3>
+            {(state.run.destination || liveApproval?.destination) && (
+              <p className="proposal-destination" style={{ fontSize: "0.8rem", color: "var(--muted-color, #888)", margin: "0.2rem 0" }}>
+                {t("ui.review.targetDestination")} <code style={{ color: "var(--accent-color, #38bdf8)" }}>{state.run.destination || liveApproval?.destination}</code>
+              </p>
+            )}
+            {(state.run.reason || liveApproval?.reason) && (
+              <p className="proposal-reason" style={{ fontSize: "0.85rem", fontStyle: "italic", margin: "0.3rem 0" }}>
+                {t("ui.review.analyticalJustification")} <span>{state.run.reason || liveApproval?.reason}</span>
+              </p>
+            )}
+          </div>
+
           <div className="output-box">
             <p className="output-text">{state.run.edited_body ?? state.run.proposal_body}</p>
           </div>
 
-          <div className="proposal-footer">
+          {/* Evidence, Provenance & Uncertainties Callouts */}
+          {Boolean(
+            (state.run.evidence && state.run.evidence.length > 0) ||
+            (liveApproval?.evidence && liveApproval.evidence.length > 0) ||
+            (state.run.uncertainties && state.run.uncertainties.length > 0) ||
+            (liveApproval?.uncertainties && liveApproval.uncertainties.length > 0) ||
+            (state.run.provenance && state.run.provenance.length > 0) ||
+            (liveApproval?.provenance && liveApproval.provenance.length > 0)
+          ) && (
+            <div className="proposal-details-box" style={{ margin: "0.75rem 0", padding: "0.6rem 0.8rem", background: "var(--card-bg, rgba(255,255,255,0.02))", borderRadius: "4px", border: "1px solid var(--border-color, #333)", fontSize: "0.8rem" }}>
+              {((state.run.provenance && state.run.provenance.length > 0) || (liveApproval?.provenance && liveApproval.provenance.length > 0)) && (
+                <div style={{ marginBottom: "0.4rem" }}>
+                  <strong>{t("ui.review.provenance")}</strong> {(state.run.provenance || liveApproval?.provenance || []).join(", ")}
+                </div>
+              )}
+              {((state.run.evidence && state.run.evidence.length > 0) || (liveApproval?.evidence && liveApproval.evidence.length > 0)) && (
+                <div style={{ marginBottom: "0.4rem" }}>
+                  <strong>{t("ui.review.evidenceAnchors")}</strong>
+                  <ul style={{ margin: "0.25rem 0 0 1.25rem", padding: 0 }}>
+                    {(state.run.evidence || liveApproval?.evidence || []).map((evItem, idx) => (
+                      <li key={`ev-${idx}`}>{evItem}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {((state.run.uncertainties && state.run.uncertainties.length > 0) || (liveApproval?.uncertainties && liveApproval.uncertainties.length > 0)) && (
+                <div>
+                  <strong>{t("ui.review.uncertainties")}</strong>
+                  <ul style={{ margin: "0.25rem 0 0 1.25rem", padding: 0, color: "#facc15" }}>
+                    {(state.run.uncertainties || liveApproval?.uncertainties || []).map((uncItem, idx) => (
+                      <li key={`unc-${idx}`}>{uncItem}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="proposal-footer" style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", alignItems: "center", gap: "0.5rem" }}>
             <TranslateAction
               text={state.run.edited_body ?? state.run.proposal_body}
               sourceKind="proposal"
               recordId={state.run.proposal_hash}
               sourceLang={state.stagingLanguage}
             />
-            <p className="hash-label">
-              proposal_hash: <code>{state.run.proposal_hash || "hash-pending"}</code>
-            </p>
+            <div className="identity-labels" style={{ fontSize: "0.75rem", fontFamily: "var(--font-mono, monospace)" }}>
+              {state.run.run_id && (
+                <span className="run-id-label" style={{ marginRight: "1rem" }}>
+                  run: <code>{state.run.run_id}</code>
+                </span>
+              )}
+              <span className="hash-label">
+                proposal_hash: <code>{state.run.proposal_hash || "hash-pending"}</code>
+              </span>
+            </div>
           </div>
 
           {/* Action Seams */}
-          <div className="action-row" role="group" aria-label="human review">
+          <div className="action-row" role="group" aria-label={t("ui.review.humanReviewAria")}>
             {executable ? (
               <>
                 {livePending ? (
                   <>
-                    <button type="button" className="btn approve" onClick={() => void liveApprove("approve")}>
-                      {t("ui.review.approve")}
+                    <button
+                      type="button"
+                      className="btn approve"
+                      disabled={actionInFlight}
+                      onClick={() => void liveApprove("approve")}
+                    >
+                      {actionInFlight ? t("ui.review.submitting") : t("ui.review.approve")}
                     </button>
                     <button
                       type="button"
                       className="btn ghost"
+                      disabled={actionInFlight}
                       onClick={() => {
                         setDraft(state.run.edited_body ?? state.run.proposal_body);
                         setDraftTitle(state.run.proposal_title);
@@ -515,11 +609,21 @@ export function ProcessingResult() {
                     >
                       {t("ui.review.edit")}
                     </button>
-                    <button type="button" className="btn reject" onClick={() => void liveApprove("reject")}>
-                      {t("ui.review.reject")}
+                    <button
+                      type="button"
+                      className="btn reject"
+                      disabled={actionInFlight}
+                      onClick={() => void liveApprove("reject")}
+                    >
+                      {actionInFlight ? t("ui.review.submitting") : t("ui.review.reject")}
                     </button>
-                    <button type="button" className="btn ghost note-btn" onClick={() => setShowNoteModal(true)}>
-                      Read Generated Note ↗
+                    <button
+                      type="button"
+                      className="btn ghost note-btn"
+                      disabled={actionInFlight}
+                      onClick={() => setShowNoteModal(true)}
+                    >
+                      {t("ui.review.readGeneratedNote")}
                     </button>
                     {liveError && <p role="alert" className="err-text">{liveError}</p>}
                   </>
@@ -543,7 +647,7 @@ export function ProcessingResult() {
                       {t("ui.review.reject")}
                     </button>
                     <button type="button" className="btn ghost note-btn" onClick={() => setShowNoteModal(true)}>
-                      Read Generated Note ↗
+                      {t("ui.review.readGeneratedNote")}
                     </button>
                     <button
                       type="button"
@@ -568,21 +672,26 @@ export function ProcessingResult() {
             ) : isReviewAction ? (
               <div className="review-acknowledge">
                 <p className="review-hint">
-                  This proposal is flagged as <strong>{state.run.proposal_action}</strong>. Human acknowledgment is required to complete the review.
+                  {t("ui.review.flaggedHint").replace("{action}", state.run.proposal_action || "")}
                 </p>
                 {state.run.accepted ? (
                   <p aria-live="polite" className="ok-text">✓ {t("ui.review.acknowledged")}</p>
                 ) : (
-                  <button
-                    type="button"
-                    className="btn approve"
-                    onClick={() => {
-                      if (liveAvailable) void liveAccept();
-                    }}
-                  >
-                    Accept
-                  </button>
+                  <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn acknowledge"
+                      disabled={actionInFlight}
+                      onClick={() => {
+                        if (liveAvailable) void liveAccept();
+                      }}
+                    >
+                      {actionInFlight ? t("ui.review.submittingAck") : t("ui.review.acknowledge")}
+                    </button>
+                    {actionInFlight && <span className="muted" style={{ fontSize: "0.8rem" }}>{t("ui.review.submittingDecision")}</span>}
+                  </div>
                 )}
+                {liveError && <p role="alert" className="err-text" style={{ marginTop: "0.5rem" }}>{liveError}</p>}
               </div>
             ) : (
               <div className="non-executable-row">
@@ -590,10 +699,16 @@ export function ProcessingResult() {
                 {state.run.accepted ? (
                   <span className="ok-text">✓ {t("ui.review.acknowledged")}</span>
                 ) : (
-                  <button type="button" className="btn ghost" onClick={() => void liveAccept()}>
-                    {t("ui.review.acknowledge")}
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={actionInFlight}
+                    onClick={() => void liveAccept()}
+                  >
+                    {actionInFlight ? t("ui.review.submitting") : t("ui.review.acknowledge")}
                   </button>
                 )}
+                {liveError && <p role="alert" className="err-text">{liveError}</p>}
               </div>
             )}
           </div>
@@ -601,7 +716,7 @@ export function ProcessingResult() {
           {/* Inline Edit Form */}
           {editing && (
             <div className="edit-modal-box">
-              <h4>Edit Proposal</h4>
+              <h4>{t("ui.review.editProposal")}</h4>
               <label htmlFor="edit-title">{t("ui.review.editTitle")}</label>
               <input
                 id="edit-title"
@@ -681,14 +796,14 @@ export function ProcessingResult() {
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="note-reader-title">
           <div className="modal-card reader-card">
             <div className="modal-header">
-              <h3 id="note-reader-title">{state.run.proposal_title || "Generated Note"}</h3>
+              <h3 id="note-reader-title">{state.run.proposal_title || t("ui.review.defaultNoteTitle")}</h3>
               <button type="button" className="close-btn" onClick={() => setShowNoteModal(false)}>✕</button>
             </div>
             <div className="modal-body note-markdown">
               <pre>{state.run.edited_body ?? state.run.proposal_body}</pre>
             </div>
             <div className="modal-footer">
-              <button type="button" className="btn ghost" onClick={() => setShowNoteModal(false)}>Close</button>
+              <button type="button" className="btn ghost" onClick={() => setShowNoteModal(false)}>{t("ui.common.close")}</button>
             </div>
           </div>
         </div>
@@ -720,9 +835,9 @@ export function Journals() {
       <section aria-label={t("ui.journals.audit")} className="panel journal-panel audit-journal">
         <div className="panel-head">
           <div className="journal-title-row">
-            <h2>Summary Of Recent Audits</h2>
+            <h2>{t("ui.journals.recentAuditsSummary")}</h2>
             <span className="pager-indicator">
-              [{totalSlots > 0 ? activeIdx + 1 : 0} of {totalSlots}]
+              [{totalSlots > 0 ? activeIdx + 1 : 0} {t("ui.journals.pager")} {totalSlots}]
             </span>
           </div>
           <div className="pager-nav">
@@ -744,7 +859,7 @@ export function Journals() {
                 </span>
                 {currentAudit.emergency && (
                   <span className="status-badge failed emergency-badge">
-                    Emergency Journal
+                    {t("ui.status.emergencyJournal")}
                   </span>
                 )}
               </div>
@@ -753,7 +868,7 @@ export function Journals() {
               {currentAudit.narrative && (
                 <div className="news-narrative">
                   <div className="narrative-badge">
-                    <span>{currentAudit.narrative_language === "fa" ? "گزارش حسابرسی پیوسته" : "Continuous Audit Narrative"}</span>
+                    <span>{t("ui.journals.continuousAuditNarrative")}</span>
                   </div>
                   <pre className="narrative-body">{currentAudit.narrative}</pre>
                 </div>
@@ -771,7 +886,7 @@ export function Journals() {
         </div>
 
         <div className="journal-foot">
-          <span className="sync-timer">⟳ 5s synchronized</span>
+          <span className="sync-timer">{t("ui.journals.synchronized")}</span>
           <button
             type="button"
             className="btn ghost small"
@@ -787,9 +902,9 @@ export function Journals() {
       <section aria-label={t("ui.journals.staging")} className="panel journal-panel staging-journal">
         <div className="panel-head">
           <div className="journal-title-row">
-            <h2>Summary Of Recent Staging</h2>
+            <h2>{t("ui.journals.recentStagingSummary")}</h2>
             <span className="pager-indicator">
-              [{totalSlots > 0 ? activeIdx + 1 : 0} of {totalSlots}]
+              [{totalSlots > 0 ? activeIdx + 1 : 0} {t("ui.journals.pager")} {totalSlots}]
             </span>
           </div>
           <div className="pager-nav">
@@ -810,13 +925,13 @@ export function Journals() {
                 </span>
                 {currentStaging.emergency && (
                   <span className="status-badge failed emergency-badge">
-                    Emergency
+                    {t("ui.status.emergency")}
                   </span>
                 )}
               </div>
-              <h4 className="news-title">{currentStaging.title || "Staged Artifact"}</h4>
+              <h4 className="news-title">{currentStaging.title || t("ui.journals.defaultStagingTitle")}</h4>
               <p className="news-summary excerpt">
-                {currentStaging.excerpt || (currentStaging.staging_available ? "Staging file generated and ready for human review." : "Unavailable — no staged note produced.")}
+                {currentStaging.excerpt || (currentStaging.staging_available ? t("ui.journals.stagingReadyExcerpt") : t("ui.journals.stagingUnavailableExcerpt"))}
               </p>
               <TranslateAction
                 text={currentStaging.excerpt || currentStaging.title}
@@ -850,18 +965,18 @@ export function Journals() {
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="viewall-title">
           <div className="modal-card wide-card">
             <div className="modal-header">
-              <h3 id="viewall-title">All Historical Audits & Staging Records</h3>
+              <h3 id="viewall-title">{t("ui.journals.allHistoricalRecords")}</h3>
               <button type="button" className="close-btn" onClick={() => setViewAllOpen(false)}>✕</button>
             </div>
             <div className="modal-body">
-              <h4>Audits Trail (Passed & Failed)</h4>
+              <h4>{t("ui.journals.auditsTrail")}</h4>
               <table className="journal-table">
                 <thead>
                   <tr>
-                    <th>Timestamp</th>
-                    <th>ID / Digest</th>
-                    <th>Outcome</th>
-                    <th>Reference</th>
+                    <th>{t("ui.table.timestamp")}</th>
+                    <th>{t("ui.table.digest")}</th>
+                    <th>{t("ui.table.outcome")}</th>
+                    <th>{t("ui.table.reference")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -874,18 +989,18 @@ export function Journals() {
                     </tr>
                   ))}
                   {audits.length === 0 && (
-                    <tr><td colSpan={4}>No audit records logged yet.</td></tr>
+                    <tr><td colSpan={4}>{t("ui.journals.noAudits")}</td></tr>
                   )}
                 </tbody>
               </table>
 
-              <h4 style={{ marginTop: "1.5rem" }}>Staging Artifacts</h4>
+              <h4 style={{ marginTop: "1.5rem" }}>{t("ui.journals.stagingArtifacts")}</h4>
               <table className="journal-table">
                 <thead>
                   <tr>
-                    <th>Timestamp</th>
-                    <th>Title / Reference</th>
-                    <th>Status</th>
+                    <th>{t("ui.table.timestamp")}</th>
+                    <th>{t("ui.table.titleRef")}</th>
+                    <th>{t("ui.table.status")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -893,17 +1008,17 @@ export function Journals() {
                     <tr key={s.id}>
                       <td><time>{s.timestamp}</time></td>
                       <td>{s.title || s.artifactReference || s.id}</td>
-                      <td>{s.staging_available ? "Staged" : "Unavailable"}</td>
+                      <td>{s.staging_available ? t("ui.status.staged") : t("ui.status.unavailable")}</td>
                     </tr>
                   ))}
                   {staging.length === 0 && (
-                    <tr><td colSpan={3}>No staging records available yet.</td></tr>
+                    <tr><td colSpan={3}>{t("ui.journals.noStaging")}</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
             <div className="modal-footer">
-              <button type="button" className="btn ghost" onClick={() => setViewAllOpen(false)}>Close</button>
+              <button type="button" className="btn ghost" onClick={() => setViewAllOpen(false)}>{t("ui.common.close")}</button>
             </div>
           </div>
         </div>
@@ -1073,7 +1188,8 @@ export function Composer() {
     !state.run.status.toLowerCase().includes("already completed") &&
     state.run.current_stage !== "completed";
 
-  const canSubmit = !runActive && hasMinLetters && !isOversized;
+  const vaultReady = state.sourceMode !== "vault" || state.resources.vault.validity === "configured_valid";
+  const canSubmit = !runActive && hasMinLetters && !isOversized && vaultReady;
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
@@ -1180,6 +1296,10 @@ export function Composer() {
               title={
                 runActive
                   ? t("ui.composer.runningHint")
+                  : !vaultReady
+                  ? (state.appLanguage === "fa"
+                    ? "برای ارسال در حالت مخزن، انتخاب یک پوشه معتبر الزامی است"
+                    : "A valid Obsidian Vault must be selected before processing in Vault Mode")
                   : !hasMinLetters && text.length > 0
                   ? state.appLanguage === "fa"
                     ? `حداقل ۵۰ حرف برای ارسال الزامی است (فعلی: ${letterCount} حرف)`

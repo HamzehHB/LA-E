@@ -125,6 +125,7 @@ def test_certain_classification_cannot_authorize_execution(tmp_path):
         context="Core", proposed_type="", position=0,
     )
     result = EvidenceFirstPipeline().run_unit(query, corpus=[], core_units=[])
+    assert result is not None
     assert result.classification.is_certain is True
     assert result.classification.proposed_type == "Core"
     fields = {f.name for f in dataclasses.fields(ClassificationResult)}
@@ -214,6 +215,7 @@ def test_core_conflict_resolves_conservatively_and_stays_non_executable(tmp_path
         proposed_type="", position=1,
     )
     result = EvidenceFirstPipeline().run_unit(query, corpus=[], core_units=[core])
+    assert result is not None
     assert result.core_analysis.relevance == "potentially_relevant"
     assert result.core_analysis.is_authoritative is False
     assert result.proposal.action == "NEEDS_REVIEW"

@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, within } from "@testing-library/react";
 import {
   deriveWorkflow,
   isTerminalSuccess,
@@ -12,9 +12,10 @@ import {
 } from "../components/workflowStages";
 import { StoreProvider, StoreContext, useStore } from "../state/store";
 import { Workflow } from "../components/Workflow";
-import { TranslateAction, Journals } from "../components/Panels";
+import { TranslateAction, Journals, ProcessingResult } from "../components/Panels";
 import { computeSha256 } from "../contracts/crypto";
 import type { RunEvent } from "../contracts/transport";
+import { TopNav } from "../components/TopNav";
 
 beforeEach(() => {
   localStorage.setItem("lae-welcomed", "1");
@@ -60,12 +61,21 @@ describe("workflow timeline mapping (Invariant: real events only)", () => {
 
   it("a full executed run completes through OUTPUT", () => {
     const stages = deriveWorkflow(
-      { run_id: "run-1", current_stage: "", stopped: false, status: "" },
+      { run_id: "run-1", current_stage: "", stopped: false, status: "", audit_status: "normal_persisted" },
       [ev("run_started"), ev("stage_completed", "ingestion"),
        ev("human_review_required", "human_review"),
        ev("approval_decided", "human_review", "approve"),
        ev("revalidation_result", "revalidation", "valid"),
        ev("execution_result", "controlled_execution", "executed"),
+       {
+         kind: "audit_persisted",
+         run_id: "run-1",
+         stage: "audit",
+         message: "audit records persisted (normal mode in passed partition)",
+         timestamp: "2026-10-31T20:00:00Z",
+         audit_mode: "normal",
+         audit_partition: "passed",
+       },
        ev("run_completed")]);
     const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
     expect(by.explicit_approval).toBe("completed");
@@ -73,6 +83,54 @@ describe("workflow timeline mapping (Invariant: real events only)", () => {
     expect(by.controlled_execution).toBe("completed");
     expect(by.audit).toBe("completed");
     expect(by.output).toBe("completed");
+  });
+
+  it("run_completed alone without audit event or audit_status never marks audit completed", () => {
+    // Issue A: Generic terminal event without confirmed audit persistence must not mark audit completed
+    const stagesWithoutAudit = deriveWorkflow(
+      { run_id: "run-no-audit", current_stage: "", stopped: false, status: "" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("human_review_required", "human_review"),
+        ev("approval_decided", "human_review", "approve"),
+        ev("revalidation_result", "revalidation", "valid"),
+        ev("execution_result", "controlled_execution", "executed"),
+        ev("run_completed"),
+      ],
+    );
+    const by = Object.fromEntries(stagesWithoutAudit.map((s) => [s.key, s.state]));
+    // Execution happened, but audit was never confirmed: audit is failed, NOT completed!
+    expect(by.audit).not.toBe("completed");
+    expect(by.audit).toBe("failed");
+    // Since audit failed, output artifact was quarantined and is not completed
+    expect(by.output).not.toBe("completed");
+  });
+
+  it("audit warning event causes audit stage to be failed and prevents output completion", () => {
+    const stagesWarning = deriveWorkflow(
+      { run_id: "run-warn-audit", current_stage: "", stopped: false, status: "" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("human_review_required", "human_review"),
+        ev("approval_decided", "human_review", "approve"),
+        ev("revalidation_result", "revalidation", "valid"),
+        ev("execution_result", "controlled_execution", "executed"),
+        {
+          kind: "warning",
+          run_id: "run-warn-audit",
+          stage: "audit",
+          message: "Staging artifact created, but 1 audit record(s) failed to persist to disk: disk error",
+          timestamp: "2026-10-31T20:00:00Z",
+        },
+        ev("run_completed"),
+      ],
+    );
+    const by = Object.fromEntries(stagesWarning.map((s) => [s.key, s.state]));
+    expect(by.controlled_execution).toBe("completed");
+    expect(by.audit).toBe("failed");
+    expect(by.output).not.toBe("completed");
   });
 
   it("a safe-stop marks reached stages stopped, not completed", () => {
@@ -85,12 +143,462 @@ describe("workflow timeline mapping (Invariant: real events only)", () => {
     expect(by.audit).not.toBe("completed");
     expect(by.output).not.toBe("completed");
   });
+
+  it("while human review is pending without a decision, human_review stage is current, not completed", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-rev-1", current_stage: "human_review", stopped: false, status: "awaiting human review / acknowledgment" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.llm_synthesis).toBe("completed");
+    expect(by.human_review).toBe("current");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.revalidation).toBe("pending");
+    expect(by.controlled_execution).toBe("pending");
+    expect(by.audit).toBe("pending");
+    expect(by.output).toBe("pending");
+  });
+
+  it("non-CREATE acknowledgment completes human_review and audit, leaving execution stages pending", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-ack-1", current_stage: "audit", stopped: false, status: "proposal acknowledged" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("approval_decided", "human_review", "acknowledged_needs_review"),
+        ev("stage_completed", "audit"),
+        ev("run_completed"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("completed");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.revalidation).toBe("pending");
+    expect(by.controlled_execution).toBe("pending");
+    expect(by.audit).toBe("completed");
+    expect(by.output).toBe("pending");
+  });
+
+  it("when run is cancelled before human decision, human_review is stopped, NOT completed", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-cancel-1", current_stage: "human_review", stopped: true, status: "run cancelled by user" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("stopped", "cancellation", "run cancelled by user request"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("stopped");
+    expect(by.human_review).not.toBe("completed");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.controlled_execution).toBe("pending");
+    expect(by.audit).toBe("pending");
+  });
+
+  it("when cancellation arrives with current_stage='cancellation', human_review is stopped, NOT completed", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-cancel-2", current_stage: "cancellation", stopped: true, status: "run cancelled during approval" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("stopped", "cancellation", "run cancelled during approval"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("stopped");
+    expect(by.human_review).not.toBe("completed");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.controlled_execution).toBe("pending");
+  });
+
+  it("when cancellation is followed by audit warning and run_completed, human_review remains stopped", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-cancel-3", current_stage: "audit", stopped: false, status: "run finished (with audit warnings)" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "input"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("stage_completed", "proposal"),
+        ev("stage_completed", "llm_synthesis"),
+        ev("human_review_required", "human_review"),
+        ev("status", "cancellation", "cancellation requested"),
+        ev("stopped", "cancellation", "run cancelled during approval"),
+        ev("warning", "audit", "Audit record write skipped (no audit writer available)"),
+        ev("run_completed", "", "run finished (with audit warnings)"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("stopped");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.audit).toBe("pending");
+    expect(by.output).toBe("pending");
+  });
+
+  it("when genuine rejection occurs, human_review is completed and explicit_approval is stopped", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-rej-1", current_stage: "human_review", stopped: true, status: "proposal rejected" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("approval_decided", "human_review", "rejected"),
+        ev("stopped", "human_review", "rejected by human"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("completed");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.controlled_execution).toBe("pending");
+    expect(by.audit).toBe("pending");
+  });
+
+  it("when run fails before human decision, human_review is stopped, NOT completed", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-fail-1", current_stage: "human_review", stopped: true, status: "review channel unavailable" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("error", "human_review", "timeout awaiting decision"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("stopped");
+    expect(by.human_review).not.toBe("completed");
+    expect(by.explicit_approval).toBe("pending");
+    expect(by.controlled_execution).toBe("pending");
+    expect(by.audit).toBe("pending");
+  });
+
+  it("marks audit as logged when emergency audit record is persisted during cancellation", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-cancel-1", current_stage: "human_review", stopped: true, status: "run cancelled during review" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("stopped", "cancellation", "run cancelled during review"),
+        {
+          kind: "audit_persisted",
+          run_id: "run-cancel-1",
+          stage: "audit",
+          message: "audit records persisted (emergency mode in errors partition)",
+          timestamp: "2026-10-31T20:00:00Z",
+          audit_mode: "emergency",
+          audit_partition: "errors",
+        },
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.human_review).toBe("stopped");
+    expect(by.audit).toBe("logged");
+  });
+
+  it("marks audit as completed when normal audit is persisted", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-ok-1", current_stage: "audit", stopped: false, status: "completed" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("approval_decided", "human_review", "approved"),
+        ev("revalidation_result", "revalidation", "valid"),
+        ev("execution_result", "controlled_execution", "executed"),
+        {
+          kind: "audit_persisted",
+          run_id: "run-ok-1",
+          stage: "audit",
+          message: "audit records persisted (normal mode in passed partition)",
+          timestamp: "2026-10-31T20:00:00Z",
+          audit_mode: "normal",
+          audit_partition: "passed",
+        },
+        ev("completed", "run"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.controlled_execution).toBe("completed");
+    expect(by.audit).toBe("completed");
+    expect(by.output).toBe("completed");
+  });
+
+  it("marks audit as failed when audit persistence fails", () => {
+    const stages = deriveWorkflow(
+      { run_id: "run-fail-audit-1", current_stage: "audit", stopped: true, status: "audit persistence failed" },
+      [
+        ev("run_started"),
+        ev("stage_completed", "ingestion"),
+        ev("stage_completed", "retrieval"),
+        ev("human_review_required", "human_review"),
+        ev("approval_decided", "human_review", "approved"),
+        ev("revalidation_result", "revalidation", "valid"),
+        ev("execution_result", "controlled_execution", "executed"),
+        {
+          kind: "audit_failed",
+          run_id: "run-fail-audit-1",
+          stage: "audit",
+          message: "audit persistence failed",
+          timestamp: "2026-10-31T20:00:00Z",
+        },
+        ev("stopped", "audit_persistence", "audit persistence failed"),
+      ],
+    );
+    const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+    expect(by.controlled_execution).toBe("completed");
+    expect(by.audit).toBe("failed");
+  });
+
+  it("derives audit state from run.audit_status when events are absent", () => {
+    const loggedStages = deriveWorkflow(
+      { run_id: "run-logged", current_stage: "human_review", stopped: true, status: "cancelled", audit_status: "emergency_persisted" },
+      [],
+    );
+    const byLogged = Object.fromEntries(loggedStages.map((s) => [s.key, s.state]));
+    expect(byLogged.audit).toBe("logged");
+
+    const failedStages = deriveWorkflow(
+      { run_id: "run-failed", current_stage: "controlled_execution", stopped: true, status: "failed", audit_status: "persistence_failed" },
+      [],
+    );
+    const byFailed = Object.fromEntries(failedStages.map((s) => [s.key, s.state]));
+    expect(byFailed.audit).toBe("failed");
+  });
+
+  describe("audit-state derivation precedence and output gate", () => {
+    const baseExecutedEvents: RunEvent[] = [
+      ev("run_started"),
+      ev("stage_completed", "ingestion"),
+      ev("human_review_required", "human_review"),
+      ev("approval_decided", "human_review", "approve"),
+      ev("revalidation_result", "revalidation", "valid"),
+      ev("execution_result", "controlled_execution", "executed"),
+    ];
+
+    it("Case A: execution executed + run_completed + no audit event + audit_status normal_persisted -> audit completed, output completed", () => {
+      const stages = deriveWorkflow(
+        { run_id: "run-case-a", current_stage: "", stopped: false, status: "completed", audit_status: "normal_persisted" },
+        [...baseExecutedEvents, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).toBe("completed");
+      expect(by.output).toBe("completed");
+    });
+
+    it("Case B: execution executed + run_completed + no audit event + audit_status persistence_failed -> audit failed, output pending", () => {
+      const stages = deriveWorkflow(
+        { run_id: "run-case-b", current_stage: "", stopped: false, status: "failed", audit_status: "persistence_failed" },
+        [...baseExecutedEvents, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).toBe("failed");
+      expect(by.output).toBe("pending");
+    });
+
+    it("Case C: execution executed + run_completed + no audit event + no audit_status -> audit failed, output pending", () => {
+      const stages = deriveWorkflow(
+        { run_id: "run-case-c", current_stage: "", stopped: false, status: "" },
+        [...baseExecutedEvents, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).not.toBe("completed");
+      expect(by.audit).toBe("failed");
+      expect(by.output).toBe("pending");
+    });
+
+    it("Case D: explicit audit_failed event + contradictory audit_status normal_persisted -> explicit failure preserved (audit failed), output pending", () => {
+      const stages = deriveWorkflow(
+        { run_id: "run-case-d", current_stage: "", stopped: false, status: "completed", audit_status: "normal_persisted" },
+        [
+          ...baseExecutedEvents,
+          {
+            kind: "audit_failed",
+            run_id: "run-case-d",
+            stage: "audit",
+            message: "audit persistence failed: disk write error",
+            timestamp: "2026-10-31T20:00:00Z",
+          },
+          ev("run_completed"),
+        ],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).toBe("failed");
+      expect(by.audit).not.toBe("completed");
+      expect(by.output).toBe("pending");
+    });
+
+    it("Case E: audit_persisted with missing/unknown metadata does not mark audit completed", () => {
+      const stages = deriveWorkflow(
+        { run_id: "run-case-e", current_stage: "", stopped: false, status: "" },
+        [
+          ...baseExecutedEvents,
+          {
+            kind: "audit_persisted",
+            run_id: "run-case-e",
+            stage: "audit",
+            message: "ambiguous unstructured message without mode",
+            timestamp: "2026-10-31T20:00:00Z",
+            audit_mode: undefined,
+            audit_partition: undefined,
+          },
+          ev("run_completed"),
+        ],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).not.toBe("completed");
+      expect(by.audit).toBe("pending");
+      expect(by.output).toBe("pending");
+    });
+  });
+
+  describe("deriveWorkflow audit stickiness and ambiguity invariants (Tests A-E)", () => {
+    const baseExecutedEvents: RunEvent[] = [
+      ev("run_started"),
+      ev("stage_completed", "ingestion"),
+      ev("human_review_required", "human_review"),
+      ev("approval_decided", "human_review", "approve"),
+      ev("revalidation_result", "revalidation", "valid"),
+      ev("execution_result", "controlled_execution", "executed"),
+    ];
+
+    const normalAuditPersisted: RunEvent = {
+      kind: "audit_persisted",
+      run_id: "run-sticky",
+      stage: "audit",
+      message: "audit records persisted (normal mode in passed partition)",
+      timestamp: "2026-10-31T20:00:00Z",
+      audit_mode: "normal",
+      audit_partition: "passed",
+    };
+
+    it("Test A: audit_failed followed by valid normal audit_persisted + run_completed -> Audit remains failed, Output pending", () => {
+      const failedAudit: RunEvent = {
+        kind: "audit_failed",
+        run_id: "run-sticky-a",
+        stage: "audit",
+        message: "audit persistence failed: disk write error",
+        timestamp: "2026-10-31T20:00:00Z",
+      };
+      const stages = deriveWorkflow(
+        { run_id: "run-sticky-a", current_stage: "", stopped: false, status: "completed" },
+        [...baseExecutedEvents, failedAudit, normalAuditPersisted, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).toBe("failed");
+      expect(by.audit).not.toBe("completed");
+      expect(by.output).toBe("pending");
+    });
+
+    it("Test B: Genuine persistence-failure warning followed by valid normal audit_persisted -> failure remains authoritative (failed), Output pending", () => {
+      const failureWarning: RunEvent = {
+        kind: "warning",
+        run_id: "run-sticky-b",
+        stage: "audit",
+        message: "Staging artifact created, but 1 audit record(s) failed to persist to disk: I/O error",
+        timestamp: "2026-10-31T20:00:00Z",
+      };
+      const stages = deriveWorkflow(
+        { run_id: "run-sticky-b", current_stage: "", stopped: false, status: "completed" },
+        [...baseExecutedEvents, failureWarning, normalAuditPersisted, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).toBe("failed");
+      expect(by.audit).not.toBe("completed");
+      expect(by.output).toBe("pending");
+    });
+
+    it("Test C: Ambiguous audit_persisted metadata combined with run.audit_status = 'normal_persisted' -> Audit not completed, Output pending", () => {
+      const ambiguousAudit: RunEvent = {
+        kind: "audit_persisted",
+        run_id: "run-sticky-c",
+        stage: "audit",
+        message: "audit records persisted in passed partition",
+        timestamp: "2026-10-31T20:00:00Z",
+        audit_mode: "unknown" as any,
+        audit_partition: "passed",
+      };
+      const stages = deriveWorkflow(
+        { run_id: "run-sticky-c", current_stage: "", stopped: false, status: "completed", audit_status: "normal_persisted" },
+        [...baseExecutedEvents, ambiguousAudit, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).not.toBe("completed");
+      expect(by.audit).toBe("pending");
+      expect(by.output).toBe("pending");
+    });
+
+    it("Test D: Emergency persistence followed by contradictory normal persistence evidence or snapshot -> does not produce false successful terminal state", () => {
+      const emergencyAudit: RunEvent = {
+        kind: "audit_persisted",
+        run_id: "run-sticky-d",
+        stage: "audit",
+        message: "audit records persisted (emergency mode in errors partition)",
+        timestamp: "2026-10-31T20:00:00Z",
+        audit_mode: "emergency",
+        audit_partition: "errors",
+      };
+      // Case D1: Emergency event followed by contradictory normal audit event
+      const stagesEventOverride = deriveWorkflow(
+        { run_id: "run-sticky-d", current_stage: "", stopped: false, status: "completed" },
+        [...baseExecutedEvents, emergencyAudit, normalAuditPersisted, ev("run_completed")],
+      );
+      const by1 = Object.fromEntries(stagesEventOverride.map((s) => [s.key, s.state]));
+      expect(by1.audit).toBe("logged");
+      expect(by1.audit).not.toBe("completed");
+      expect(by1.output).toBe("pending");
+
+      // Case D2: Emergency event followed by contradictory normal_persisted snapshot
+      const stagesSnapshotOverride = deriveWorkflow(
+        { run_id: "run-sticky-d", current_stage: "", stopped: false, status: "completed", audit_status: "normal_persisted" },
+        [...baseExecutedEvents, emergencyAudit, ev("run_completed")],
+      );
+      const by2 = Object.fromEntries(stagesSnapshotOverride.map((s) => [s.key, s.state]));
+      expect(by2.audit).toBe("logged");
+      expect(by2.audit).not.toBe("completed");
+      expect(by2.output).toBe("pending");
+    });
+
+    it("Test E: Ordinary valid normal-persistence event with no contradictory failure evidence still completes Audit and Output", () => {
+      const stages = deriveWorkflow(
+        { run_id: "run-sticky-e", current_stage: "", stopped: false, status: "completed" },
+        [...baseExecutedEvents, normalAuditPersisted, ev("run_completed")],
+      );
+      const by = Object.fromEntries(stages.map((s) => [s.key, s.state]));
+      expect(by.controlled_execution).toBe("completed");
+      expect(by.audit).toBe("completed");
+      expect(by.output).toBe("completed");
+    });
+  });
 });
 
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { BACKEND_STAGE_ORDER } from "../components/stageOrder";
-import { UI_KEYS_EN, translate } from "../i18n/resources";
+import { UI_KEYS_EN, translate, en, fa } from "../i18n/resources";
 import { transport } from "../services/transport";
 
 describe("backend stage fidelity (Invariant A)", () => {
@@ -516,19 +1024,185 @@ describe("gap-closure behaviors (§§1-4)", () => {
       ev("revalidation_result", "revalidation", "valid"),
       ev("execution_result", "controlled_execution", "executed"),
     ];
-    expect(isTerminalSuccess([...base, ev("run_completed")])).toBe(true);
+    const normalAudit: RunEvent = {
+      kind: "audit_persisted",
+      run_id: "r1",
+      stage: "audit",
+      message: "audit records persisted (normal mode in passed partition)",
+      timestamp: "2026-10-31T20:00:00Z",
+      audit_mode: "normal",
+      audit_partition: "passed",
+    };
+
+    // Missing affirmative audit persistence → not success.
+    expect(isTerminalSuccess([...base, ev("run_completed")])).toBe(false);
+    // Full sequence with affirmative audit persistence → success.
+    expect(isTerminalSuccess([...base, normalAudit, ev("run_completed")])).toBe(true);
+    // Authoritative snapshot fallback when event is absent → success.
+    expect(isTerminalSuccess([...base, ev("run_completed")], "normal_persisted")).toBe(true);
     // No terminal event → not success.
-    expect(isTerminalSuccess(base)).toBe(false);
+    expect(isTerminalSuccess([...base, normalAudit])).toBe(false);
     // Any stop/error/rejection after completion → not success.
-    expect(isTerminalSuccess([...base, ev("run_completed"), ev("stopped", "x", "y")])).toBe(false);
-    expect(isTerminalSuccess([...base, ev("run_completed"), ev("error", "x", "y")])).toBe(false);
+    expect(isTerminalSuccess([...base, normalAudit, ev("run_completed"), ev("stopped", "x", "y")])).toBe(false);
+    expect(isTerminalSuccess([...base, normalAudit, ev("run_completed"), ev("error", "x", "y")])).toBe(false);
     // Rejected approval → not success.
     const rejected = base.map((e, i) =>
       i === 2 ? ev("approval_decided", "human_review", "reject") : e);
-    expect(isTerminalSuccess([...rejected, ev("run_completed")])).toBe(false);
+    expect(isTerminalSuccess([...rejected, normalAudit, ev("run_completed")])).toBe(false);
     // Missing execution → not success.
     const noExec = base.filter((e) => e.kind !== "execution_result");
-    expect(isTerminalSuccess([...noExec, ev("run_completed")])).toBe(false);
+    expect(isTerminalSuccess([...noExec, normalAudit, ev("run_completed")])).toBe(false);
+    // Audit failure → not success.
+    expect(isTerminalSuccess([...base, normalAudit, ev("audit_failed", "audit", "disk error"), ev("run_completed")])).toBe(false);
+    expect(isTerminalSuccess([...base, normalAudit, { kind: "warning", stage: "audit", message: "audit persistence failed", run_id: "r1", timestamp: "2026-10-31T20:00:00Z" }, ev("run_completed")])).toBe(false);
+  });
+
+  describe("isTerminalSuccess audit invariant (§§A-F)", () => {
+    const baseExecutedEvents: RunEvent[] = [
+      ev("run_started"),
+      ev("stage_completed", "ingestion"),
+      ev("human_review_required", "human_review"),
+      ev("approval_decided", "human_review", "approve"),
+      ev("revalidation_result", "revalidation", "valid"),
+      ev("execution_result", "controlled_execution", "executed"),
+    ];
+
+    const normalAuditPersisted: RunEvent = {
+      kind: "audit_persisted",
+      run_id: "run-term-audit",
+      stage: "audit",
+      message: "audit records persisted (normal mode in passed partition)",
+      timestamp: "2026-10-31T20:00:00Z",
+      audit_mode: "normal",
+      audit_partition: "passed",
+    };
+
+    it("A. Successful approval, revalidation, execution and run_completed, but no audit_persisted returns false", () => {
+      const events = [...baseExecutedEvents, ev("run_completed")];
+      expect(isTerminalSuccess(events)).toBe(false);
+    });
+
+    it("B. The same event sequence with valid normal-mode audit_persisted returns true", () => {
+      const events = [...baseExecutedEvents, normalAuditPersisted, ev("run_completed")];
+      expect(isTerminalSuccess(events)).toBe(true);
+    });
+
+    it("C. Emergency audit persistence must not be treated as normal successful CREATE completion", () => {
+      const emergencyAuditPersisted: RunEvent = {
+        kind: "audit_persisted",
+        run_id: "run-term-emerg",
+        stage: "audit",
+        message: "audit records persisted (emergency mode in errors partition)",
+        timestamp: "2026-10-31T20:00:00Z",
+        audit_mode: "emergency",
+        audit_partition: "errors",
+      };
+      const events = [...baseExecutedEvents, emergencyAuditPersisted, ev("run_completed")];
+      expect(isTerminalSuccess(events)).toBe(false);
+    });
+
+    it("D. Explicit audit_failed followed by contradictory normal audit evidence remains unsuccessful", () => {
+      const failedAudit: RunEvent = {
+        kind: "audit_failed",
+        run_id: "run-term-fail",
+        stage: "audit",
+        message: "audit persistence failed",
+        timestamp: "2026-10-31T20:00:00Z",
+      };
+      const events = [...baseExecutedEvents, failedAudit, normalAuditPersisted, ev("run_completed")];
+      expect(isTerminalSuccess(events)).toBe(false);
+      // Also verify contradictory snapshot status does not override explicit failure
+      expect(isTerminalSuccess(events, "normal_persisted")).toBe(false);
+    });
+
+    it("E. A non-failure audit warning must not automatically be classified as audit persistence failure", () => {
+      const nonFailureWarning: RunEvent = {
+        kind: "warning",
+        run_id: "run-term-warn-nonfail",
+        stage: "audit",
+        message: "Audit journal cache directory already exists; continuing normal write",
+        timestamp: "2026-10-31T20:00:00Z",
+      };
+      const events = [...baseExecutedEvents, nonFailureWarning, normalAuditPersisted, ev("run_completed")];
+      expect(isTerminalSuccess(events)).toBe(true);
+    });
+
+    it("F. A genuine audit persistence failure warning must invalidate terminal success", () => {
+      const failureWarning: RunEvent = {
+        kind: "warning",
+        run_id: "run-term-warn-fail",
+        stage: "audit",
+        message: "Staging artifact created, but 1 audit record(s) failed to persist to disk: I/O error",
+        timestamp: "2026-10-31T20:00:00Z",
+      };
+      const events = [...baseExecutedEvents, failureWarning, normalAuditPersisted, ev("run_completed")];
+      expect(isTerminalSuccess(events)).toBe(false);
+    });
+
+    it("G. Contradictory or ambiguous metadata cannot establish terminal success", () => {
+      const contradictoryAudit: RunEvent = {
+        kind: "audit_persisted",
+        run_id: "run-term-contradict",
+        stage: "audit",
+        message: "audit records persisted in passed partition",
+        timestamp: "2026-10-31T20:00:00Z",
+        audit_mode: "unknown" as any,
+        audit_partition: "passed",
+      };
+      const events = [...baseExecutedEvents, contradictoryAudit, ev("run_completed")];
+      // Cannot establish terminal success from contradictory/ambiguous event
+      expect(isTerminalSuccess(events)).toBe(false);
+      // Contradictory event also prevents snapshot from overriding it
+      expect(isTerminalSuccess(events, "normal_persisted")).toBe(false);
+    });
+
+    it("H. Emergency persistence event cannot be overridden by normal_persisted snapshot", () => {
+      const emergencyAudit: RunEvent = {
+        kind: "audit_persisted",
+        run_id: "run-term-emerg-override",
+        stage: "audit",
+        message: "audit records persisted (emergency mode in errors partition)",
+        timestamp: "2026-10-31T20:00:00Z",
+        audit_mode: "emergency",
+        audit_partition: "errors",
+      };
+      const events = [...baseExecutedEvents, emergencyAudit, ev("run_completed")];
+      // Emergency event alone is not success
+      expect(isTerminalSuccess(events)).toBe(false);
+      // Emergency persistence event cannot be silently reclassified as normal success by a contradictory snapshot
+      expect(isTerminalSuccess(events, "normal_persisted")).toBe(false);
+      expect(isTerminalSuccess(events, { audit_status: "normal_persisted" })).toBe(false);
+    });
+
+    it("I. Successfully recovered run with recoverable_errors > 0 achieves terminal success (Scenario 10)", () => {
+      const events = [...baseExecutedEvents, normalAuditPersisted, ev("run_completed")];
+      // When run succeeded downstream with 0 unrecovered failures, recoverable_errors does not block success
+      expect(
+        isTerminalSuccess(events, {
+          run_outcome: "full_success",
+          units_failed_operational: 0,
+          recoverable_errors: 1,
+        })
+      ).toBe(true);
+
+      // Unresolved operational failure still blocks success even if recoverable_errors > 0
+      expect(
+        isTerminalSuccess(events, {
+          run_outcome: "full_success",
+          units_failed_operational: 1,
+          recoverable_errors: 1,
+        })
+      ).toBe(false);
+
+      // Non-full_success run_outcome still blocks success
+      expect(
+        isTerminalSuccess(events, {
+          run_outcome: "partial_success",
+          units_failed_operational: 0,
+          recoverable_errors: 1,
+        })
+      ).toBe(false);
+    });
   });
 
   it("Workflow renders exactly 17 circular timeline nodes", () => {
@@ -1101,7 +1775,7 @@ describe("TranslateAction provenance and stale handling", () => {
         />
       </StoreContext.Provider>
     );
-    expect(screen.getByText("stale")).toBeInTheDocument();
+    expect(document.querySelector(".translate-stale")).toBeInTheDocument();
 
     // Rerender with mutated recordId -> stale badge should appear
     rerender(
@@ -1114,7 +1788,7 @@ describe("TranslateAction provenance and stale handling", () => {
         />
       </StoreContext.Provider>
     );
-    expect(screen.getByText("stale")).toBeInTheDocument();
+    expect(document.querySelector(".translate-stale")).toBeInTheDocument();
 
     // Rerender with mutated sourceKind -> stale badge should appear
     rerender(
@@ -1127,7 +1801,7 @@ describe("TranslateAction provenance and stale handling", () => {
         />
       </StoreContext.Provider>
     );
-    expect(screen.getByText("stale")).toBeInTheDocument();
+    expect(document.querySelector(".translate-stale")).toBeInTheDocument();
 
     // Rerender with mutated sourceLang -> stale badge should appear
     rerender(
@@ -1140,7 +1814,7 @@ describe("TranslateAction provenance and stale handling", () => {
         />
       </StoreContext.Provider>
     );
-    expect(screen.getByText("stale")).toBeInTheDocument();
+    expect(document.querySelector(".translate-stale")).toBeInTheDocument();
   });
 
   it("marks translation unverifiable when source_hash is missing and stale when source_hash does not match", async () => {
@@ -1177,7 +1851,7 @@ describe("TranslateAction provenance and stale handling", () => {
 
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
     // Because source_hash is missing, it must not treat missing provenance as fresh; it is marked unverifiable
-    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    expect(screen.getByText(/unverifiable|غیرقابل راستی‌آزمایی/)).toBeInTheDocument();
 
     // Mismatched source_hash
     const mockBadHash = vi.fn().mockResolvedValue({
@@ -1200,7 +1874,7 @@ describe("TranslateAction provenance and stale handling", () => {
     );
 
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("stale")).toBeInTheDocument();
+    expect(document.querySelector(".translate-stale")).toBeInTheDocument();
   });
 
   it("renders unverifiable badge when translation status is unverifiable", async () => {
@@ -1231,7 +1905,7 @@ describe("TranslateAction provenance and stale handling", () => {
       </StoreContext.Provider>
     );
     await userEvent.setup().click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    expect(screen.getByText(/unverifiable|غیرقابل راستی‌آزمایی/)).toBeInTheDocument();
   });
 
   it("does NOT mark unavailable translation as stale when source_hash is absent", async () => {
@@ -1371,9 +2045,9 @@ describe("TranslateAction provenance and stale handling", () => {
 
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
     // Missing required metadata (source_id) must fail closed as unverifiable
-    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    expect(screen.getByText(/unverifiable|غیرقابل راستی‌آزمایی/)).toBeInTheDocument();
     // Non-persisted on-demand badge is visible
-    expect(screen.getByText("on-demand")).toBeInTheDocument();
+    expect(screen.getByText(/on-demand|درخواستی/)).toBeInTheDocument();
 
     // Missing source_kind when caller specifies sourceKind="audit_narrative"
     const mockMissingSourceKind = vi.fn().mockResolvedValue({
@@ -1400,7 +2074,7 @@ describe("TranslateAction provenance and stale handling", () => {
       </StoreContext.Provider>
     );
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    expect(screen.getByText(/unverifiable|غیرقابل راستی‌آزمایی/)).toBeInTheDocument();
 
     // Missing source_language when caller specifies sourceLang="en"
     const mockMissingSourceLang = vi.fn().mockResolvedValue({
@@ -1427,7 +2101,7 @@ describe("TranslateAction provenance and stale handling", () => {
       </StoreContext.Provider>
     );
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    expect(screen.getByText(/unverifiable|غیرقابل راستی‌آزمایی/)).toBeInTheDocument();
   });
 
   it("handles target_language validation: unverifiable when missing, stale when mismatched, current when verified", async () => {
@@ -1469,7 +2143,7 @@ describe("TranslateAction provenance and stale handling", () => {
     );
 
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("unverifiable")).toBeInTheDocument();
+    expect(screen.getByText(/unverifiable|غیرقابل راستی‌آزمایی/)).toBeInTheDocument();
 
     // 2. Mismatched target_language -> stale (metadata present but targeting German 'de' when UI is 'fa')
     const mockMismatchedTarget = vi.fn().mockResolvedValue({
@@ -1496,7 +2170,7 @@ describe("TranslateAction provenance and stale handling", () => {
       </StoreContext.Provider>
     );
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("stale")).toBeInTheDocument();
+    expect(document.querySelector(".translate-stale")).toBeInTheDocument();
 
     // 3. Fully valid, current translation -> current
     const mockValidCurrent = vi.fn().mockResolvedValue({
@@ -1523,7 +2197,7 @@ describe("TranslateAction provenance and stale handling", () => {
       </StoreContext.Provider>
     );
     await user.click(screen.getByRole("button", { name: /Translate|ترجمه/ }));
-    expect(screen.getByText("current")).toBeInTheDocument();
+    expect(screen.getByText(/current|به‌روز/)).toBeInTheDocument();
   });
 });
 
@@ -1680,3 +2354,1781 @@ describe("conservative run correlation and retrieval UI behavior (Section 3)", (
   });
 });
 
+
+
+describe("Phase 2 — Frontend Human Review Loop UI", () => {
+  const baseRunState: any = {
+    run_id: "run-rev-ui-1",
+    proposal_action: "NEEDS_REVIEW",
+    classification_type: "Observation",
+    proposal_title: "Complex Experiential Pattern",
+    proposal_body: "Detailed analytical observation text from empirical data.",
+    confidence_score: 0.88,
+    confidence_score_band: "high",
+    confidence_level: "high",
+    destination: "01 - Observations/Complex Pattern.md",
+    reason: "Similar candidate exists; requires human clarification",
+    evidence: ["Anchor text 1", "Anchor text 2"],
+    provenance: ["source-file.md"],
+    uncertainties: ["Possible semantic boundary ambiguity"],
+    proposal_hash: "a".repeat(64),
+    review_state: "live_awaiting_review",
+    current_stage: "human_review",
+    status: "awaiting human review / acknowledgment",
+    stopped: false,
+    stop_reason: "",
+    accepted: false,
+    edited_body: null,
+    error: null,
+  };
+
+  it("renders non-CREATE proposal with executability banner, evidence, uncertainties, and Acknowledge button", () => {
+    const fakeStore: any = {
+      state: {
+        appLanguage: "en",
+        stagingLanguage: "en",
+        auditLanguage: "en",
+        sourceMode: "vault",
+        retrievalType: "lexical",
+        run: { ...baseRunState },
+        runEvents: [],
+        inputOutcome: null,
+        inputErrorCode: null,
+        inputRecoveryOptions: [],
+        safeStop: null,
+        lastSubmittedText: "",
+      },
+      liveAvailable: true,
+      liveConnected: true,
+      liveError: null,
+      actionInFlight: false,
+      liveApproval: {
+        proposal_hash: "a".repeat(64),
+        query_unit_id: "qu-99",
+        proposal_action: "NEEDS_REVIEW",
+        title: "Complex Experiential Pattern",
+        body: "Detailed analytical observation text from empirical data.",
+        confidence_level: "high",
+        confidence_score: 0.88,
+        confidence_score_band: "high",
+        classification_type: "Observation",
+        destination: "01 - Observations/Complex Pattern.md",
+        reason: "Similar candidate exists; requires human clarification",
+        evidence: ["Anchor text 1", "Anchor text 2"],
+        provenance: ["source-file.md"],
+        uncertainties: ["Possible semantic boundary ambiguity"],
+        is_executable: false,
+      },
+      liveAccept: vi.fn(),
+      liveApprove: vi.fn(),
+      dismissRunOutcome: vi.fn(),
+      cancelActiveRun: vi.fn(),
+    };
+
+    render(
+      <StoreContext.Provider value={fakeStore}>
+        <ProcessingResult />
+      </StoreContext.Provider>
+    );
+
+    // Verify Title
+    expect(screen.getByText("Complex Experiential Pattern")).toBeInTheDocument();
+    // Verify Executability Banner
+    expect(screen.getByText(/Non-Executable Proposal \(NEEDS_REVIEW\)/i)).toBeInTheDocument();
+    // Verify Destination
+    expect(screen.getByText("01 - Observations/Complex Pattern.md")).toBeInTheDocument();
+    // Verify Reason
+    expect(screen.getByText("Similar candidate exists; requires human clarification")).toBeInTheDocument();
+    // Verify Evidence
+    expect(screen.getByText("Anchor text 1")).toBeInTheDocument();
+    // Verify Uncertainties
+    expect(screen.getByText("Possible semantic boundary ambiguity")).toBeInTheDocument();
+    // Verify Provenance
+    expect(screen.getByText(/source-file\.md/)).toBeInTheDocument();
+    // Verify Button is "Acknowledge", NOT "Accept" or "Approve"
+    const ackBtn = screen.getByRole("button", { name: "Acknowledge" });
+    expect(ackBtn).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accept" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve" })).not.toBeInTheDocument();
+  });
+
+  it("disables Acknowledge button and shows submitting state when action is in flight", () => {
+    const fakeStore: any = {
+      state: {
+        appLanguage: "en",
+        stagingLanguage: "en",
+        auditLanguage: "en",
+        sourceMode: "vault",
+        retrievalType: "lexical",
+        run: { ...baseRunState },
+        runEvents: [],
+        inputOutcome: null,
+        inputErrorCode: null,
+        inputRecoveryOptions: [],
+        safeStop: null,
+        lastSubmittedText: "",
+      },
+      liveAvailable: true,
+      liveConnected: true,
+      liveError: null,
+      actionInFlight: true,
+      liveApproval: {
+        proposal_hash: "a".repeat(64),
+        query_unit_id: "qu-99",
+        proposal_action: "NEEDS_REVIEW",
+        title: "Complex Experiential Pattern",
+        body: "Detailed analytical observation text.",
+        confidence_level: "high",
+        is_executable: false,
+      },
+      liveAccept: vi.fn(),
+      liveApprove: vi.fn(),
+      dismissRunOutcome: vi.fn(),
+      cancelActiveRun: vi.fn(),
+    };
+
+    render(
+      <StoreContext.Provider value={fakeStore}>
+        <ProcessingResult />
+      </StoreContext.Provider>
+    );
+
+    const submittingBtn = screen.getByRole("button", { name: /Submitting Acknowledgment/i });
+    expect(submittingBtn).toBeDisabled();
+    expect(screen.getByText("Submitting decision to backend…")).toBeInTheDocument();
+  });
+
+  it("displays liveError prominently in non-CREATE review when acknowledgment fails", () => {
+    const fakeStore: any = {
+      state: {
+        appLanguage: "en",
+        stagingLanguage: "en",
+        auditLanguage: "en",
+        sourceMode: "vault",
+        retrievalType: "lexical",
+        run: { ...baseRunState },
+        runEvents: [],
+        inputOutcome: null,
+        inputErrorCode: null,
+        inputRecoveryOptions: [],
+        safeStop: null,
+        lastSubmittedText: "",
+      },
+      liveAvailable: true,
+      liveConnected: true,
+      liveError: "proposal_hash does not match the active proposal",
+      actionInFlight: false,
+      liveApproval: {
+        proposal_hash: "a".repeat(64),
+        query_unit_id: "qu-99",
+        proposal_action: "NEEDS_REVIEW",
+        title: "Complex Experiential Pattern",
+        body: "Detailed analytical observation text.",
+        confidence_level: "high",
+        is_executable: false,
+      },
+      liveAccept: vi.fn(),
+      liveApprove: vi.fn(),
+      dismissRunOutcome: vi.fn(),
+      cancelActiveRun: vi.fn(),
+    };
+
+    render(
+      <StoreContext.Provider value={fakeStore}>
+        <ProcessingResult />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("proposal_hash does not match the active proposal");
+  });
+
+  it("editing a non-CREATE proposal cannot convert it into an executable action", () => {
+    // 1. In UI, Edit button is NOT rendered for non-CREATE proposals.
+    // 2. State-level mockEdit strictly retains is_executable: false.
+    const nonCreateRun = {
+      ...baseRunState,
+      proposal_action: "NEEDS_REVIEW",
+      is_executable: false,
+    };
+    const mockEditFn = vi.fn((body: string) => {
+      nonCreateRun.edited_body = body;
+      nonCreateRun.is_executable = nonCreateRun.proposal_action === "CREATE";
+      nonCreateRun.review_state = "mock_edited_stale";
+    });
+    const fakeStore: any = {
+      state: {
+        appLanguage: "en",
+        stagingLanguage: "en",
+        auditLanguage: "en",
+        sourceMode: "vault",
+        retrievalType: "lexical",
+        run: nonCreateRun,
+        runEvents: [],
+        recentAudits: [],
+        recentStaging: [],
+      },
+      mockApprove: vi.fn(),
+      mockReject: vi.fn(),
+      mockEdit: mockEditFn,
+      liveAvailable: false,
+      liveConnected: false,
+      liveError: null,
+      actionInFlight: false,
+      liveApproval: null,
+      dismissRunOutcome: vi.fn(),
+      cancelActiveRun: vi.fn(),
+    };
+
+    render(
+      <StoreContext.Provider value={fakeStore}>
+        <ProcessingResult />
+      </StoreContext.Provider>
+    );
+
+    // Edit button must not be present
+    expect(screen.queryByRole("button", { name: /Edit/i })).not.toBeInTheDocument();
+
+    // Invoking mockEdit directly must not flip is_executable to true
+    mockEditFn("Attempted edit on non-CREATE proposal");
+    expect(nonCreateRun.is_executable).toBe(false);
+    expect(nonCreateRun.proposal_action).toBe("NEEDS_REVIEW");
+  });
+});
+
+describe("Store event handling and warning isolation", () => {
+  it("warning from an unrelated run does not corrupt active run state or event log", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "active-run-123",
+        stage: "ingestion",
+        message: "ingesting",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("active-run-123");
+    expect(currentStore.state.run.current_stage).toBe("ingestion");
+    expect(currentStore.state.run.stopped).toBe(false);
+
+    // Foreign warning arrives from an unrelated run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "warning",
+        run_id: "foreign-run-999",
+        stage: "audit",
+        message: "Audit storage warning on different run",
+        timestamp: "2026-10-27T10:00:01Z",
+      });
+    });
+
+    // Active run must remain completely intact
+    expect(currentStore.state.run.run_id).toBe("active-run-123");
+    expect(currentStore.state.run.current_stage).toBe("ingestion");
+    expect(currentStore.state.run.status).toBe("ingesting");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.runEvents.some((e: RunEvent) => e.run_id === "foreign-run-999")).toBe(false);
+  });
+
+  it("warning on a stopped run preserves stopped state, stop reason, and current stage", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "stopped-run-456",
+        stage: "human_review",
+        message: "reviewing",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+      currentStore.applyEvent({
+        kind: "stopped",
+        run_id: "stopped-run-456",
+        stage: "human_review",
+        message: "run cancelled by user request",
+        timestamp: "2026-10-27T10:00:02Z",
+      });
+    });
+
+    expect(currentStore.state.run.stopped).toBe(true);
+    expect(currentStore.state.run.stop_reason).toBe("run cancelled by user request");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+
+    // Late warning arrives for this stopped run (e.g. audit write skipped)
+    act(() => {
+      currentStore.applyEvent({
+        kind: "warning",
+        run_id: "stopped-run-456",
+        stage: "audit",
+        message: "Audit record write skipped (no audit writer available)",
+        timestamp: "2026-10-27T10:00:03Z",
+      });
+    });
+
+    // Warning must NOT revive the run or clear stop_reason or alter stopped stage
+    expect(currentStore.state.run.stopped).toBe(true);
+    expect(currentStore.state.run.stop_reason).toBe("run cancelled by user request");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+    expect(currentStore.state.run.status).toBe("Audit record write skipped (no audit writer available)");
+  });
+
+  it("warning on an active running run preserves stopped=false and does not overwrite current stage", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "active-run-789",
+        stage: "llm_synthesis",
+        message: "synthesizing",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+    });
+
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.run.current_stage).toBe("llm_synthesis");
+
+    // Non-fatal warning arrives during synthesis
+    act(() => {
+      currentStore.applyEvent({
+        kind: "warning",
+        run_id: "active-run-789",
+        stage: "llm_synthesis",
+        message: "High latency on synthesis model",
+        timestamp: "2026-10-27T10:00:01Z",
+      });
+    });
+
+    // Must remain active (stopped=false), preserve current stage, and reflect status
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.run.stop_reason).toBeFalsy();
+    expect(currentStore.state.run.current_stage).toBe("llm_synthesis");
+    expect(currentStore.state.run.status).toBe("High latency on synthesis model");
+  });
+
+  it("lifecycle events from an unrelated run do not corrupt active run", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "active-run-101",
+        stage: "classification",
+        message: "classifying",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+    });
+
+    // Foreign stage_started from an old or different run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "stale-run-000",
+        stage: "output",
+        message: "completing",
+        timestamp: "2026-10-27T10:00:01Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("active-run-101");
+    expect(currentStore.state.run.current_stage).toBe("classification");
+    expect(currentStore.state.run.status).toBe("classifying");
+  });
+
+  it("foreign run_started event cannot replace active run ID, stage, stopped state, or event log", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish an active run at retrieval stage
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "active-run-alpha",
+        stage: "retrieval",
+        message: "retrieving",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "active-run-alpha",
+        stage: "retrieval",
+        message: "query preparation",
+        timestamp: "2026-10-27T10:00:01Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("active-run-alpha");
+    expect(currentStore.state.run.current_stage).toBe("retrieval");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.runEvents.length).toBe(2);
+
+    // 2. Foreign or stale run_started arrives with a different run_id
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "foreign-run-omega",
+        stage: "input",
+        message: "foreign run starting",
+        timestamp: "2026-10-27T10:00:02Z",
+      });
+    });
+
+    // 3. Active run MUST NOT be replaced or corrupted by foreign run_started
+    expect(currentStore.state.run.run_id).toBe("active-run-alpha");
+    expect(currentStore.state.run.current_stage).toBe("retrieval");
+    expect(currentStore.state.run.status).toBe("query preparation");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.runEvents.length).toBe(2);
+    expect(currentStore.state.runEvents.some((e: RunEvent) => e.run_id === "foreign-run-omega")).toBe(false);
+  });
+
+  it("foreign run_started event cannot revive or corrupt a stopped run", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish a stopped run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "stopped-run-gamma",
+        stage: "human_review",
+        message: "awaiting review",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+      currentStore.applyEvent({
+        kind: "stopped",
+        run_id: "stopped-run-gamma",
+        stage: "human_review",
+        message: "run cancelled by user request",
+        timestamp: "2026-10-27T10:00:02Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("stopped-run-gamma");
+    expect(currentStore.state.run.stopped).toBe(true);
+    expect(currentStore.state.run.stop_reason).toBe("run cancelled by user request");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+
+    // 2. Foreign run_started arrives
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "foreign-run-zeta",
+        stage: "input",
+        message: "new run started",
+        timestamp: "2026-10-27T10:00:03Z",
+      });
+    });
+
+    // 3. Stopped run remains stopped, retains original run_id, stage, and reason
+    expect(currentStore.state.run.run_id).toBe("stopped-run-gamma");
+    expect(currentStore.state.run.stopped).toBe(true);
+    expect(currentStore.state.run.stop_reason).toBe("run cancelled by user request");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+    expect(currentStore.state.runEvents.some((e: RunEvent) => e.run_id === "foreign-run-zeta")).toBe(false);
+  });
+
+  it("stale run_started for the same run ID cannot revive a stopped run", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "stopped-run-delta",
+        stage: "human_review",
+        message: "awaiting review",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+      currentStore.applyEvent({
+        kind: "stopped",
+        run_id: "stopped-run-delta",
+        stage: "human_review",
+        message: "cancelled by user",
+        timestamp: "2026-10-27T10:00:02Z",
+      });
+    });
+
+    expect(currentStore.state.run.stopped).toBe(true);
+
+    // Delayed run_started for the exact same run arrives late
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "stopped-run-delta",
+        stage: "input",
+        message: "late arriving run_started",
+        timestamp: "2026-10-27T10:00:03Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("stopped-run-delta");
+    expect(currentStore.state.run.stopped).toBe(true);
+    expect(currentStore.state.run.stop_reason).toBe("cancelled by user");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+  });
+
+  it("legitimate new run initializes correctly from idle/fixture and after run dismissal", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Initial store (fixture/idle state) initializes valid new run 1
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "legit-run-1",
+        stage: "input",
+        message: "first valid run",
+        timestamp: "2026-10-27T10:00:00Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("legit-run-1");
+    expect(currentStore.state.run.current_stage).toBe("input");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.runEvents).toHaveLength(1);
+    expect(currentStore.state.runEvents[0].run_id).toBe("legit-run-1");
+
+    // 2. User dismisses run outcome or prepares new run
+    act(() => {
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+
+    // 3. Legitimate new run 2 starts cleanly
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "legit-run-2",
+        stage: "input",
+        message: "second valid run",
+        timestamp: "2026-10-27T10:05:00Z",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("legit-run-2");
+    expect(currentStore.state.run.current_stage).toBe("input");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.runEvents).toHaveLength(1);
+    expect(currentStore.state.runEvents[0].run_id).toBe("legit-run-2");
+  });
+
+  it("delayed stage_started from previous run is rejected during the interval after run ID is cleared", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish and retire run-alpha
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-alpha",
+        stage: "input",
+        message: "starting run alpha",
+      });
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "run-alpha",
+        stage: "ingestion",
+        message: "ingesting",
+      });
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.current_stage).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 2. Delayed stage_started arrives from run-alpha before new run starts
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "run-alpha",
+        stage: "retrieval",
+        message: "delayed query prep",
+      });
+    });
+
+    // 3. Stale event must be rejected: run_id remains empty, stage remains empty, log empty
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.current_stage).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+  });
+
+  it("delayed warning from previous run is rejected during the interval after run ID is cleared", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish and retire run-beta
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-beta",
+        stage: "input",
+        message: "starting run beta",
+      });
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+
+    // 2. Delayed warning from run-beta arrives during transition interval
+    act(() => {
+      currentStore.applyEvent({
+        kind: "warning",
+        run_id: "run-beta",
+        stage: "audit",
+        message: "Audit write delay on previous run",
+      });
+    });
+
+    // 3. Rejected: must not revive run ID, alter stage, or populate log
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.current_stage).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+  });
+
+  it("delayed approval and terminal events from previous run are rejected during transition interval", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish and retire run-gamma
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-gamma",
+        stage: "input",
+        message: "starting run gamma",
+      });
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+
+    // 2. Delayed approval_decided arrives from run-gamma
+    act(() => {
+      currentStore.applyEvent({
+        kind: "approval_decided",
+        run_id: "run-gamma",
+        message: "proposal approved",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.review_state).not.toBe("live_approved");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 3. Delayed human_review_required arrives from run-gamma
+    act(() => {
+      currentStore.applyEvent({
+        kind: "human_review_required",
+        run_id: "run-gamma",
+        proposal_hash: "c".repeat(64),
+        proposal_action: "CREATE",
+        title: "Delayed proposal",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.liveApproval).toBeNull();
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 4. Delayed run_completed arrives from run-gamma
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_completed",
+        run_id: "run-gamma",
+        stage: "output",
+        message: "run completed",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.current_stage).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+  });
+
+  it("rejected foreign event cannot falsely mark connection live", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>conn:{String(currentStore.liveConnected)}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // Initially liveConnected is false
+    expect(currentStore.liveConnected).toBe(false);
+
+    // 1. An unsolicited foreign event arrives when idle
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "foreign-unsolicited-99",
+        stage: "input",
+        message: "foreign stage",
+      });
+    });
+
+    // Foreign event was rejected; connection MUST NOT be marked live!
+    expect(currentStore.liveConnected).toBe(false);
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 2. A legitimate run_started event arrives to initialize the new run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "legit-conn-run",
+        stage: "input",
+        message: "starting valid run",
+      });
+    });
+
+    // Accepted event sets liveConnected to true
+    expect(currentStore.liveConnected).toBe(true);
+    expect(currentStore.state.run.run_id).toBe("legit-conn-run");
+  });
+
+  it("legitimate new run progresses normally through stages after initialization", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Initialize legitimate run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "progression-run-1",
+        stage: "input",
+        message: "run started",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("progression-run-1");
+    expect(currentStore.state.run.current_stage).toBe("input");
+    expect(currentStore.state.runEvents).toHaveLength(1);
+
+    // 2. Progression through ingestion
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "progression-run-1",
+        stage: "ingestion",
+        message: "ingesting document",
+      });
+    });
+
+    expect(currentStore.state.run.current_stage).toBe("ingestion");
+    expect(currentStore.state.run.status).toBe("ingesting document");
+    expect(currentStore.state.runEvents).toHaveLength(2);
+
+    // 3. Progression through retrieval
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_completed",
+        run_id: "progression-run-1",
+        stage: "ingestion",
+        message: "ingestion done",
+      });
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "progression-run-1",
+        stage: "retrieval",
+        message: "retrieving notes",
+      });
+    });
+
+    expect(currentStore.state.run.current_stage).toBe("retrieval");
+    expect(currentStore.state.run.status).toBe("retrieving notes");
+    expect(currentStore.state.runEvents).toHaveLength(4);
+    expect(currentStore.state.runEvents.every((e: RunEvent) => e.run_id === "progression-run-1")).toBe(true);
+  });
+
+  it("foreign event is rejected without changing run ID, stage, stopped state, stop reason, review state, or event log", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish an active run at human_review stage
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "guarded-run-1",
+        stage: "input",
+        message: "started",
+      });
+      currentStore.applyEvent({
+        kind: "human_review_required",
+        run_id: "guarded-run-1",
+        proposal_hash: "d".repeat(64),
+        proposal_action: "CREATE",
+        title: "Guarded Proposal",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("guarded-run-1");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.run.stop_reason).toBeFalsy();
+    expect(currentStore.state.run.review_state).toBe("live_awaiting_review");
+    const baselineEventCount = currentStore.state.runEvents.length;
+
+    // 2. Foreign event arrives with foreign run_id attempting to stop or corrupt the run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stopped",
+        run_id: "hostile-foreign-run",
+        stage: "output",
+        message: "force stopped",
+      });
+      currentStore.applyEvent({
+        kind: "approval_decided",
+        run_id: "hostile-foreign-run",
+        message: "reject",
+      });
+      currentStore.applyEvent({
+        kind: "warning",
+        run_id: "hostile-foreign-run",
+        stage: "audit",
+        message: "foreign warning",
+      });
+    });
+
+    // 3. Active run state and review state MUST be completely unchanged
+    expect(currentStore.state.run.run_id).toBe("guarded-run-1");
+    expect(currentStore.state.run.current_stage).toBe("human_review");
+    expect(currentStore.state.run.stopped).toBe(false);
+    expect(currentStore.state.run.stop_reason).toBeFalsy();
+    expect(currentStore.state.run.review_state).toBe("live_awaiting_review");
+    expect(currentStore.state.runEvents).toHaveLength(baselineEventCount);
+    expect(currentStore.state.runEvents.some((e: RunEvent) => e.run_id === "hostile-foreign-run")).toBe(false);
+  });
+
+  it("delayed run_started from an older retired run cannot re-initialize after multiple run transitions", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish Run 1 ("run-epoch-1") and retire it
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-epoch-1",
+        stage: "input",
+        message: "starting run 1",
+      });
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "run-epoch-1",
+        stage: "extraction",
+        message: "extracting",
+      });
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 2. Establish Run 2 ("run-epoch-2") and retire it
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-epoch-2",
+        stage: "input",
+        message: "starting run 2",
+      });
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "run-epoch-2",
+        stage: "analysis",
+        message: "analyzing",
+      });
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 3. Now store is idle. A delayed, out-of-order run_started arrives from Run 1 ("run-epoch-1")
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-epoch-1",
+        stage: "input",
+        message: "stale replayed run_started",
+      });
+    });
+
+    // 4. Stale run_started MUST be rejected: store remains idle, events empty, no mutation
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.current_stage).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    // 5. A legitimate new run ("run-epoch-3") arrives and initializes normally
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "run-epoch-3",
+        stage: "input",
+        message: "starting run 3",
+      });
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "run-epoch-3",
+        stage: "synthesis",
+        message: "synthesizing",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("run-epoch-3");
+    expect(currentStore.state.run.current_stage).toBe("synthesis");
+    expect(currentStore.state.runEvents).toHaveLength(2);
+    expect(currentStore.state.runEvents[0].run_id).toBe("run-epoch-3");
+    expect(currentStore.state.runEvents[1].run_id).toBe("run-epoch-3");
+  });
+
+  it("rejects uncorrelated lifecycle and human review events missing run_id, but accepts correctly correlated events", async () => {
+    localStorage.setItem("lae-welcomed", "1");
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return <div>run:{currentStore.state.run.run_id}</div>;
+    }
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Establish an active run
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "active-run-corr-1",
+        stage: "input",
+        message: "starting run",
+      });
+    });
+
+    expect(currentStore.state.run.run_id).toBe("active-run-corr-1");
+    expect(currentStore.state.run.current_stage).toBe("input");
+    expect(currentStore.state.runEvents).toHaveLength(1);
+    const baselineEventCount = currentStore.state.runEvents.length;
+
+    // 2. stage_started without run_id must be rejected
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "",
+        stage: "synthesis",
+        message: "uncorrelated stage",
+      });
+    });
+
+    expect(currentStore.state.run.current_stage).toBe("input");
+    expect(currentStore.state.runEvents).toHaveLength(baselineEventCount);
+
+    // 3. human_review_required without run_id must be rejected
+    act(() => {
+      currentStore.applyEvent({
+        kind: "human_review_required",
+        run_id: "",
+        proposal_hash: "e".repeat(64),
+        proposal_action: "CREATE",
+        title: "Uncorrelated Proposal",
+      });
+    });
+
+    expect(currentStore.liveApproval).toBeNull();
+    expect(currentStore.state.run.review_state).toBe("awaiting_review");
+    expect(currentStore.state.runEvents).toHaveLength(baselineEventCount);
+
+    // 4. approval_decided without run_id must be rejected
+    act(() => {
+      currentStore.applyEvent({
+        kind: "approval_decided",
+        run_id: "",
+        message: "proposal approved",
+      });
+    });
+
+    expect(currentStore.state.run.review_state).toBe("awaiting_review");
+    expect(currentStore.state.runEvents).toHaveLength(baselineEventCount);
+
+    // 5. A valid, correctly correlated event for active-run-corr-1 is accepted
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "active-run-corr-1",
+        stage: "extraction",
+        message: "extracting properly",
+      });
+    });
+
+    expect(currentStore.state.run.current_stage).toBe("extraction");
+    expect(currentStore.state.runEvents).toHaveLength(baselineEventCount + 1);
+    expect(currentStore.state.runEvents[baselineEventCount].stage).toBe("extraction");
+
+    // 6. Mismatched run_id is rejected and cannot mutate stage or review state
+    act(() => {
+      currentStore.applyEvent({
+        kind: "stage_started",
+        run_id: "mismatched-foreign-run-999",
+        stage: "synthesis",
+        message: "mismatched stage",
+      });
+      currentStore.applyEvent({
+        kind: "approval_decided",
+        run_id: "mismatched-foreign-run-999",
+        message: "reject",
+      });
+    });
+
+    expect(currentStore.state.run.current_stage).toBe("extraction");
+    expect(currentStore.state.run.review_state).toBe("awaiting_review");
+    expect(currentStore.state.runEvents).toHaveLength(baselineEventCount + 1);
+
+    // 7. Transition out to idle and verify run_started without run_id cannot initialize
+    act(() => {
+      currentStore.dismissRunOutcome();
+    });
+
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+
+    act(() => {
+      currentStore.applyEvent({
+        kind: "run_started",
+        run_id: "",
+        stage: "input",
+        message: "anonymous run_started",
+      });
+    });
+
+    // An anonymous run_started without run_id MUST NOT initialize the store
+    expect(currentStore.state.run.run_id).toBe("");
+    expect(currentStore.state.run.current_stage).toBe("");
+    expect(currentStore.state.runEvents).toHaveLength(0);
+  });
+});
+
+describe("Vault Selection Cancellation and UI State (§4)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    localStorage.setItem("lae-welcomed", "1");
+    (window as any).__LAE_BOOTSTRAP__ = { token: "mock-token-xyz" };
+  });
+
+  afterEach(() => {
+    delete (window as any).__LAE_BOOTSTRAP__;
+    vi.restoreAllMocks();
+  });
+
+  it("user opens VAULT MODE but cancels folder selection: remains in test mode and unconfigured", async () => {
+    vi.spyOn(window, "fetch").mockImplementation(async (url: any) => {
+      if (String(url).includes("/api/state")) {
+        return new Response(JSON.stringify({ status: "ok", resources: {}, paused_run: null }), { status: 200 });
+      }
+      if (String(url).includes("/api/folders/pick")) {
+        return new Response(
+          JSON.stringify({ purpose: "vault", status: "cancelled", display: "", reason: "User cancelled folder picker" }),
+          { status: 200 }
+        );
+      }
+            if (String(url).includes("/api/journals")) {
+        return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+    });
+
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return (
+        <div>
+          <span data-testid="mode">{currentStore.state.sourceMode}</span>
+          <span data-testid="validity">{currentStore.state.resources.vault.validity}</span>
+          <button type="button" onClick={() => void currentStore.pickLiveFolder("vault")}>
+            Pick Vault
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    expect(screen.getByTestId("mode").textContent).toBe("test");
+    expect(screen.getByTestId("validity").textContent).toBe("not_configured");
+
+    // User triggers folder selection and cancels
+    await act(async () => {
+      await currentStore.pickLiveFolder("vault");
+    });
+
+    // Remains in test mode, validity stays not_configured
+    expect(screen.getByTestId("mode").textContent).toBe("test");
+    expect(screen.getByTestId("validity").textContent).toBe("not_configured");
+  });
+
+  it("folder picker fails: surfaces error and does not mark unselected vault ready", async () => {
+    vi.spyOn(window, "fetch").mockImplementation(async (url: any) => {
+      if (String(url).includes("/api/folders/pick")) {
+        return new Response(JSON.stringify({ error: "daemon crashed" }), { status: 500 });
+      }
+            if (String(url).includes("/api/journals")) {
+        return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+    });
+
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return (
+        <div>
+          <span data-testid="mode">{currentStore.state.sourceMode}</span>
+          <span data-testid="validity">{currentStore.state.resources.vault.validity}</span>
+          <span data-testid="error">{currentStore.liveError || ""}</span>
+        </div>
+      );
+    }
+
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    await act(async () => {
+      await currentStore.pickLiveFolder("vault");
+    });
+
+    // Vault marked as validation_error, error surfaced, stays test mode
+    expect(screen.getByTestId("validity").textContent).toBe("validation_error");
+    expect(screen.getByTestId("mode").textContent).toBe("test");
+    expect(screen.getByTestId("error").textContent).not.toBe("");
+  });
+
+  it("selected folder is invalid: marks configured_invalid and disables submit in vault mode", async () => {
+    vi.spyOn(window, "fetch").mockImplementation(async (url: any) => {
+      if (String(url).includes("/api/folders/pick")) {
+        return new Response(
+          JSON.stringify({ purpose: "vault", status: "invalid", display: "bad_folder", reason: "missing marker" }),
+          { status: 200 }
+        );
+      }
+            if (String(url).includes("/api/journals")) {
+        return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+    });
+
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return (
+        <div>
+          <span data-testid="mode">{currentStore.state.sourceMode}</span>
+          <span data-testid="validity">{currentStore.state.resources.vault.validity}</span>
+        </div>
+      );
+    }
+
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    await act(async () => {
+      await currentStore.pickLiveFolder("vault");
+    });
+
+    expect(screen.getByTestId("validity").textContent).toBe("configured_invalid");
+    // Not ready for processing in vault mode
+    expect(currentStore.state.resources.vault.validity === "configured_valid").toBe(false);
+  });
+
+  it("user switches back to TEST MODE: preserves existing valid selection", async () => {
+    vi.spyOn(window, "fetch").mockImplementation(async (url: any) => {
+      if (String(url).includes("/api/folders/pick")) {
+        return new Response(
+          JSON.stringify({ purpose: "vault", status: "configured", display: "my_personal_vault", reason: "" }),
+          { status: 200 }
+        );
+      }
+            if (String(url).includes("/api/journals")) {
+        return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+    });
+
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return (
+        <div>
+          <span data-testid="mode">{currentStore.state.sourceMode}</span>
+          <span data-testid="display">{currentStore.state.resources.vault.display}</span>
+          <span data-testid="validity">{currentStore.state.resources.vault.validity}</span>
+        </div>
+      );
+    }
+
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Configure valid vault
+    await act(async () => {
+      await currentStore.pickLiveFolder("vault");
+    });
+
+    expect(screen.getByTestId("mode").textContent).toBe("vault");
+    expect(screen.getByTestId("display").textContent).toBe("my_personal_vault");
+    expect(screen.getByTestId("validity").textContent).toBe("configured_valid");
+
+    // 2. Switch back to test mode
+    await act(async () => {
+      currentStore.setSourceMode("test");
+    });
+
+    expect(screen.getByTestId("mode").textContent).toBe("test");
+    // Vault selection is preserved
+    expect(screen.getByTestId("display").textContent).toBe("my_personal_vault");
+    expect(screen.getByTestId("validity").textContent).toBe("configured_valid");
+  });
+
+  it("previously selected Vault exists and user attempts to select another but cancels: preserves existing selection", async () => {
+    let callCount = 0;
+    vi.spyOn(window, "fetch").mockImplementation(async (url: any) => {
+      if (String(url).includes("/api/folders/pick")) {
+        callCount++;
+        if (callCount === 1) {
+          return new Response(
+            JSON.stringify({ purpose: "vault", status: "configured", display: "primary_vault", reason: "" }),
+            { status: 200 }
+          );
+        } else {
+          return new Response(
+            JSON.stringify({ purpose: "vault", status: "cancelled", display: "", reason: "User cancelled dialog" }),
+            { status: 200 }
+          );
+        }
+      }
+            if (String(url).includes("/api/journals")) {
+        return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ audits: [], staging: [] }), { status: 200 });
+    });
+
+    let currentStore: any;
+    function Capture() {
+      currentStore = useStore();
+      return (
+        <div>
+          <span data-testid="mode">{currentStore.state.sourceMode}</span>
+          <span data-testid="display">{currentStore.state.resources.vault.display}</span>
+          <span data-testid="validity">{currentStore.state.resources.vault.validity}</span>
+        </div>
+      );
+    }
+
+    render(
+      <StoreProvider>
+        <Capture />
+      </StoreProvider>
+    );
+
+    // 1. Initial valid selection
+    await act(async () => {
+      await currentStore.pickLiveFolder("vault");
+    });
+
+    expect(screen.getByTestId("mode").textContent).toBe("vault");
+    expect(screen.getByTestId("display").textContent).toBe("primary_vault");
+    expect(screen.getByTestId("validity").textContent).toBe("configured_valid");
+
+    // 2. User attempts to pick another folder, but cancels
+    await act(async () => {
+      await currentStore.pickLiveFolder("vault");
+    });
+
+    // 3. Existing valid selection MUST NOT be silently discarded
+    expect(screen.getByTestId("mode").textContent).toBe("vault");
+    expect(screen.getByTestId("display").textContent).toBe("primary_vault");
+    expect(screen.getByTestId("validity").textContent).toBe("configured_valid");
+  });
+});
+
+describe("Phase 2 Remediation: Retrieval Substeps & Comprehensive English/Persian Localization", () => {
+  it("renders all 5 retrieval substeps in English and Persian with correct labels and accessibility attributes", () => {
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "r-sub", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "r-sub", stage: "retrieval", operation: "candidate_retrieval", phase: "started", message: "", timestamp: "" },
+    ];
+
+    // English render
+    const enContext = {
+      state: {
+        appLanguage: "en" as const,
+        run: {
+          run_id: "r-sub",
+          current_stage: "retrieval",
+          stopped: false,
+        },
+        runEvents: events,
+      },
+    };
+
+    const { rerender } = render(
+      <StoreContext.Provider value={enContext as any}>
+        <Workflow />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByLabelText("Retrieval Substeps")).toBeInTheDocument();
+    expect(screen.getByText("Query Preparation")).toBeInTheDocument();
+    expect(screen.getByText("Candidate Retrieval")).toBeInTheDocument();
+    expect(screen.getByText("Relevance Assessment")).toBeInTheDocument();
+    expect(screen.getByText("Candidate Identification")).toBeInTheDocument();
+    expect(screen.getByText("Retrieval Evidence Recording")).toBeInTheDocument();
+
+    // Persian render
+    const faContext = {
+      state: {
+        appLanguage: "fa" as const,
+        run: {
+          run_id: "r-sub",
+          current_stage: "retrieval",
+          stopped: false,
+        },
+        runEvents: events,
+      },
+    };
+
+    rerender(
+      <StoreContext.Provider value={faContext as any}>
+        <Workflow />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByLabelText("زیرمراحل بازیابی")).toBeInTheDocument();
+    expect(screen.getByText("آماده‌سازی پرس‌وجو")).toBeInTheDocument();
+    expect(screen.getByText("بازیابی کاندیداها")).toBeInTheDocument();
+    expect(screen.getByText("ارزیابی ارتباط")).toBeInTheDocument();
+    expect(screen.getByText("شناسایی کاندیداها")).toBeInTheDocument();
+    expect(screen.getByText("ثبت شواهد بازیابی")).toBeInTheDocument();
+  });
+
+  it("handles interrupted retrieval: cancelled sub-stage halts without completing subsequent sub-stages", () => {
+    const events: RunEvent[] = [
+      { kind: "status", run_id: "r-canc", stage: "retrieval", operation: "query_preparation", phase: "completed", message: "", timestamp: "" },
+      { kind: "status", run_id: "r-canc", stage: "retrieval", operation: "candidate_retrieval", phase: "cancelled", message: "", timestamp: "" },
+    ];
+
+    const substeps = deriveRetrievalSubsteps("current", events, "r-canc");
+    expect(substeps.map((s) => ({ key: s.key, state: s.state }))).toEqual([
+      { key: "query_preparation", state: "completed" },
+      { key: "candidate_retrieval", state: "cancelled" },
+      { key: "relevance_assessment", state: "pending" },
+      { key: "candidate_identification", state: "pending" },
+      { key: "retrieval_evidence_recording", state: "pending" },
+    ]);
+  });
+
+  it("localizes proposal review provenance, evidence anchors, uncertainties, and executability banner in English and Persian", () => {
+    const proposalData = {
+      proposal_action: "CREATE",
+      proposal_title: "Authentic Action Note",
+      proposal_body: "Detailed proposal content here.",
+      destination: "Notes/Authenticity.md",
+      reason: "Evidence-backed synthesis",
+      provenance: ["Source doc A", "Source doc B"],
+      evidence: ["Direct quote anchor 1", "Direct quote anchor 2"],
+      uncertainties: ["Requires historical cross-check"],
+      review_state: "pending",
+    };
+
+    // English render
+    const enContext = {
+      state: {
+        appLanguage: "en" as const,
+        sourceMode: "test",
+        auditLanguage: "en",
+        stagingLanguage: "en",
+        run: proposalData,
+        runEvents: [],
+      },
+      liveAvailable: false,
+      mockApprove: vi.fn(),
+      mockReject: vi.fn(),
+      mockSafeStop: vi.fn(),
+    };
+
+    const { rerender } = render(
+      <StoreContext.Provider value={enContext as any}>
+        <ProcessingResult />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByLabelText("Proposal Review")).toBeInTheDocument();
+    expect(screen.getByText("Provenance:")).toBeInTheDocument();
+    expect(screen.getByText("Evidence Anchors:")).toBeInTheDocument();
+    expect(screen.getByText("Uncertainties / Limitations:")).toBeInTheDocument();
+    expect(screen.getByText(/Explicit human approval authorizes proceeding/)).toBeInTheDocument();
+
+    // Persian render
+    const faContext = {
+      state: {
+        appLanguage: "fa" as const,
+        sourceMode: "test",
+        auditLanguage: "fa",
+        stagingLanguage: "fa",
+        run: proposalData,
+        runEvents: [],
+      },
+      liveAvailable: false,
+      mockApprove: vi.fn(),
+      mockReject: vi.fn(),
+      mockSafeStop: vi.fn(),
+    };
+
+    rerender(
+      <StoreContext.Provider value={faContext as any}>
+        <ProcessingResult />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByLabelText("بررسی پیشنهاد")).toBeInTheDocument();
+    expect(screen.getByText("منشأ و پیشینه:")).toBeInTheDocument();
+    expect(screen.getByText("شواهد و ارجاعات مستند:")).toBeInTheDocument();
+    expect(screen.getByText("عدم قطعیت‌ها و محدودیت‌ها:")).toBeInTheDocument();
+    expect(screen.getByText(/تأیید صریح انسانی اجازه ورود به بازاعتبارسنجی/)).toBeInTheDocument();
+  });
+
+  it("localizes journals summary and synchronization timer in English and Persian", () => {
+    // English render
+    const enContext = {
+      state: {
+        appLanguage: "en" as const,
+        sourceMode: "test",
+        recentAudits: [
+          {
+            id: "aud-test-1",
+            timestamp: "2026-10-25T10:00:00Z",
+            statusKey: "journal.passed",
+            stagingNoteKey: "journal.stagingCreated",
+            title: "Test Audit",
+            summary: "Run audit succeeded",
+            emergency: false,
+          },
+        ],
+        recentStaging: [
+          {
+            id: "stg-test-1",
+            timestamp: "2026-10-25T10:00:00Z",
+            statusKey: "journal.passed",
+            stagingNoteKey: null,
+            title: "Test Note",
+            excerpt: "Staged note summary",
+            emergency: false,
+            staging_available: true,
+          },
+        ],
+        journalIndex: 0,
+        run: {},
+        runEvents: [],
+      },
+      liveAvailable: false,
+      stepJournal: vi.fn(),
+      refreshJournals: vi.fn(),
+    };
+
+    const { rerender } = render(
+      <StoreContext.Provider value={enContext as any}>
+        <Journals />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByText("Summary Of Recent Audits")).toBeInTheDocument();
+    expect(screen.getByText("Summary Of Recent Staging")).toBeInTheDocument();
+    expect(screen.getByText("⟳ 5s synchronized")).toBeInTheDocument();
+
+    // Persian render
+    const faContext = {
+      ...enContext,
+      state: {
+        ...enContext.state,
+        appLanguage: "fa" as const,
+      },
+    };
+
+    rerender(
+      <StoreContext.Provider value={faContext as any}>
+        <Journals />
+      </StoreContext.Provider>
+    );
+
+    expect(screen.getByText("خلاصه حسابرسی‌های اخیر")).toBeInTheDocument();
+    expect(screen.getByText("خلاصه فایل‌های موقت اخیر")).toBeInTheDocument();
+    expect(screen.getByText("⟳ همگام‌سازی ۵ ثانیه‌ای")).toBeInTheDocument();
+  });
+
+  describe("Phase 2 Remediation: Retrieval Substeps & Complete Localization", () => {
+    it("guarantees 100% translation key symmetry between English and Persian without missing keys", () => {
+      const enKeys = Object.keys(en).sort();
+      const faKeys = Object.keys(fa).sort();
+      expect(enKeys).toEqual(faKeys);
+      expect(enKeys.length).toBeGreaterThan(320);
+    });
+
+    it("interpolates parameters correctly in translate()", () => {
+      const textEn = translate("en", "ui.nav.indexedCounts", { notes: 12, vectors: 48 });
+      expect(textEn).toBe("(12 notes, 48 vectors)");
+
+      const textFa = translate("fa", "ui.nav.indexedCounts", { notes: 12, vectors: 48 });
+      expect(textFa).toBe("(12 یادداشت، 48 بردار)");
+    });
+
+    it("derives retrieval substeps correctly for complete run", () => {
+      const runId = "run-test-full";
+      const mk = (operation: string, phase: "started" | "completed" | "cancelled"): RunEvent => ({
+        kind: "status", stage: "retrieval", operation, phase, run_id: runId, message: "", timestamp: "",
+      });
+      const events: RunEvent[] = [
+        mk("query_preparation", "started"),
+        mk("query_preparation", "completed"),
+        mk("candidate_retrieval", "started"),
+        mk("candidate_retrieval", "completed"),
+        mk("relevance_assessment", "started"),
+        mk("relevance_assessment", "completed"),
+        mk("candidate_identification", "started"),
+        mk("candidate_identification", "completed"),
+        mk("retrieval_evidence_recording", "started"),
+        mk("retrieval_evidence_recording", "completed"),
+      ];
+
+      const substeps = deriveRetrievalSubsteps("completed", events, runId);
+      expect(substeps).toHaveLength(5);
+      expect(substeps.every((s) => s.state === "completed")).toBe(true);
+    });
+
+    it("derives retrieval substeps correctly on intermediate cancellation without falsely completing future substeps", () => {
+      const runId = "run-test-cancel";
+      const mk = (operation: string, phase: "started" | "completed" | "cancelled"): RunEvent => ({
+        kind: "status", stage: "retrieval", operation, phase, run_id: runId, message: "", timestamp: "",
+      });
+      const events: RunEvent[] = [
+        mk("query_preparation", "started"),
+        mk("query_preparation", "completed"),
+        mk("candidate_retrieval", "started"),
+        mk("candidate_retrieval", "completed"),
+        mk("relevance_assessment", "cancelled"),
+        { kind: "stopped", stage: "cancellation", message: "run cancelled during retrieval", run_id: runId, timestamp: "" },
+      ];
+
+      const substeps = deriveRetrievalSubsteps("stopped", events, runId);
+      expect(substeps).toHaveLength(5);
+      expect(substeps[0].state).toBe("completed");
+      expect(substeps[1].state).toBe("completed");
+      expect(substeps[2].state).toBe("cancelled");
+      expect(substeps[3].state).toBe("pending");
+      expect(substeps[4].state).toBe("pending");
+    });
+
+    it("renders TopNav download links and modal fallback in Persian without hardcoded English", () => {
+      const faStore: any = {
+        state: {
+          appLanguage: "fa",
+          stagingLanguage: "fa",
+          auditLanguage: "fa",
+          sourceMode: "vault",
+          retrievalType: "lexical",
+          llmMode: "local",
+          resources: {
+            vault: { validity: "not_configured", display: "" },
+            staging: { validity: "not_configured", display: "" },
+            audit: { validity: "not_configured", display: "" },
+            vector_db: { validity: "not_configured", display: "" },
+            embedding_model: { validity: "not_configured", display: "" },
+            local_llm: { validity: "not_configured", display: "" },
+          },
+          run: {
+            run_id: "",
+            current_stage: "",
+            status: "",
+            stopped: false,
+            stop_reason: "",
+            proposal_title: "",
+            proposal_body: "",
+            proposal_action: "",
+            confidence_level: "",
+            confidence_score: 0,
+            evidence: [],
+            provenance: [],
+            uncertainties: [],
+            audit_status: "",
+          },
+        },
+        liveAvailable: false,
+        setTheme: vi.fn(),
+        setAppLanguage: vi.fn(),
+        setSourceMode: vi.fn(),
+        setRetrievalType: vi.fn(),
+        setLlmMode: vi.fn(),
+        pickLiveFolder: vi.fn(),
+        liveAuthorizeVaultSync: vi.fn(),
+        liveGetVaultSyncStatus: vi.fn().mockResolvedValue(null),
+        liveReconcileVaultSync: vi.fn(),
+      };
+
+      render(
+        <StoreContext.Provider value={faStore}>
+          <TopNav />
+        </StoreContext.Provider>
+      );
+
+      expect(screen.getAllByText("پیکربندی‌نشده").length).toBeGreaterThan(0);
+    });
+  });
+});

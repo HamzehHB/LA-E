@@ -40,7 +40,12 @@ class KnowledgeRetriever(ABC):
 
     @abstractmethod
     def retrieve(
-        self, query: KnowledgeUnit, corpus: Sequence[KnowledgeUnit]
+        self,
+        query: KnowledgeUnit,
+        corpus: Sequence[KnowledgeUnit],
+        observer: Any = None,
+        run_id: str = "",
+        should_cancel: Any = None,
     ) -> RetrievalResult:
         """Return existing-knowledge candidates relevant to ``query``."""
         raise NotImplementedError

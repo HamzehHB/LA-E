@@ -123,6 +123,13 @@ export interface CurrentRunView {
   stopped: boolean;
   stop_reason: string;
   accepted?: boolean;
+  destination?: string;
+  reason?: string;
+  evidence?: string[];
+  provenance?: string[];
+  uncertainties?: string[];
+  is_executable?: boolean;
+  audit_status?: "pending" | "normal_persisted" | "emergency_persisted" | "persistence_failed" | "unknown";
 }
 
 /** @category ui-model — journal row (rendered from fixture) */

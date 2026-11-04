@@ -29,8 +29,11 @@ credential-like keys recursively through dicts, lists, tuples, and
 nested dataclass structures before anything is written.
 """
 import dataclasses
+from datetime import date, datetime
+from enum import Enum
 import hashlib
 import json
+import math
 import os
 import re
 import uuid
@@ -119,27 +122,73 @@ _FORBIDDEN_RECORD_KEYS = frozenset({
 })
 
 
+def _canonical_key_dumps(val: Any) -> str:
+    """Deterministic canonical JSON string used as sort key for set/frozenset members."""
+    return json.dumps(
+        val,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def _sanitize(value: object) -> object:
-    """Drop credential-like keys recursively; return plain data."""
+    """Drop credential-like keys recursively; return strictly typed plain data.
+
+    Enforces canonical JSON types and rejects non-finite floats, non-string keys,
+    and unsupported objects fail-closed.
+    Deterministically converts Path, datetime, date, Enum, UUID, set, frozenset.
+    """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         try:
             value = dataclasses.asdict(value)
-        except Exception:
-            value = str(value)
+        except Exception as exc:
+            raise TypeError(f"Cannot serialize dataclass: {value!r}") from exc
     if isinstance(value, dict):
         cleaned: dict = {}
         for key, item in value.items():
-            if isinstance(key, str) and key.lower() in _FORBIDDEN_RECORD_KEYS:
+            if not isinstance(key, str):
+                raise TypeError(f"Dictionary key must be string, got {type(key).__name__}: {key!r}")
+            if key.lower() in _FORBIDDEN_RECORD_KEYS:
+                continue
+            if key.lower() in ("stop_reason", "reason", "error_message", "execution_reason"):
+                if isinstance(item, str):
+                    from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
+                    cleaned[key] = sanitize_diagnostic_text(item)
+                    continue
+            if key.lower() == "errors" and isinstance(item, (list, tuple)):
+                from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
+                cleaned[key] = [sanitize_diagnostic_text(str(err)) for err in item]
                 continue
             cleaned[key] = _sanitize(item)
         return cleaned
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, (set, frozenset)):
+        sanitized_items = [_sanitize(item) for item in value]
+        return sorted(sanitized_items, key=_canonical_key_dumps)
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        enum_val = value.value
+        if isinstance(enum_val, (str, int, float, bool)) or enum_val is None:
+            return enum_val
+        return _sanitize(enum_val)
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    # Check bool before int because bool is a subclass of int in Python
+    if isinstance(value, bool):
         return value
-    # Unknown object: serialize to a plain string rather than persisting
-    # an opaque structure that might carry sensitive content.
-    return str(value)
+    if isinstance(value, (str, int)) or value is None:
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise TypeError(f"Non-finite float not permitted in audit record: {value}")
+        return value
+    raise TypeError(f"Unsupported audit record field type: {type(value).__name__} ({value!r})")
 
 
 def record_to_dict(record: object) -> dict[str, Any]:
@@ -165,14 +214,162 @@ def record_to_dict(record: object) -> dict[str, Any]:
 POST_DIGEST_FIELDS = frozenset({"record_digest", "persistence_timestamp"})
 
 
+def _validate_canonical_json_value(val: Any, path: str = "root") -> None:
+    """Strictly validate permitted RFC 8259 types for canonical JSON."""
+    if isinstance(val, bool):
+        return
+    if isinstance(val, (int, str)) or val is None:
+        return
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            raise TypeError(f"Non-finite float at {path} is not permitted in canonical JSON: {val}")
+        return
+    if isinstance(val, dict):
+        for k, v in val.items():
+            if not isinstance(k, str):
+                raise TypeError(f"Dictionary key at {path} must be string, got {type(k).__name__}: {k!r}")
+            _validate_canonical_json_value(v, f"{path}.{k}")
+        return
+    if isinstance(val, (list, tuple)):
+        for idx, item in enumerate(val):
+            _validate_canonical_json_value(item, f"{path}[{idx}]")
+        return
+    raise TypeError(f"Unsupported type at {path} for canonical JSON: {type(val).__name__} ({val!r})")
+
+
+def canonical_json_dumps(payload: dict) -> str:
+    """Return deterministic canonical JSON string without non-standard types or whitespace.
+
+    Parameters: sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False.
+    No default=str fallback is permitted.
+    """
+    _validate_canonical_json_value(payload)
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _reject_constant(c):
+    raise ValueError(f"Non-standard JSON constant rejected: {c}")
+
+
+def _reject_duplicate_pairs(pairs):
+    res = {}
+    for k, v in pairs:
+        if k in res:
+            raise ValueError(f"Duplicate JSON key detected: {k!r}")
+        res[k] = v
+    return res
+
+
+def parse_canonical_json_line(line: str, require_canonical: bool = True) -> dict:
+    """Parse JSONL journal line rejecting non-standard constants, duplicates, and non-canonical forms.
+
+    Enforces:
+    1. Line text must be a string.
+    2. Single trailing newline ('\n' or '\r\n') is stripped per newline policy.
+    3. Rejects leading/trailing whitespace around the line when require_canonical=True.
+    4. Rejects duplicate object keys.
+    5. Rejects non-standard constants (NaN, Infinity, -Infinity).
+    6. Decodes to a JSON object (dict).
+    7. Validates permitted RFC 8259 types.
+    8. When require_canonical=True, asserts exact equality between the input line (sans newline)
+       and the canonical re-serialization (no formatting whitespace, lexicographically sorted keys).
+    """
+    if not isinstance(line, str):
+        raise TypeError(f"line must be a string, got {type(line).__name__}")
+    clean_line = line
+    if clean_line.endswith("\n"):
+        clean_line = clean_line[:-1]
+    if clean_line.endswith("\r"):
+        clean_line = clean_line[:-1]
+
+    if require_canonical:
+        if clean_line.startswith((" ", "\t")):
+            raise ValueError("Non-canonical JSON line: leading whitespace detected")
+        if clean_line.endswith((" ", "\t")):
+            raise ValueError("Non-canonical JSON line: trailing whitespace detected")
+
+    data = json.loads(
+        clean_line,
+        parse_constant=_reject_constant,
+        object_pairs_hook=_reject_duplicate_pairs,
+    )
+    if not isinstance(data, dict):
+        raise ValueError(f"Canonical JSON line must be a JSON object, got {type(data).__name__}")
+
+    _validate_canonical_json_value(data)
+
+    if require_canonical:
+        canonical_str = canonical_json_dumps(data)
+        if clean_line != canonical_str:
+            raise ValueError(
+                "Non-canonical JSON line: line does not match canonical encoding (differing whitespace or non-sorted keys)"
+            )
+
+    return data
+
+
+POST_DIGEST_FIELDS = frozenset({"record_digest", "persistence_timestamp"})
+READER_DIAGNOSTIC_FIELDS = frozenset()
+
+
+class PersistedRecord(dict):
+    """An exact, unmutated representation of a persisted journal record on disk.
+
+    Reader diagnostic metadata (such as source file and line number) is stored in
+    dedicated object slots without polluting or mutating the persisted record keys.
+    This guarantees that reader metadata never collides with or overwrites persisted fields,
+    and that cryptographic digest verification is never bypassed.
+    """
+
+    __slots__ = ("_reader_source_file", "_reader_line_no")
+
+    def __init__(self, data: dict, source_file: str = "", line_no: int = 0):
+        super().__init__(data)
+        self._reader_source_file = str(source_file)
+        self._reader_line_no = int(line_no)
+
+    @property
+    def reader_source_file(self) -> str:
+        return self._reader_source_file
+
+    @property
+    def reader_line_no(self) -> int:
+        return self._reader_line_no
+
+
+def parse_journal_record_line(raw_line: str) -> dict:
+    """Parse a persisted journal record line enforcing strict canonical JSON.
+
+    Format Provenance & Invariant:
+    Every version of AuditWriter in the codebase has generated canonical JSON lines
+    (sort_keys=True, ensure_ascii=False, separators=(',', ':'), no extraneous whitespace).
+    No historical pre-canonical format exists in the repository.
+
+    In-band self-declared fields (e.g. 'journal_format', 'schema_version', 'legacy_format')
+    do not establish provenance and cannot be trusted to relax validation.
+    Current, unknown, and historical-claiming records must all strictly satisfy
+    canonical JSON formatting. Any non-canonical line, duplicate key, or non-standard
+    constant fails closed and is rejected as malformed.
+    """
+    return parse_canonical_json_line(raw_line, require_canonical=True)
+
+
 def compute_record_digest(payload: dict) -> str:
-    """Return the sha256 of the canonical JSON encoding of ``payload``.
+    """Return the deterministic sha256 of the canonical JSON encoding of ``payload``.
 
     Explicitly excludes post-digest fields ('record_digest', 'persistence_timestamp')
     to ensure deterministic recomputation against stored records.
+    Every other persisted field (including any user-defined underscore fields)
+    remains strictly included in the digest computation.
     """
     to_hash = {k: v for k, v in payload.items() if k not in POST_DIGEST_FIELDS}
-    canonical = json.dumps(to_hash, ensure_ascii=False, sort_keys=True, default=str)
+    canonical = canonical_json_dumps(to_hash)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -194,10 +391,33 @@ def verify_record_digest(stored_data: object) -> tuple[bool, str]:
     digest = digest.strip()
     if len(digest) != 64 or not all(c in "0123456789abcdefABCDEF" for c in digest):
         return False, f"malformed 'record_digest' (not a 64-character hex string): {digest!r}"
-    expected_digest = compute_record_digest(stored_data)
+    clean_data = {k: v for k, v in stored_data.items() if k not in POST_DIGEST_FIELDS}
+    try:
+        expected_digest = compute_record_digest(clean_data)
+    except Exception as exc:
+        return False, f"failed to recompute record_digest: {exc}"
     if digest.lower() != expected_digest.lower():
         return False, f"record_digest mismatch: stored={digest!r} != recomputed={expected_digest!r}"
     return True, ""
+
+
+def is_execution_claiming(rec: dict) -> bool:
+    """Determine whether an in-memory receipt or persisted journal record claims execution.
+
+    Approved definition includes:
+    - terminal_outcome equal to 'executed' or 'execution_executed'
+    - execution_executed is True
+    - the applicable execution-claiming storage category ('passed')
+    """
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("terminal_outcome") in ("executed", "execution_executed"):
+        return True
+    if rec.get("execution_executed") is True:
+        return True
+    if rec.get("storage_category") == "passed":
+        return True
+    return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -612,8 +832,7 @@ class AuditWriter:
         except OSError as exc:
             raise OSError("audit root unavailable") from exc
         target = self._target(category)
-        line = json.dumps(payload, ensure_ascii=False, sort_keys=True,
-                          default=str) + "\n"
+        line = canonical_json_dumps(payload) + "\n"
         try:
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(line)
@@ -626,7 +845,12 @@ class AuditWriter:
                 "emergency": False,
                 "durability": "written",
                 "persisted": True,
-                "timestamp": payload["timestamp"]}
+                "timestamp": payload["timestamp"],
+                "terminal_outcome": payload.get("terminal_outcome", ""),
+                "execution_executed": payload.get("execution_executed", False),
+                "query_unit_id": payload.get("query_unit_id", ""),
+                "proposal_hash": payload.get("proposal_hash", ""),
+                "artifact_path": payload.get("artifact_path", "") or payload.get("artifact_reference", "")}
 
     def append_emergency(self, record, failure_reason: str = "") -> dict:
         """Persist record into emergency journal in the errors partition.
@@ -676,8 +900,7 @@ class AuditWriter:
             raise OSError("audit root unavailable for emergency journal") from exc
 
         target = self._boundary.validate(str(directory / EMERGENCY_LOG_FILENAME))
-        line = json.dumps(payload, ensure_ascii=False, sort_keys=True,
-                          default=str) + "\n"
+        line = canonical_json_dumps(payload) + "\n"
         try:
             with target.open("a", encoding="utf-8") as handle:
                 pos = handle.tell()
@@ -702,7 +925,12 @@ class AuditWriter:
                 "emergency": True,
                 "durability": "confirmed",
                 "persisted": True,
-                "timestamp": payload["timestamp"]}
+                "timestamp": payload["timestamp"],
+                "terminal_outcome": payload.get("terminal_outcome", ""),
+                "execution_executed": payload.get("execution_executed", False),
+                "query_unit_id": payload.get("query_unit_id", ""),
+                "proposal_hash": payload.get("proposal_hash", ""),
+                "artifact_path": payload.get("artifact_path", "") or payload.get("artifact_reference", "")}
 
     def read_emergency_records(self) -> EmergencyJournalReadResult:
         """Read all emergency records from errors/audit_emergency.jsonl.
@@ -737,11 +965,11 @@ class AuditWriter:
         try:
             content = target.read_text(encoding="utf-8")
             for line_no, raw_line in enumerate(content.splitlines(), start=1):
-                line = raw_line.strip()
-                if not line:
+                if not raw_line.strip():
                     continue
+                line = raw_line
                 try:
-                    data = json.loads(line)
+                    data = parse_journal_record_line(raw_line)
                 except Exception as exc:
                     rec_id = _extract_identifiable_record_id(line)
                     malformed.append({
@@ -1788,11 +2016,12 @@ def persist_record(writer, record, receipts=None) -> bool:
         raw_receipt = writer.append(record)
     except Exception as exc:
         if receipts is not None:
+            from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
             receipts.append({
                 "record_id": rec_id,
                 "persisted": False,
                 "durability": "failed",
-                "reason": str(exc) or "audit persistence failed",
+                "reason": sanitize_diagnostic_text(str(exc) or "audit persistence failed"),
             })
         return False
 
@@ -1820,7 +2049,473 @@ def persist_record(writer, record, receipts=None) -> bool:
     return True
 
 
+def read_all_persisted_journal_records(audit_root: str | Path) -> tuple[list[PersistedRecord], list[dict], dict[str, int]]:
+    """Scan all journal partitions under audit_root.
+
+    Reads passed/audit.jsonl, failed/audit.jsonl, errors/audit.jsonl, and errors/audit_emergency.jsonl.
+    Returns:
+        (records, malformed_lines, record_id_counts)
+    where record_id_counts tracks global occurrence count for every record_id across the entire journal.
+    """
+    root = Path(audit_root).expanduser().resolve()
+    records: list[PersistedRecord] = []
+    malformed: list[dict] = []
+    record_id_counts: dict[str, int] = {}
+
+    standard_files = [
+        root / "passed" / AUDIT_LOG_FILENAME,
+        root / "failed" / AUDIT_LOG_FILENAME,
+        root / "errors" / AUDIT_LOG_FILENAME,
+        root / "errors" / EMERGENCY_LOG_FILENAME,
+    ]
+    seen_files = set()
+    candidate_files = []
+    for sf in standard_files:
+        if sf.is_file():
+            candidate_files.append(sf)
+            seen_files.add(sf.resolve())
+    if root.is_dir():
+        for extra in sorted(root.rglob("*.jsonl")):
+            if extra.is_file() and extra.resolve() not in seen_files:
+                candidate_files.append(extra)
+                seen_files.add(extra.resolve())
+
+    for p in candidate_files:
+        if not p.is_file():
+            continue
+        try:
+            content = p.read_text(encoding="utf-8")
+        except Exception as exc:
+            malformed.append({"file": str(p), "error": f"read error: {exc}"})
+            continue
+
+        for line_no, raw_line in enumerate(content.splitlines(), start=1):
+            if not raw_line.strip():
+                continue
+            line = raw_line
+            try:
+                data = parse_journal_record_line(raw_line)
+            except Exception as exc:
+                malformed.append({
+                    "file": str(p),
+                    "line_no": line_no,
+                    "error": f"JSON decode/validation error: {exc}",
+                    "raw": line,
+                })
+                continue
+
+            if not isinstance(data, dict):
+                malformed.append({
+                    "file": str(p),
+                    "line_no": line_no,
+                    "error": "line is not a JSON object",
+                    "raw": line,
+                })
+                continue
+
+            persisted_entry = PersistedRecord(data, source_file=str(p), line_no=line_no)
+            records.append(persisted_entry)
+
+            rec_id = data.get("record_id")
+            if isinstance(rec_id, str) and rec_id.strip():
+                rid = rec_id.strip()
+                record_id_counts[rid] = record_id_counts.get(rid, 0) + 1
+
+    return records, malformed, record_id_counts
+
+
+def _validate_identity_str(val: Any, field_name: str, entity_name: str) -> tuple[str, str]:
+    """Validate that an identity field is strictly a non-empty string.
+
+    Rejects:
+    - None or missing values
+    - Non-string types (int, bool, float, dict, list, arbitrary objects)
+    - Empty or whitespace-only strings
+    Returns (cleaned_string, error_message).
+    """
+    display_field = f"'{field_name}'" if not field_name.startswith("'") and " " not in field_name else field_name
+    if val is None:
+        return "", f"{entity_name} missing mandatory {display_field}"
+    if not isinstance(val, str) or isinstance(val, bool):
+        return "", f"{entity_name} {display_field} must be a string, got {type(val).__name__}: {val!r}"
+    cleaned = val.strip()
+    if not cleaned:
+        return "", f"{entity_name} missing mandatory {display_field}"
+    return cleaned, ""
+
+
+def _extract_and_validate_artifact(
+    entity: dict,
+    entity_name: str,
+    field_label: str = "artifact path",
+) -> tuple[str, str]:
+    """Extract and strictly validate artifact path or reference from a dictionary.
+
+    Enforces strict distinction:
+    1. Primary field missing entirely vs. present.
+    2. Primary field present but non-string (int, bool, float, list, dict) -> strictly rejected.
+       Falsey values like False or 0 must NEVER fall back to alternative fields.
+    3. Primary field present but empty or whitespace-only -> strictly rejected.
+    4. Alternative field ('artifact_reference') evaluated ONLY when 'artifact_path' is absent.
+    5. When both fields are present, both must be valid strings and cannot contradict each other.
+    """
+    has_path = "artifact_path" in entity
+    has_ref = "artifact_reference" in entity
+
+    if not has_path and not has_ref:
+        return "", f"{entity_name} missing mandatory {field_label}"
+
+    path_val = entity.get("artifact_path") if has_path else None
+    ref_val = entity.get("artifact_reference") if has_ref else None
+
+    cleaned_path = ""
+    cleaned_ref = ""
+
+    if has_path:
+        cleaned_path, err = _validate_identity_str(path_val, field_label, entity_name)
+        if err:
+            return "", err
+
+    if has_ref:
+        cleaned_ref, err = _validate_identity_str(ref_val, "artifact_reference", entity_name)
+        if err:
+            return "", err
+
+    if cleaned_path and cleaned_ref:
+        path_name = Path(cleaned_path).name
+        ref_name = Path(cleaned_ref).name
+        if path_name != ref_name and cleaned_path != cleaned_ref:
+            return "", f"{entity_name} conflicting artifact fields: artifact_path={cleaned_path!r} != artifact_reference={cleaned_ref!r}"
+        return cleaned_path, ""
+
+    if cleaned_path:
+        return cleaned_path, ""
+    if cleaned_ref:
+        return cleaned_ref, ""
+
+    return "", f"{entity_name} missing mandatory {field_label}"
+
+
+def verify_execution_receipt_bijection(
+    entries: Iterable,
+    audit_receipts: Iterable,
+    audit_writer: Any = None,
+    active_run_id: str = "",
+) -> tuple[bool, str, str]:
+    """Verify strict two-sided bijective binding between executed units and audit receipts.
+
+    Enforces:
+    - Every executed unit corresponds to exactly one verified execution receipt.
+    - Every execution-claiming receipt corresponds to exactly one executed unit.
+    - Strict string identity fields (no implicit coercion, no non-string types, no empty values).
+    - Exact run identity consistency across receipt, persisted record, and active run.
+    - Rejection of conflicting record_id bindings between executed units and receipts.
+    - Detects:
+      * Missing receipt for executed unit
+      * Orphan execution receipt
+      * Extra execution receipt
+      * Duplicate receipt assignment
+      * Multiple receipts sharing record_id
+      * Duplicate record_id across entire journal on disk
+      * Cryptographic digest mismatch
+      * Field identity binding mismatch
+      * Journal records claiming execution absent from in-memory receipts
+
+    Returns:
+        (is_valid, failure_type, failure_reason)
+        where failure_type is "audit_integrity_failure", "accounting_integrity_failure", or "".
+    """
+    # 1. Strictly validate active_run_id if provided
+    if active_run_id != "":
+        clean_active_run_id, err = _validate_identity_str(active_run_id, "active_run_id", "execution context")
+        if err:
+            return False, "audit_integrity_failure", err
+    else:
+        clean_active_run_id = ""
+
+    executed_units = [u for u in entries if getattr(u, "outcome", "") == "executed"]
+    receipts_list = list(audit_receipts) if audit_receipts is not None else []
+    audit_root = getattr(audit_writer, "root", "") if audit_writer is not None else ""
+
+    # 2. Strictly validate in-memory receipts structure and record_id uniqueness
+    seen_in_mem_ids: set[str] = set()
+    for r in receipts_list:
+        if not isinstance(r, dict):
+            return False, "audit_integrity_failure", f"receipt is not a dictionary: got {type(r).__name__}"
+        raw_rid = r.get("record_id")
+        c_rid, err = _validate_identity_str(raw_rid, "record_id", "in-memory receipt")
+        if err:
+            return False, "audit_integrity_failure", err
+        if c_rid in seen_in_mem_ids:
+            return False, "accounting_integrity_failure", f"multiple in-memory receipts share the same record_id: {c_rid}"
+        seen_in_mem_ids.add(c_rid)
+
+    disk_records, malformed_lines, id_counts = (
+        read_all_persisted_journal_records(audit_root) if audit_root else ([], [], {})
+    )
+
+    if malformed_lines:
+        first_mal = malformed_lines[0]
+        return False, "audit_integrity_failure", f"malformed journal line on disk ({first_mal.get('file')}:{first_mal.get('line_no')}): {first_mal.get('error')}"
+
+    # 3. Strictly validate disk records structure and build disk_by_id safely
+    disk_by_id: dict[str, dict] = {}
+    for d in disk_records:
+        if not isinstance(d, dict):
+            return False, "audit_integrity_failure", f"persisted record on disk is not a dictionary: got {type(d).__name__}"
+        d_rid = d.get("record_id")
+        source_loc = getattr(d, "reader_source_file", "") or d.get("_source_file", "unknown")
+        line_no_loc = getattr(d, "reader_line_no", 0) or d.get("_line_no", "?")
+        clean_d_rid, err = _validate_identity_str(
+            d_rid,
+            "record_id",
+            f"persisted record ({source_loc}:{line_no_loc})",
+        )
+        if err:
+            return False, "audit_integrity_failure", err
+        disk_by_id[clean_d_rid] = d
+
+    def _claims_execution(r: dict) -> bool:
+        if not isinstance(r, dict):
+            return False
+        if is_execution_claiming(r):
+            return True
+        raw_rid = r.get("record_id")
+        if isinstance(raw_rid, str) and not isinstance(raw_rid, bool):
+            rid = raw_rid.strip()
+            if rid and rid in disk_by_id:
+                if is_execution_claiming(disk_by_id[rid]):
+                    return True
+        return False
+
+    claim_receipts = [r for r in receipts_list if _claims_execution(r)]
+
+    if audit_writer is None:
+        if len(executed_units) > 0:
+            return False, "audit_integrity_failure", f"{len(executed_units)} units executed, but no audit writer configured"
+        if len(claim_receipts) > 0:
+            return False, "accounting_integrity_failure", f"{len(claim_receipts)} execution receipts reported, but no audit writer configured"
+        return True, "", ""
+
+    # Global journal-wide uniqueness of record_id across every discovered record in the complete journal
+    for rid, count in id_counts.items():
+        if count > 1:
+            matching_locs = [
+                f"{getattr(d, 'reader_source_file', '') or d.get('_source_file', 'unknown')}:{getattr(d, 'reader_line_no', 0) or d.get('_line_no', '?')}"
+                for d in disk_records
+                if d.get("record_id") == rid
+            ]
+            locs_desc = ", ".join(matching_locs) if matching_locs else "unknown locations"
+            return (
+                False,
+                "audit_integrity_failure",
+                f"duplicate record_id detected across journal on disk: {rid!r} (count={count}) at [{locs_desc}]",
+            )
+
+    # Check journal records claiming execution for active_run_id that are missing from in-memory receipts
+    disk_claim_records = [
+        d for d in disk_records
+        if is_execution_claiming(d)
+        and (not clean_active_run_id or d.get("run_id") == clean_active_run_id)
+    ]
+    for d in disk_claim_records:
+        d_id = d.get("record_id")
+        if not any(isinstance(r, dict) and r.get("record_id") == d_id for r in receipts_list):
+            return False, "audit_integrity_failure", f"journal record {d_id} claiming execution is absent from in-memory run receipts"
+
+    # Cardinality checks
+    if len(executed_units) == 0 and len(claim_receipts) > 0:
+        return False, "accounting_integrity_failure", f"orphan execution receipts ({len(claim_receipts)}) present when 0 units executed"
+    if len(executed_units) > 0 and len(claim_receipts) == 0:
+        return False, "audit_integrity_failure", f"{len(executed_units)} units executed, but 0 execution receipts recorded"
+    if len(claim_receipts) > len(executed_units):
+        return False, "accounting_integrity_failure", f"extra execution receipts: {len(claim_receipts)} receipts for {len(executed_units)} executed units"
+    if len(claim_receipts) < len(executed_units):
+        return False, "audit_integrity_failure", f"missing execution receipts: {len(claim_receipts)} receipts for {len(executed_units)} executed units"
+
+    # Strict two-sided bijective binding
+    assigned_receipt_ids: set[str] = set()
+    for u in executed_units:
+        # Mandatory identity fields on executed unit entry
+        u_id, err = _validate_identity_str(getattr(u, "query_unit_id", None), "query_unit_id", "executed unit entry")
+        if err:
+            return False, "audit_integrity_failure", err
+
+        p_hash, err = _validate_identity_str(getattr(u, "proposal_hash", None), "proposal_hash", f"executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+
+        u_art, err = _validate_identity_str(getattr(u, "artifact_reference", None), "artifact_reference", f"executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+
+        raw_u_rec_id = getattr(u, "record_id", None)
+        if raw_u_rec_id is not None and raw_u_rec_id != "":
+            u_rec_id, err = _validate_identity_str(raw_u_rec_id, "record_id", f"executed unit {u_id}")
+            if err:
+                return False, "audit_integrity_failure", err
+        else:
+            u_rec_id = ""
+
+        # Receipt candidate selection and conflict detection
+        matching_receipt = None
+        for r in claim_receipts:
+            r_rec_raw = r.get("record_id")
+            r_qid = r.get("query_unit_id")
+            r_phash = r.get("proposal_hash")
+
+            unit_prop_match = (r_qid == u_id and r_phash == p_hash)
+            rec_id_match = bool(u_rec_id and r_rec_raw == u_rec_id)
+
+            if u_rec_id and r_rec_raw is not None and r_rec_raw != "":
+                if rec_id_match and unit_prop_match:
+                    matching_receipt = r
+                    break
+                elif rec_id_match and not unit_prop_match:
+                    matching_receipt = r
+                    break
+                elif not rec_id_match and unit_prop_match:
+                    # Conflicting record_id binding!
+                    return (
+                        False,
+                        "audit_integrity_failure",
+                        f"conflicting record_id binding for unit {u_id}: unit specifies record_id={u_rec_id!r}, but receipt with matching unit/proposal specifies record_id={r_rec_raw!r}",
+                    )
+            elif unit_prop_match:
+                matching_receipt = r
+                break
+            elif rec_id_match:
+                matching_receipt = r
+                break
+
+        if matching_receipt is None:
+            return False, "audit_integrity_failure", f"missing receipt for executed unit query_unit_id={u_id}, proposal_hash={p_hash}"
+
+        m_rec_id, err = _validate_identity_str(matching_receipt.get("record_id"), "record_id", f"receipt for executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+
+        if u_rec_id and m_rec_id != u_rec_id:
+            return (
+                False,
+                "audit_integrity_failure",
+                f"conflicting record_id binding for unit {u_id}: unit specifies record_id={u_rec_id!r} != receipt specifies record_id={m_rec_id!r}",
+            )
+
+        if m_rec_id in assigned_receipt_ids:
+            return False, "accounting_integrity_failure", f"duplicate receipt assignment: receipt {m_rec_id} assigned to multiple units"
+        assigned_receipt_ids.add(m_rec_id)
+
+        # Mandatory identity fields on receipt
+        r_qid, err = _validate_identity_str(matching_receipt.get("query_unit_id"), "query_unit_id", f"receipt {m_rec_id} for executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if r_qid != u_id:
+            return False, "audit_integrity_failure", f"receipt {m_rec_id} query_unit_id mismatch: unit={u_id!r} != receipt={r_qid!r}"
+
+        r_phash, err = _validate_identity_str(matching_receipt.get("proposal_hash"), "proposal_hash", f"receipt {m_rec_id} for executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if r_phash != p_hash:
+            return False, "audit_integrity_failure", f"receipt {m_rec_id} proposal_hash mismatch: unit={p_hash!r} != receipt={r_phash!r}"
+
+        r_art, err = _extract_and_validate_artifact(matching_receipt, f"receipt {m_rec_id}", field_label="artifact reference/path")
+        if err:
+            return False, "audit_integrity_failure", err
+
+        # Run identity consistency on receipt
+        r_run_id, err = _validate_identity_str(matching_receipt.get("run_id"), "run_id", f"receipt {m_rec_id} for executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if clean_active_run_id and r_run_id != clean_active_run_id:
+            return False, "audit_integrity_failure", f"receipt {m_rec_id} run_id mismatch: expected active run_id={clean_active_run_id!r}, got receipt run_id={r_run_id!r}"
+
+        # Validate receipt persistence attributes
+        is_val, val_reason = validate_persistence_receipt(matching_receipt, require_emergency=bool(matching_receipt.get("emergency")))
+        if not is_val:
+            return False, "audit_integrity_failure", f"invalid persistence receipt for executed unit {u_id}: {val_reason}"
+
+        # Locate matching on-disk record
+        disk_matches = [d for d in disk_records if d.get("record_id") == m_rec_id]
+        if len(disk_matches) == 0:
+            return False, "audit_integrity_failure", f"persisted record {m_rec_id} for executed unit {u_id} not found on disk"
+        if len(disk_matches) > 1:
+            return False, "audit_integrity_failure", f"duplicate on-disk records found for record_id {m_rec_id}"
+
+        disk_rec = disk_matches[0]
+        # Recompute and verify cryptographic digest
+        is_dig_val, dig_err = verify_record_digest(disk_rec)
+        if not is_dig_val:
+            return False, "audit_integrity_failure", f"on-disk record digest verification failed for {m_rec_id}: {dig_err}"
+
+        # Mandatory identity fields on persisted record
+        d_rec_id, err = _validate_identity_str(disk_rec.get("record_id"), "record_id", f"persisted record for executed unit {u_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if d_rec_id != m_rec_id:
+            return False, "audit_integrity_failure", f"persisted record record_id mismatch: {d_rec_id!r} != {m_rec_id!r}"
+
+        d_qid, err = _validate_identity_str(disk_rec.get("query_unit_id"), "query_unit_id", f"persisted record {m_rec_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if d_qid != u_id:
+            return False, "audit_integrity_failure", f"binding mismatch query_unit_id: unit has {u_id!r}, record has {d_qid!r}"
+
+        d_phash, err = _validate_identity_str(disk_rec.get("proposal_hash"), "proposal_hash", f"persisted record {m_rec_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if d_phash != p_hash:
+            return False, "audit_integrity_failure", f"binding mismatch proposal_hash: unit has {p_hash!r}, record has {d_phash!r}"
+
+        d_art, err = _extract_and_validate_artifact(disk_rec, f"persisted record {m_rec_id}", field_label="artifact path")
+        if err:
+            return False, "audit_integrity_failure", err
+
+        # Run identity consistency on persisted record
+        d_run_id, err = _validate_identity_str(disk_rec.get("run_id"), "run_id", f"persisted record {m_rec_id}")
+        if err:
+            return False, "audit_integrity_failure", err
+        if d_run_id != r_run_id:
+            return False, "audit_integrity_failure", f"run_id mismatch between receipt and persisted record {m_rec_id}: receipt={r_run_id!r} != record={d_run_id!r}"
+        if clean_active_run_id and d_run_id != clean_active_run_id:
+            return False, "audit_integrity_failure", f"persisted record {m_rec_id} run_id mismatch: expected active run_id={clean_active_run_id!r}, got record run_id={d_run_id!r}"
+
+        # Artifact path / filename matching
+        u_art_name = Path(u_art).name
+        r_art_name = Path(r_art).name
+        d_art_name = Path(d_art).name
+
+        if not u_art_name:
+            return False, "audit_integrity_failure", f"executed unit {u_id} has invalid/empty artifact filename: {u_art!r}"
+        if not r_art_name:
+            return False, "audit_integrity_failure", f"receipt {m_rec_id} has invalid/empty artifact filename: {r_art!r}"
+        if not d_art_name:
+            return False, "audit_integrity_failure", f"persisted record {m_rec_id} has invalid/empty artifact filename: {d_art!r}"
+
+        if not (u_art in (d_art, d_art_name) or u_art_name == d_art_name):
+            return False, "audit_integrity_failure", f"binding mismatch artifact_path: unit has {u_art!r}, record has {d_art!r}"
+
+        if not (r_art in (d_art, d_art_name) or r_art_name == d_art_name):
+            return False, "audit_integrity_failure", f"binding mismatch receipt artifact_path: receipt has {r_art!r}, record has {d_art!r}"
+
+        if u_art_name != r_art_name:
+            return False, "audit_integrity_failure", f"binding mismatch artifact_path: unit filename {u_art_name!r} != receipt filename {r_art_name!r}"
+
+    # Verify no orphan receipts in claim_receipts
+    for r in claim_receipts:
+        r_id = r.get("record_id")
+        if r_id not in assigned_receipt_ids:
+            return False, "accounting_integrity_failure", f"orphan execution receipt {r_id} cannot be bound to any executed unit"
+
+    return True, "", ""
+
+
 __all__ = ("AUDIT_LOG_FILENAME", "EMERGENCY_LOG_FILENAME", "PASSED_SUBDIR",
            "FAILED_SUBDIR", "ERRORS_SUBDIR", "AuditWriter", "AuditRecord",
            "audit_storage_category", "persist_record", "persist_record_resilient",
-           "validate_persistence_receipt", "record_digest", "record_to_dict")
+           "validate_persistence_receipt", "record_digest", "record_to_dict",
+           "compute_record_digest", "verify_record_digest", "canonical_json_dumps",
+           "parse_canonical_json_line", "parse_journal_record_line",
+           "PersistedRecord", "read_all_persisted_journal_records",
+           "verify_execution_receipt_bijection", "is_execution_claiming",
+           "POST_DIGEST_FIELDS")

@@ -24,6 +24,7 @@ def test_stage_identity_and_llm_safe_stop():
 
     pipe = EvidenceFirstPipeline()
     unit = pipe.run_unit(_unit())
+    assert unit is not None
     prompt = build_llm_context(
         unit.query_unit, unit.proposal, unit.classification,
         unit.retrieval_result, unit.comparisons, unit.relation_result,

@@ -67,11 +67,14 @@ def test_example_input_directory_is_synthetic_and_present():
 def test_example_run_reaches_controlled_execution(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
+    audit_root = tmp_path / "audit"
+    audit_root.mkdir()
     synthesis = SyntheticSynthesis()
     report = run_bounded_integration(
         str(EXAMPLE_INPUT), str(staging), guarded_roots=(),
         approval_reader=_approve_all, corpus=_corpus(),
         core_units=_core_units(), max_files=1, synthesis=synthesis,
+        audit_root=str(audit_root), authorized_audit_root=str(audit_root),
     )
     assert synthesis.calls >= 1, "the formal LLM stage must run"
     assert report.accepted is True

@@ -24,7 +24,7 @@ function initialResources(): AppState["resources"] {
   const purposes: FolderPurpose[] = ["vault", "staging", "audit", "vector_db", "local_llm", "embedding_model"];
   const entries = purposes.map((purpose): [FolderPurpose, ConfigResourceState] => [
     purpose,
-    { purpose, validity: purpose === "vault" ? "configured_valid" : "not_configured", display: purpose === "vault" ? "<TEST_VAULT>" : "", reason: "" },
+    { purpose, validity: "not_configured", display: "", reason: "" },
   ]);
   return Object.fromEntries(entries) as AppState["resources"];
 }
@@ -123,6 +123,9 @@ interface Store {
   pickLiveFolder: (purpose: FolderPurpose) => Promise<void>;
   retryConnection: () => Promise<void>;
   dismissLiveError: () => void;
+  /** Apply a stream event to update store state and lifecycle. */
+  applyEvent: (event: RunEvent) => void;
+  actionInFlight: boolean;
   /** Pending live payloads surfaced from the SSE stream. */
   liveApproval: {
     proposal_hash: string;
@@ -134,6 +137,12 @@ interface Store {
     confidence_score?: number;
     confidence_score_band?: string;
     classification_type?: string;
+    destination?: string;
+    reason?: string;
+    evidence?: string[];
+    provenance?: string[];
+    uncertainties?: string[];
+    is_executable?: boolean;
   } | null;
   liveConsentRequest: { consent_id: string; message: string } | null;
   pendingSyncApproval: PendingSyncApprovalInfo | null;
@@ -175,40 +184,118 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   });
   const [liveConnected, setLiveConnected] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
+  const [actionInFlight, setActionInFlight] = useState(false);
   const [liveApproval, setLiveApproval] = useState<Store["liveApproval"]>(null);
   const [liveConsentRequest, setLiveConsentRequest] = useState<
     Store["liveConsentRequest"]
   >(null);
   const [pendingSyncApproval, setPendingSyncApproval] = useState<PendingSyncApprovalInfo | null>(null);
   const lastInstanceIdRef = useRef<string>("");
+  const currentRunIdRef = useRef<string>(live.available ? "" : "run-fixture-001");
+  const isStoppedRef = useRef<boolean>(false);
+  const previousRunIdRef = useRef<string>("");
+  const retiredRunIdsRef = useRef<Set<string>>(new Set());
+
+  const retireRunId = (id: string) => {
+    if (id && !id.startsWith("run-fixture")) {
+      retiredRunIdsRef.current.add(id);
+      previousRunIdRef.current = id;
+    }
+  };
 
   const stateRef = useRef(state);
   stateRef.current = state;
 
   const applyEvent = (event: RunEvent) => {
-    setLiveConnected(true);
-    // Retain a bounded, run-scoped event log for Current Audit + timeline.
-    setState((s) => {
-      const rid = typeof event.run_id === "string" ? event.run_id : "";
-      const sameRun = !rid || rid === s.run.run_id || s.run.run_id === "";
-      if (!sameRun) return s;
-      const next = s.runEvents.length >= MAX_RUN_EVENTS
-        ? [...s.runEvents.slice(s.runEvents.length - MAX_RUN_EVENTS + 1), event]
-        : [...s.runEvents, event];
-      return { ...s, runEvents: next };
-    });
     const runId = typeof event.run_id === "string" ? event.run_id : "";
     const stage = typeof event.stage === "string" ? event.stage : "";
     const message = typeof event.message === "string" ? event.message : "";
     const extra = event as RunEvent & Record<string, unknown>;
 
-    // Stale event protection: If this run has been stopped or rejected,
-    // prevent any delayed SSE events from reviving it to RUNNING or AWAITING_REVIEW.
-    if (stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
+    const activeRunId = currentRunIdRef.current;
+    const isFixtureOrIdle = !activeRunId || activeRunId.startsWith("run-fixture");
+
+    // 1. Run identity correlation:
+    // When an active real run exists, every lifecycle and decision event must carry the exact matching run_id.
+    // Events lacking a run_id or carrying a foreign run_id are rejected before state mutation or connection updates.
+    if (!isFixtureOrIdle && (!runId || runId !== activeRunId)) {
+      return;
+    }
+
+    // 2. Retired/previous-run rejection: If the event carries any previously retired run ID, it is stale.
+    if (runId && (retiredRunIdsRef.current.has(runId) || (previousRunIdRef.current && runId === previousRunIdRef.current))) {
+      return;
+    }
+
+    // 3. Idle / fixture gate: When no real run is active, ONLY a legitimate run_started event
+    // with a valid non-empty run_id can initialize a new run. Ordinary events or events without
+    // run_id cannot initialize or mutate the run state.
+    if (isFixtureOrIdle && (event.kind !== "run_started" || !runId)) {
+      return;
+    }
+
+    // 4. Stale event protection on stopped runs: If the active run has been stopped or rejected,
+    // prevent delayed lifecycle events from reviving it to running.
+    if (!isFixtureOrIdle && isStoppedRef.current && (!runId || runId === activeRunId)) {
       if (
         event.kind !== "stopped" &&
         event.kind !== "run_rejected" &&
-        event.kind !== "error"
+        event.kind !== "error" &&
+        event.kind !== "warning" &&
+        event.kind !== "audit_persisted" &&
+        event.kind !== "audit_failed"
+      ) {
+        return;
+      }
+    }
+
+    // Connection-state ordering: Event is verified as valid for the current/new run;
+    // mark connection live now without allowing rejected foreign/stale events to do so.
+    setLiveConnected(true);
+
+    if (event.kind === "run_started" && runId) {
+      if (currentRunIdRef.current && currentRunIdRef.current !== runId) {
+        retireRunId(currentRunIdRef.current);
+      }
+      currentRunIdRef.current = runId;
+      isStoppedRef.current = false;
+    } else if (
+      event.kind === "stopped" ||
+      event.kind === "run_rejected" ||
+      event.kind === "error"
+    ) {
+      isStoppedRef.current = true;
+    }
+
+    // Retain a bounded, run-scoped event log for Current Audit + timeline.
+    setState((s) => {
+      const rid = typeof event.run_id === "string" ? event.run_id : "";
+      const isFixture = !s.run.run_id || s.run.run_id.startsWith("run-fixture");
+      if (!isFixture && (!rid || rid !== s.run.run_id)) {
+        return s;
+      }
+      if (rid && (retiredRunIdsRef.current.has(rid) || (previousRunIdRef.current && rid === previousRunIdRef.current))) {
+        return s;
+      }
+      if (isFixture && event.kind !== "run_started") {
+        return s;
+      }
+      const baseEvents = isFixture ? [] : s.runEvents;
+      const next = baseEvents.length >= MAX_RUN_EVENTS
+        ? [...baseEvents.slice(baseEvents.length - MAX_RUN_EVENTS + 1), event]
+        : [...baseEvents, event];
+      return { ...s, runEvents: next };
+    });
+
+    // Stale event protection: If this run has been stopped or rejected,
+    // prevent any delayed SSE events from reviving it to RUNNING or AWAITING_REVIEW.
+    const isCurFixture = !stateRef.current.run.run_id || stateRef.current.run.run_id.startsWith("run-fixture");
+    if (!isCurFixture && stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
+      if (
+        event.kind !== "stopped" &&
+        event.kind !== "run_rejected" &&
+        event.kind !== "error" &&
+        event.kind !== "warning"
       ) {
         return;
       }
@@ -263,16 +350,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           : (extra.confidence_score ? Number(extra.confidence_score) : 0.89);
         const confBand = String(extra.confidence_score_band ?? (confScore >= 0.8 ? "high" : confScore >= 0.5 ? "moderate" : "low"));
         const classType = String(extra.classification_type ?? "Observation");
+        const action = String(extra.proposal_action ?? "");
+        const isExecutable = extra.is_executable !== undefined ? Boolean(extra.is_executable) : action === "CREATE";
+        const destination = String(extra.destination ?? "");
+        const reason = String(extra.reason ?? "");
+        const evidence = Array.isArray(extra.evidence) ? (extra.evidence as string[]) : [];
+        const provenance = Array.isArray(extra.provenance) ? (extra.provenance as string[]) : [];
+        const uncertainties = Array.isArray(extra.uncertainties) ? (extra.uncertainties as string[]) : [];
+        const awaitingStatus = isExecutable
+          ? "awaiting explicit approval"
+          : "awaiting human review / acknowledgment";
+
         setLiveApproval({
           proposal_hash: proposalHash,
           query_unit_id: String(extra.query_unit_id ?? ""),
-          proposal_action: String(extra.proposal_action ?? ""),
+          proposal_action: action,
           title: String(extra.title ?? ""),
           body: String(extra.body ?? ""),
           confidence_level: String(extra.confidence_level ?? ""),
           confidence_score: confScore,
           confidence_score_band: confBand,
           classification_type: classType,
+          destination,
+          reason,
+          evidence,
+          provenance,
+          uncertainties,
+          is_executable: isExecutable,
         });
         setState((s) => {
           if (s.run.stopped && (!runId || runId === s.run.run_id)) {
@@ -284,7 +388,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ...s.run,
               run_id: runId || s.run.run_id,
               proposal_action:
-                (String(extra.proposal_action ?? "") as CurrentRunView["proposal_action"]) ||
+                (action as CurrentRunView["proposal_action"]) ||
                 s.run.proposal_action,
               classification_type: classType,
               proposal_title: String(extra.title ?? s.run.proposal_title),
@@ -292,9 +396,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               confidence_score: confScore,
               confidence_score_band: confBand,
               proposal_hash: proposalHash,
+              destination,
+              reason,
+              evidence,
+              provenance,
+              uncertainties,
+              is_executable: isExecutable,
               review_state: "live_awaiting_review",
               current_stage: "human_review",
-              status: "awaiting explicit approval",
+              status: awaitingStatus,
               error: null,
             },
           };
@@ -323,6 +433,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     if (event.kind === "approval_decided") {
       setLiveApproval(null);
+      setState((s) => {
+        if (s.run.stopped && (!runId || runId === s.run.run_id)) {
+          return s;
+        }
+        const isApprove = /approve/i.test(message);
+        const isReject = /reject/i.test(message);
+        const isAck = /acknowledged|ack/i.test(message);
+        const nextReviewState = isApprove
+          ? "live_approved"
+          : isReject
+            ? "live_rejected"
+            : isAck
+              ? "live_acknowledged"
+              : s.run.review_state;
+        const nextStatus = isApprove
+          ? "proposal approved"
+          : isReject
+            ? "proposal rejected"
+            : isAck
+              ? "proposal acknowledged"
+              : message || s.run.status;
+        return {
+          ...s,
+          run: {
+            ...s.run,
+            review_state: nextReviewState,
+            status: nextStatus,
+            accepted: isAck ? true : s.run.accepted,
+          },
+        };
+      });
       return;
     }
     if (
@@ -336,6 +477,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       event.kind === "completed"
     ) {
       setState((s) => {
+        const isFixture = !s.run.run_id || s.run.run_id.startsWith("run-fixture");
+        // Prevent uncorrelated events or events from a different run from corrupting the active run
+        if (!isFixture && (!runId || runId !== s.run.run_id)) {
+          return s;
+        }
+        if (runId && (retiredRunIdsRef.current.has(runId) || (previousRunIdRef.current && runId === previousRunIdRef.current))) {
+          return s;
+        }
+        if (isFixture && event.kind !== "run_started") {
+          return s;
+        }
         // Prevent stale events from reviving a run that was stopped or rejected
         if (s.run.stopped && (!runId || runId === s.run.run_id)) {
           return s;
@@ -345,9 +497,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           run: {
             ...s.run,
             run_id: runId || s.run.run_id,
-            current_stage: stage || s.run.current_stage,
+            current_stage: stage || (event.kind === "run_started" ? (stage || "input") : s.run.current_stage),
             status: message || s.run.status,
             stopped: false,
+            stop_reason: event.kind === "run_started" ? "" : s.run.stop_reason,
+            audit_status: event.kind === "run_started" ? "pending" : s.run.audit_status,
           },
         };
       });
@@ -357,31 +511,106 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       return;
     }
+    if (event.kind === "audit_persisted") {
+      const isEmergency =
+        event.audit_mode === "emergency" ||
+        event.audit_partition === "errors" ||
+        /emergency/i.test(message) ||
+        event.operation === "emergency";
+      setState((s) => {
+        const isFixture = !s.run.run_id || s.run.run_id.startsWith("run-fixture");
+        if (!isFixture && (!runId || runId !== s.run.run_id)) {
+          return s;
+        }
+        return {
+          ...s,
+          run: {
+            ...s.run,
+            audit_status: isEmergency ? "emergency_persisted" : "normal_persisted",
+          },
+        };
+      });
+      void refreshJournalsQuiet();
+      return;
+    }
+    if (event.kind === "audit_failed") {
+      setState((s) => {
+        const isFixture = !s.run.run_id || s.run.run_id.startsWith("run-fixture");
+        if (!isFixture && (!runId || runId !== s.run.run_id)) {
+          return s;
+        }
+        return {
+          ...s,
+          run: {
+            ...s.run,
+            audit_status: "persistence_failed",
+          },
+        };
+      });
+      return;
+    }
+    if (event.kind === "warning") {
+      setState((s) => {
+        const isFixture = !s.run.run_id || s.run.run_id.startsWith("run-fixture");
+        // If this warning is uncorrelated or belongs to a different run, ignore it.
+        if (!isFixture && (!runId || runId !== s.run.run_id)) {
+          return s;
+        }
+        if (runId && (retiredRunIdsRef.current.has(runId) || (previousRunIdRef.current && runId === previousRunIdRef.current))) {
+          return s;
+        }
+        if (isFixture) {
+          return s;
+        }
+        return {
+          ...s,
+          run: {
+            ...s.run,
+            run_id: runId || s.run.run_id,
+            current_stage: s.run.stopped
+              ? s.run.current_stage
+              : (s.run.current_stage || stage || "input"),
+            stopped: s.run.stopped,
+            stop_reason: s.run.stop_reason,
+            status: message || s.run.status,
+          },
+        };
+      });
+      return;
+    }
     if (
       event.kind === "run_rejected" ||
       event.kind === "stopped" ||
-      event.kind === "error" ||
-      event.kind === "warning"
+      event.kind === "error"
     ) {
-      if (event.kind !== "warning") {
-        setPendingSyncApproval(null);
+      const isFixture = !stateRef.current.run.run_id || stateRef.current.run.run_id.startsWith("run-fixture");
+      if (!isFixture && (!runId || runId !== stateRef.current.run.run_id)) {
+        return;
       }
+      setPendingSyncApproval(null);
+      setLiveApproval(null);
       const outcome = (event.outcome as AppState["inputOutcome"]) ||
         (event.kind === "stopped" ? "STOPPED" : "REJECTED");
-      setState((s) => ({
-        ...s,
-        inputOutcome: outcome,
-        inputErrorCode: event.error_code ?? null,
-        inputRecoveryOptions: event.recovery_options ?? ["fix_input", "stop"],
-        run: {
-          ...s.run,
-          run_id: runId || s.run.run_id,
-          current_stage: stage || s.run.current_stage || "input",
-          stopped: event.kind !== "warning",
-          stop_reason: message,
-          status: message || s.run.status,
-        },
-      }));
+      setState((s) => {
+        const sIsFixture = !s.run.run_id || s.run.run_id.startsWith("run-fixture");
+        if (!sIsFixture && (!runId || runId !== s.run.run_id)) {
+          return s;
+        }
+        return {
+          ...s,
+          inputOutcome: outcome,
+          inputErrorCode: event.error_code ?? null,
+          inputRecoveryOptions: event.recovery_options ?? ["fix_input", "stop"],
+          run: {
+            ...s.run,
+            run_id: runId || s.run.run_id,
+            current_stage: stage || s.run.current_stage || "input",
+            stopped: true,
+            stop_reason: message,
+            status: message || s.run.status,
+          },
+        };
+      });
       return;
     }
   };
@@ -392,7 +621,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const data = await live.journals();
       setState((s) => ({
         ...s,
-        recentAudits: data.audits.map((a) => ({
+        recentAudits: (data?.audits || []).map((a) => ({
           id: a.record_id,
           timestamp: a.timestamp,
           statusKey:
@@ -419,7 +648,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           narrative_language: a.narrative_language,
           emergency: a.emergency,
         })),
-        recentStaging: data.staging.map((r) => ({
+        recentStaging: (data?.staging || []).map((r) => ({
           id: r.record_id,
           timestamp: r.timestamp,
           statusKey:
@@ -448,6 +677,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   };
 
   const startLiveRunFn = async (inputText: string) => {
+    if (stateRef.current.run.run_id && !stateRef.current.run.run_id.startsWith("run-fixture")) {
+      retireRunId(stateRef.current.run.run_id);
+    }
+    if (currentRunIdRef.current && !currentRunIdRef.current.startsWith("run-fixture")) {
+      retireRunId(currentRunIdRef.current);
+    }
+    currentRunIdRef.current = "";
+    isStoppedRef.current = false;
     setState((s) => ({
       ...s,
       lastSubmittedText: inputText,
@@ -473,6 +710,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setLiveError(null);
     setLiveApproval(null);
     setPendingSyncApproval(null);
+    setState((s) => ({
+      ...s,
+      runEvents: [],
+      inputOutcome: null,
+      inputErrorCode: null,
+      run: {
+        ...s.run,
+        run_id: "",
+        current_stage: "input",
+        status: "submitted — validating input",
+        stopped: false,
+        stop_reason: "",
+        review_state: "awaiting_review",
+        error: null,
+      },
+    }));
     try {
       const res = await live.startRun({
         input_text: inputText,
@@ -483,23 +736,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         audit_language: state.auditLanguage,
         source_type: "chat_input",
       });
-      setState((s) => ({
-        ...s,
-        runEvents: [],
-        run: {
-          ...s.run,
-          run_id: res.run_id,
-          current_stage: "input",
-          status:
-            "submitted — validating input (retrieval: " +
-            (res.retrieval_mode ?? state.retrievalType) +
-            ")",
-          stopped: false,
-          stop_reason: "",
-          review_state: "awaiting_review",
-          error: null,
-        },
-      }));
+      setState((s) => {
+        const matchingEvents = s.runEvents.filter((ev) => !ev.run_id || ev.run_id === res.run_id);
+        const alreadyAdvanced = s.run.run_id === res.run_id && s.run.current_stage !== "input";
+        return {
+          ...s,
+          runEvents: matchingEvents,
+          run: {
+            ...s.run,
+            run_id: res.run_id,
+            current_stage: alreadyAdvanced ? s.run.current_stage : "input",
+            status: alreadyAdvanced
+              ? s.run.status
+              : (
+                "submitted — validating input (retrieval: " +
+                (res.retrieval_mode ?? state.retrievalType) +
+                ")"
+              ),
+            stopped: s.run.run_id === res.run_id ? s.run.stopped : false,
+            stop_reason: s.run.run_id === res.run_id ? s.run.stop_reason : "",
+            review_state: alreadyAdvanced ? s.run.review_state : "awaiting_review",
+            error: null,
+          },
+        };
+      });
     } catch (e) {
       const errMsg = (e as Error)?.message ?? "backend_error";
       setLiveError(errMsg);
@@ -586,7 +846,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       mockEdit: (body) =>
         setState((s) => ({
           ...s,
-          run: { ...s.run, edited_body: body, review_state: "mock_edited_stale" },
+          run: {
+            ...s.run,
+            edited_body: body,
+            is_executable: s.run.proposal_action === "CREATE",
+            review_state: "mock_edited_stale",
+          },
         })),
       setComposer: (open, text) =>
         setState((s) => ({ ...s, composerOpen: open, composerText: text ?? s.composerText })),
@@ -671,6 +936,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       liveConsentRequest,
       startLiveRun: startLiveRunFn,
       fixInput: () => {
+        if (stateRef.current.run.run_id && !stateRef.current.run.run_id.startsWith("run-fixture")) {
+          retireRunId(stateRef.current.run.run_id);
+        }
+        if (currentRunIdRef.current && !currentRunIdRef.current.startsWith("run-fixture")) {
+          retireRunId(currentRunIdRef.current);
+        }
+        currentRunIdRef.current = "";
+        isStoppedRef.current = false;
         setPendingSyncApproval(null);
         setState((s) => ({
           ...s,
@@ -692,6 +965,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       retryLastInput: async () => {
         const textToRetry = state.lastSubmittedText;
         if (!textToRetry) return;
+        if (stateRef.current.run.run_id && !stateRef.current.run.run_id.startsWith("run-fixture")) {
+          retireRunId(stateRef.current.run.run_id);
+        }
+        if (currentRunIdRef.current && !currentRunIdRef.current.startsWith("run-fixture")) {
+          retireRunId(currentRunIdRef.current);
+        }
+        currentRunIdRef.current = "";
+        isStoppedRef.current = false;
         if (!live.available) {
           setLiveError("connection_unavailable");
           return;
@@ -699,6 +980,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setLiveError(null);
         setLiveApproval(null);
         setPendingSyncApproval(null);
+        setState((s) => ({
+          ...s,
+          runEvents: [],
+          inputOutcome: null,
+          inputErrorCode: null,
+          run: {
+            ...s.run,
+            run_id: "",
+            current_stage: "input",
+            status: "submitted retry — validating input",
+            stopped: false,
+            stop_reason: "",
+            review_state: "awaiting_review",
+            error: null,
+          },
+        }));
         try {
           const res = await live.startRun({
             input_text: textToRetry,
@@ -709,32 +1006,45 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             audit_language: state.auditLanguage,
             source_type: "chat_input",
           });
-          setState((s) => ({
-            ...s,
-            runEvents: [],
-            inputOutcome: null,
-            inputErrorCode: null,
-            run: {
-              ...s.run,
-              run_id: res.run_id,
-              current_stage: "input",
-              status: "submitted retry — validating input",
-              stopped: false,
-              stop_reason: "",
-              review_state: "awaiting_review",
-              error: null,
-            },
-          }));
+          setState((s) => {
+            const matchingEvents = s.runEvents.filter((ev) => !ev.run_id || ev.run_id === res.run_id);
+            const alreadyAdvanced = s.run.run_id === res.run_id && s.run.current_stage !== "input";
+            return {
+              ...s,
+              runEvents: matchingEvents,
+              inputOutcome: null,
+              inputErrorCode: null,
+              run: {
+                ...s.run,
+                run_id: res.run_id,
+                current_stage: alreadyAdvanced ? s.run.current_stage : "input",
+                status: alreadyAdvanced ? s.run.status : "submitted retry — validating input",
+                stopped: s.run.run_id === res.run_id ? s.run.stopped : false,
+                stop_reason: s.run.run_id === res.run_id ? s.run.stop_reason : "",
+                review_state: alreadyAdvanced ? s.run.review_state : "awaiting_review",
+                error: null,
+              },
+            };
+          });
         } catch (e) {
           const errMsg = (e as Error)?.message ?? "backend_error";
           setLiveError(errMsg);
         }
       },
       dismissRunOutcome: () => {
+        if (stateRef.current.run.run_id && !stateRef.current.run.run_id.startsWith("run-fixture")) {
+          retireRunId(stateRef.current.run.run_id);
+        }
+        if (currentRunIdRef.current && !currentRunIdRef.current.startsWith("run-fixture")) {
+          retireRunId(currentRunIdRef.current);
+        }
+        currentRunIdRef.current = "";
+        isStoppedRef.current = false;
         setLiveError(null);
         setPendingSyncApproval(null);
         setState((s) => ({
           ...s,
+          runEvents: [],
           inputOutcome: null,
           inputErrorCode: null,
           run: {
@@ -744,6 +1054,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }));
       },
       cancelActiveRun: async () => {
+        isStoppedRef.current = true;
         setPendingSyncApproval(null);
         if (live.available && state.run.run_id) {
           try {
@@ -765,12 +1076,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       },
       liveApprove: async (decision) => {
         if (!live.available || !liveApproval) return;
+        if (!state.run.run_id) {
+          setLiveError("Missing run ID for approval");
+          return;
+        }
         setLiveError(null);
+        setActionInFlight(true);
         try {
           await live.approve({
             proposal_hash: liveApproval.proposal_hash,
             query_unit_id: liveApproval.query_unit_id,
             decision,
+            run_id: state.run.run_id,
+            proposal_action: liveApproval.proposal_action,
           });
           setState((s) => ({
             ...s,
@@ -778,17 +1096,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ...s.run,
               review_state:
                 decision === "approve" ? "live_approved" : "live_rejected",
+              status: decision === "approve" ? "proposal approved" : "proposal rejected",
             },
           }));
           setLiveApproval(null);
           void refreshJournalsQuiet();
         } catch (e) {
           setLiveError((e as Error)?.message ?? "backend_error");
+        } finally {
+          setActionInFlight(false);
         }
       },
       liveEditProposal: async (title, body, reason) => {
         if (!live.available || !liveApproval) return;
         setLiveError(null);
+        setActionInFlight(true);
         try {
           const res = await live.editProposal({
             title,
@@ -806,6 +1128,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             title: res.title,
             body: res.body,
             confidence_level: res.confidence_level,
+            confidence_score: liveApproval.confidence_score,
+            confidence_score_band: liveApproval.confidence_score_band,
+            classification_type: liveApproval.classification_type,
+            destination: liveApproval.destination,
+            reason: reason || liveApproval.reason,
+            evidence: liveApproval.evidence,
+            provenance: liveApproval.provenance,
+            uncertainties: liveApproval.uncertainties,
+            is_executable: res.proposal_action === "CREATE",
           });
           setState((s) => ({
             ...s,
@@ -817,11 +1148,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               edited_body: res.body,
               proposal_hash: res.proposal_hash,
               review_state: "live_awaiting_review",
-              status: "proposal edited — fresh approval required",
+              is_executable: res.proposal_action === "CREATE",
+              status: res.proposal_action === "CREATE"
+                ? "proposal edited — fresh approval required"
+                : "proposal edited — acknowledgment required",
             },
           }));
         } catch (e) {
           setLiveError((e as Error)?.message ?? "backend_error");
+        } finally {
+          setActionInFlight(false);
         }
       },
       liveAccept: async () => {
@@ -831,9 +1167,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setLiveError("Missing proposal hash for acknowledgment");
           return;
         }
+        if (!state.run.run_id) {
+          setLiveError("Missing run ID for acknowledgment");
+          return;
+        }
         setLiveError(null);
+        setActionInFlight(true);
         try {
-          await live.acceptProposal(proposalHash, state.run.run_id);
+          await live.acceptProposal({
+            proposal_hash: proposalHash,
+            run_id: state.run.run_id,
+            proposal_action: liveApproval?.proposal_action || state.run.proposal_action,
+          });
           setState((s) => ({
             ...s,
             run: {
@@ -847,6 +1192,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           void refreshJournalsQuiet();
         } catch (e) {
           setLiveError((e as Error)?.message ?? "backend_error");
+        } finally {
+          setActionInFlight(false);
         }
       },
       liveFix: async (inputText) => {
@@ -1063,52 +1410,106 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return;
         }
         setLiveError(null);
-        setState((s) => ({
-          ...s,
-          resources: {
-            ...s.resources,
-            [purpose]: {
-              ...s.resources[purpose],
-              validity: "validation_pending",
-              reason: "",
-            },
-          },
-        }));
-        try {
-          const res = await live.pickFolder(purpose);
-          setState((s) => ({
-            ...s,
-            resources: {
-              ...s.resources,
-              [res.purpose]: {
-                ...s.resources[res.purpose],
-                validity:
-                  res.status === "configured"
-                    ? "configured_valid"
-                    : res.status === "invalid"
-                      ? "configured_invalid"
-                      : res.status === "cancelled"
-                        ? "not_configured"
-                        : "configured_unavailable",
-                display: res.display,
-                reason: res.reason,
-              },
-            },
-          }));
-          void refreshJournalsQuiet();
-        } catch (e) {
-          setLiveError((e as Error)?.message ?? "backend_error");
-          setState((s) => ({
+        let prevRes = state.resources[purpose];
+        let prevMode = state.sourceMode;
+        setState((s) => {
+          prevRes = s.resources[purpose];
+          prevMode = s.sourceMode;
+          return {
             ...s,
             resources: {
               ...s.resources,
               [purpose]: {
                 ...s.resources[purpose],
-                validity: "validation_error",
-                reason: (e as Error)?.message ?? "backend_error",
+                validity: "validation_pending",
+                reason: "",
               },
             },
-          }));
+          };
+        });
+        try {
+          const res = await live.pickFolder(purpose);
+          setState((s) => {
+            const wasValid = prevRes.validity === "configured_valid";
+            if (res.status === "cancelled") {
+              if (wasValid) {
+                // User cancelled changing an existing valid folder: preserve existing valid configuration
+                return {
+                  ...s,
+                  sourceMode: prevMode,
+                  resources: {
+                    ...s.resources,
+                    [res.purpose]: {
+                      ...prevRes,
+                      validity: "configured_valid",
+                    },
+                  },
+                };
+              } else {
+                // User cancelled initial folder selection: remain not_configured and revert to test mode
+                return {
+                  ...s,
+                  sourceMode: res.purpose === "vault" ? "test" : s.sourceMode,
+                  resources: {
+                    ...s.resources,
+                    [res.purpose]: {
+                      ...s.resources[res.purpose],
+                      validity: "not_configured",
+                      display: "",
+                      reason: res.reason || "Selection cancelled",
+                    },
+                  },
+                };
+              }
+            }
+
+            const isValid = res.status === "configured";
+            const isInvalid = res.status === "invalid";
+            const newValidity = isValid
+              ? "configured_valid"
+              : isInvalid
+                ? "configured_invalid"
+                : "configured_unavailable";
+
+            const nextSourceMode =
+              res.purpose === "vault"
+                ? (isValid ? "vault" : (wasValid ? prevMode : "test"))
+                : s.sourceMode;
+
+            return {
+              ...s,
+              sourceMode: nextSourceMode,
+              resources: {
+                ...s.resources,
+                [res.purpose]: {
+                  ...s.resources[res.purpose],
+                  validity: newValidity,
+                  display: res.display || (isValid ? "" : (wasValid ? prevRes.display : "")),
+                  reason: res.reason,
+                },
+              },
+            };
+          });
+          void refreshJournalsQuiet();
+        } catch (e) {
+          const errMsg = (e as Error)?.message ?? "backend_error";
+          setLiveError(errMsg);
+          setState((s) => {
+            const wasValid = prevRes.validity === "configured_valid";
+            return {
+              ...s,
+              sourceMode: wasValid ? prevMode : (purpose === "vault" ? "test" : s.sourceMode),
+              resources: {
+                ...s.resources,
+                [purpose]: {
+                  ...s.resources[purpose],
+                  validity: wasValid ? "configured_valid" : "validation_error",
+                  display: wasValid ? prevRes.display : "",
+                  reason: errMsg,
+                },
+              },
+            };
+          });
         }
       },
       retryConnection: async () => {
@@ -1149,7 +1550,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             return {
               ...s,
               resources: res,
-              sourceMode: st?.modes?.source_mode === "personal_vault" ? "vault" : "test",
+              sourceMode: st?.modes?.source_mode ? (st.modes.source_mode === "personal_vault" ? "vault" : "test") : s.sourceMode,
               retrievalType: st?.modes?.retrieval_mode ?? s.retrievalType,
               appLanguage: st?.modes?.app_language ?? s.appLanguage,
               stagingLanguage: st?.modes?.staging_language ?? s.stagingLanguage,
@@ -1162,6 +1563,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setLiveError((e as Error)?.message || "connection_unavailable");
         }
       },
+      actionInFlight,
+      applyEvent,
       dismissLiveError: () => {
         setLiveError(null);
       },
@@ -1174,6 +1577,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       liveApproval,
       liveConsentRequest,
       pendingSyncApproval,
+      actionInFlight,
     ],
   );
   // SSE stream lifecycle: connect once when live is available; abort on unmount.
@@ -1220,7 +1624,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             return {
               ...s,
               resources: res,
-              sourceMode: st?.modes?.source_mode === "personal_vault" ? "vault" : "test",
+              sourceMode: st?.modes?.source_mode ? (st.modes.source_mode === "personal_vault" ? "vault" : "test") : s.sourceMode,
               retrievalType: st?.modes?.retrieval_mode ?? s.retrievalType,
               appLanguage: st?.modes?.app_language ?? s.appLanguage,
               stagingLanguage: st?.modes?.staging_language ?? s.stagingLanguage,

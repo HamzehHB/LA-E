@@ -73,6 +73,46 @@ def test_vector_store_symlink_is_rejected(tmp_path):
     assert "symlink" in reason
 
 
+def test_vector_store_strict_test_output_isolation():
+    from Config.settings import ROOT as REPO_ROOT
+    import shutil
+
+    test_out = REPO_ROOT / "tests" / "output"
+    sub_candidate = test_out / "vdb_test_sub_dir"
+    sub_candidate.mkdir(parents=True, exist_ok=True)
+    try:
+        # Default allow_test_output=False rejects inside repo/tests/output
+        ok_def, r_def, _ = check_vector_store_eligible(str(sub_candidate), "")
+        assert ok_def is False
+        assert "repository workspace" in r_def
+
+        # Bare allow_test_output=True without authorization must be rejected
+        ok_bare, r_bare, _ = check_vector_store_eligible(
+            str(sub_candidate), "", allow_test_output=True
+        )
+        assert ok_bare is False
+        assert "repository workspace" in r_bare
+
+        # Explicit allow_test_output=True inside authorized_test_mode accepts strict descendants
+        from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
+        from tests._test_authorizer import issue_test_authorizer
+        with authorized_test_mode(issue_test_authorizer("test execution")):
+            ok_allowed, r_allowed, _ = check_vector_store_eligible(
+                str(sub_candidate), "", allow_test_output=True
+            )
+            assert ok_allowed is True, f"strict descendant in tests/output must be accepted: {r_allowed}"
+
+            # Exact root must be rejected even with allow_test_output=True
+            ok_exact, r_exact, _ = check_vector_store_eligible(
+                str(test_out), "", allow_test_output=True
+            )
+            assert ok_exact is False
+            assert "repository workspace" in r_exact
+    finally:
+        if sub_candidate.exists():
+            shutil.rmtree(sub_candidate, ignore_errors=True)
+
+
 def test_production_vector_db_key_resolves_from_config():
     assert resolve_production_vector_db() != ""
     import src.living_authenticity.knowledge.integration.vector as vector_mod

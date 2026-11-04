@@ -374,17 +374,22 @@ class RetrievalCoordinator:
     ) -> None:
         if self.observer is None or not callable(self.observer):
             return
+        from src.living_authenticity.security.diagnostic import sanitize_diagnostic_text
         payload = {
             "kind": "status",
             "stage": "retrieval",
             "operation": operation,
             "phase": phase,
-            "message": message,
+            "message": sanitize_diagnostic_text(message),
         }
         if run_id:
             payload["run_id"] = run_id
         if extra:
-            payload.update(extra)
+            sanitized_extra = {
+                k: sanitize_diagnostic_text(v) if isinstance(v, str) else v
+                for k, v in extra.items()
+            }
+            payload.update(sanitized_extra)
         try:
             self.observer(payload)
         except Exception as obs_exc:
@@ -401,10 +406,39 @@ class RetrievalCoordinator:
         query: KnowledgeUnit,
         corpus: Sequence[KnowledgeUnit],
         run_id: str = "",
+        should_cancel: Any = None,
     ) -> RetrievalResult:
         self._telemetry_failures = []
-        # Capability 1: Query Preparation
         qid = getattr(query, "id", "")
+
+        def _is_canc() -> bool:
+            if should_cancel is None:
+                return False
+            if callable(should_cancel):
+                return bool(should_cancel())
+            return bool(should_cancel)
+
+        # Pre-check before Capability 1
+        if _is_canc():
+            self._emit(
+                "query_preparation",
+                f"Retrieval cancelled before query preparation for unit '{qid}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=qid,
+                query_source=getattr(query, "source", ""),
+                query_position=getattr(query, "position", 0),
+                strategy=self.strategy,
+                candidates=(),
+                corpus_size=len(corpus) if hasattr(corpus, "__len__") else None,
+                query_terms=(),
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "query_preparation"},
+            )
+
+        # Capability 1: Query Preparation
         self._emit(
             "query_preparation",
             f"Preparing search query for unit '{qid}'",
@@ -430,8 +464,29 @@ class RetrievalCoordinator:
             run_id=run_id,
         )
 
-        # Capability 2: Candidate Retrieval
         corpus_size = len(corpus)
+
+        # Pre-check before Capability 2
+        if _is_canc():
+            self._emit(
+                "candidate_retrieval",
+                f"Retrieval cancelled before candidate retrieval for unit '{qid}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=prepared.query_unit_id,
+                query_source=prepared.query_source,
+                query_position=prepared.query_position,
+                strategy=self.strategy,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=prepared.query_terms,
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "candidate_retrieval"},
+            )
+
+        # Capability 2: Candidate Retrieval
         self._emit(
             "candidate_retrieval",
             f"Searching corpus of {corpus_size} items",
@@ -459,6 +514,26 @@ class RetrievalCoordinator:
             run_id=run_id,
         )
 
+        # Pre-check before Capability 3
+        if _is_canc():
+            self._emit(
+                "relevance_assessment",
+                f"Retrieval cancelled before relevance assessment for unit '{qid}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=prepared.query_unit_id,
+                query_source=prepared.query_source,
+                query_position=prepared.query_position,
+                strategy=self.strategy,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=prepared.query_terms,
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "relevance_assessment"},
+            )
+
         # Capability 3: Relevance Assessment
         self._emit(
             "relevance_assessment",
@@ -484,6 +559,26 @@ class RetrievalCoordinator:
             extra={"assessed_count": len(assessments)},
             run_id=run_id,
         )
+
+        # Pre-check before Capability 4
+        if _is_canc():
+            self._emit(
+                "candidate_identification",
+                f"Retrieval cancelled before candidate identification for unit '{qid}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=prepared.query_unit_id,
+                query_source=prepared.query_source,
+                query_position=prepared.query_position,
+                strategy=self.strategy,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=prepared.query_terms,
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "candidate_identification"},
+            )
 
         # Capability 4: Candidate Identification
         self._emit(
@@ -512,6 +607,26 @@ class RetrievalCoordinator:
             extra={"candidate_count": len(identified)},
             run_id=run_id,
         )
+
+        # Pre-check before Capability 5
+        if _is_canc():
+            self._emit(
+                "retrieval_evidence_recording",
+                f"Retrieval cancelled before evidence recording for unit '{qid}'",
+                phase="cancelled",
+                run_id=run_id,
+            )
+            return RetrievalResult(
+                query_unit_id=prepared.query_unit_id,
+                query_source=prepared.query_source,
+                query_position=prepared.query_position,
+                strategy=self.strategy,
+                candidates=(),
+                corpus_size=corpus_size,
+                query_terms=prepared.query_terms,
+                note="Retrieval cancelled by user request",
+                metadata={"cancelled": True, "cancelled_at_substep": "retrieval_evidence_recording"},
+            )
 
         # Capability 5: Retrieval Evidence Recording
         self._emit(
