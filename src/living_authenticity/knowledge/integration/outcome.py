@@ -53,6 +53,7 @@ class IntegrationUnitEntry:
     error_history: tuple = field(default_factory=tuple)
     resumed_from_run_id: str = ""
     resumed_from_record_id: str = ""
+    audit_persisted: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "approval_approved", bool(self.approval_approved))
@@ -129,6 +130,7 @@ class IntegrationRunReport:
     run_outcome: str = ""
     resumed_from_run_id: str = ""
     resumed_from_record_id: str = ""
+    audit_persisted: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "units", tuple(self.units))

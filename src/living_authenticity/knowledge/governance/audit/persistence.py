@@ -68,6 +68,10 @@ _ERROR_TERMINAL_OUTCOMES = frozenset({
     "interrupted",
     "infrastructure_error",
     "guard_error",
+    "core_error",
+    "core_resolution_error",
+    "core_validation_error",
+    "cold_start_error",
 })
 
 

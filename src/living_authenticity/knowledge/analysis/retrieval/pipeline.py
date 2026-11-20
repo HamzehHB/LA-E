@@ -102,6 +102,8 @@ class RelevanceAssessment:
     evidence_basis: str = ""
     strategy: str = ""
     vector_distance: float | None = None
+    is_core: bool = False
+    core_hash: str = ""
 
 
 # Capability 1: Query Preparation
@@ -185,10 +187,27 @@ def assess_relevance(
     prepared: PreparedQuery,
     candidates: Sequence[KnowledgeUnit],
     strategy: str = "token_overlap",
+    validated_core_hash: str = "",
+    validated_core_source_path: str = "",
+    validated_core: Any = None,
 ) -> tuple[RelevanceAssessment, ...]:
     """Assess potential relevance of retrieved candidates using explicit, explainable evidence."""
     if not isinstance(prepared, PreparedQuery):
         raise TypeError("prepared must be a PreparedQuery")
+
+    from src.living_authenticity.knowledge.vault.core_validator import (
+        normalize_source_identity,
+        is_trusted_validation_context,
+        is_validated_core_unit,
+    )
+
+    v_hash = ""
+    v_src = ""
+    if validated_core is not None:
+        val_ctx = getattr(validated_core, "validation_context", None)
+        if val_ctx is not None and is_trusted_validation_context(val_ctx):
+            v_hash = val_ctx.core_hash
+            v_src = val_ctx.source_path
 
     query_term_set = set(prepared.query_terms)
     assessments: list[RelevanceAssessment] = []
@@ -205,6 +224,12 @@ def assess_relevance(
             if shared
             else "No overlapping tokens"
         )
+        is_core_unit = False
+        effective_core_hash = ""
+        if v_hash and v_src and is_validated_core_unit(unit, context=validated_core):
+            is_core_unit = True
+            effective_core_hash = v_hash
+
         assessments.append(
             RelevanceAssessment(
                 candidate_unit_id=unit.id,
@@ -216,6 +241,8 @@ def assess_relevance(
                 similarity_score=float(overlap_score),
                 evidence_basis=evidence,
                 strategy=strategy,
+                is_core=is_core_unit,
+                core_hash=effective_core_hash,
             )
         )
 
@@ -227,6 +254,10 @@ def identify_candidates(
     assessments: Sequence[RelevanceAssessment],
     max_candidates: int = 5,
     retriever_name: str = "token_overlap",
+    validated_core_hash: str = "",
+    core_boost_factor: float = 0.0,
+    validated_core_source_path: str = "",
+    validated_core: Any = None,
 ) -> tuple[RetrievedCandidate, ...]:
     """Preserve stable candidate identity and order without conflating candidates."""
     if isinstance(max_candidates, bool) or not isinstance(max_candidates, int):
@@ -234,17 +265,41 @@ def identify_candidates(
     if max_candidates <= 0:
         return ()
 
-    # Deterministic ranking: score descending, then source, position, id
-    sorted_assessments = sorted(
-        assessments,
-        key=lambda a: (
-            -a.overlap_score,
-            -a.similarity_score,
+    from src.living_authenticity.knowledge.vault.core_validator import (
+        normalize_source_identity,
+        is_trusted_validation_context,
+    )
+
+    v_hash = ""
+    v_src = ""
+    if validated_core is not None:
+        val_ctx = getattr(validated_core, "validation_context", None)
+        if val_ctx is not None and is_trusted_validation_context(val_ctx):
+            v_hash = val_ctx.core_hash
+            v_src = val_ctx.source_path
+
+    def _ranking_key(a: RelevanceAssessment):
+        is_verified = bool(
+            v_hash
+            and v_src
+            and a.is_core
+            and a.core_hash
+            and a.core_hash == v_hash
+            and normalize_source_identity(a.candidate_source) == normalize_source_identity(v_src)
+        )
+        boost = (1.0 + core_boost_factor) if (is_verified and core_boost_factor > 0) else 1.0
+        effective_overlap = round(a.overlap_score * boost, 6)
+        effective_sim = round(a.similarity_score * boost, 6)
+        return (
+            -effective_overlap,
+            -effective_sim,
             a.candidate_source,
             a.candidate_position,
             a.candidate_unit_id,
-        ),
-    )
+        )
+
+    # Deterministic ranking: score descending, then source, position, id
+    sorted_assessments = sorted(assessments, key=_ranking_key)
     seen_keys: set[str] = set()
     chosen: list[RetrievedCandidate] = []
     for a in sorted_assessments:
@@ -252,6 +307,14 @@ def identify_candidates(
         if canon_key in seen_keys:
             continue
         seen_keys.add(canon_key)
+        is_cand_core = bool(
+            v_hash
+            and v_src
+            and a.is_core
+            and a.core_hash
+            and a.core_hash == v_hash
+            and normalize_source_identity(a.candidate_source) == normalize_source_identity(v_src)
+        )
         chosen.append(
             RetrievedCandidate(
                 unit_id=a.candidate_unit_id,
@@ -263,6 +326,9 @@ def identify_candidates(
                 retriever=retriever_name,
                 evidence_basis=a.evidence_basis,
                 candidate_identity_key=canon_key,
+                vector_distance=a.vector_distance,
+                is_core=is_cand_core,
+                core_hash=a.core_hash if is_cand_core else "",
             )
         )
         if len(chosen) >= max_candidates:
@@ -344,6 +410,10 @@ class RetrievalCoordinator:
         min_shared_terms: int = 1,
         max_candidates: int = 5,
         observer: Callable | None = None,
+        validated_core_hash: str = "",
+        core_boost_factor: float = 0.0,
+        validated_core_source_path: str = "",
+        validated_core: Any = None,
     ) -> None:
         if strategy not in SUPPORTED_COORDINATOR_STRATEGIES:
             raise ValueError(
@@ -363,6 +433,28 @@ class RetrievalCoordinator:
         self.min_shared_terms = min_shared_terms
         self.max_candidates = max_candidates
         self.observer = observer
+        self.core_boost_factor = float(core_boost_factor) if core_boost_factor is not None else 0.0
+        self.set_validated_core(validated_core)
+
+    def set_validated_core(self, validated_core: Any) -> None:
+        from src.living_authenticity.knowledge.vault.core_validator import is_trusted_validation_context
+        val_ctx = getattr(validated_core, "validation_context", None) if validated_core is not None else None
+        if val_ctx is not None and is_trusted_validation_context(val_ctx):
+            self.validated_core = validated_core
+            self.validated_core_hash = val_ctx.core_hash
+            self.validated_core_source_path = val_ctx.source_path
+        else:
+            self.validated_core = None
+            self.validated_core_hash = ""
+            self.validated_core_source_path = ""
+
+    def set_validated_core_hash(self, core_hash: str) -> None:
+        # Neutralized: raw hash alone cannot establish or modify validated Core authority
+        pass
+
+    def set_validated_core_source_path(self, path: str) -> None:
+        # Neutralized: raw path alone cannot establish or modify validated Core authority
+        pass
 
     def _emit(
         self,
@@ -542,7 +634,14 @@ class RetrievalCoordinator:
             run_id=run_id,
         )
         try:
-            assessments = assess_relevance(prepared, raw_candidates, self.strategy)
+            assessments = assess_relevance(
+                prepared,
+                raw_candidates,
+                self.strategy,
+                validated_core_hash=self.validated_core_hash,
+                validated_core_source_path=self.validated_core_source_path,
+                validated_core=getattr(self, "validated_core", None),
+            )
         except Exception as exc:
             self._emit(
                 "relevance_assessment",
@@ -589,7 +688,13 @@ class RetrievalCoordinator:
         )
         try:
             identified = identify_candidates(
-                assessments, self.max_candidates, self.strategy
+                assessments,
+                self.max_candidates,
+                self.strategy,
+                validated_core_hash=self.validated_core_hash,
+                core_boost_factor=self.core_boost_factor,
+                validated_core_source_path=self.validated_core_source_path,
+                validated_core=getattr(self, "validated_core", None),
             )
         except Exception as exc:
             self._emit(

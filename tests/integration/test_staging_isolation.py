@@ -32,6 +32,7 @@ def _method_core():
         meaning=CORE_SAMPLE, cleaned_text=CORE_SAMPLE,
         normalized_text=CORE_SAMPLE,
         context="", proposed_type="", position=0,
+        is_core=True, core_hash="mock_test_core_hash_staging_iso", core_source_path="core",
     )
 
 
@@ -281,13 +282,16 @@ def test_authorized_staging_inside_guarded_root_runs_end_to_end(tmp_path):
     source.mkdir()
     _write(source, "note.md")
     cores = [_method_core()]
+    from tests._test_core_helpers import build_test_validated_core
+    val_core = build_test_validated_core(cores, source_path="core.md", core_hash="mock_test_core_hash")
     audit_root = tmp_path / "audit"
     audit_root.mkdir()
     report = run_bounded_integration(
         str(source), authorized, guarded_roots=(data_root,),
         authorized_staging_root=authorized, approval_reader=_yes,
-        core_units=cores, max_files=1, synthesis=SyntheticSynthesis(),
-        audit_root=str(audit_root), authorized_audit_root=str(audit_root))
+        core_units=list(val_core.units), max_files=1, synthesis=SyntheticSynthesis(),
+        audit_root=str(audit_root), authorized_audit_root=str(audit_root),
+        validated_core=val_core)
     assert report.accepted is True
     assert report.staging_root == authorized
     assert any(unit.outcome == "executed" for unit in report.units)

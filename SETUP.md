@@ -260,24 +260,124 @@ persistent data.
 
 ## Dependency Management
 
-The project uses **pip-tools** for dependency management.
+The project uses **pip-tools** for Python dependency management and **npm** for the frontend application.
 
-### Source dependencies
+### Python Runtime Dependencies
 
-[requirements.in](requirements.in)
+* Source manifest: [requirements.in](requirements.in)
+* Compiled manifest: [requirements.txt](requirements.txt)
 
-### Resolved dependencies
+Runtime dependencies define the exact packages required to execute the LivingAuthenticity backend and adapter.
 
-[requirements.txt](requirements.txt)
+### Python Development Dependencies
 
-### Regenerate dependencies
+* Source dev manifest: [requirements-dev.in](requirements-dev.in)
+* Compiled dev manifest: [requirements-dev.txt](requirements-dev.txt)
 
-Dependency regeneration is a development task and requires the dev
-dependencies to be installed (`pip install -r requirements-dev.txt`).
+Development dependencies include testing tools (`pytest`, `pytest-cov`, `pytest-asyncio`), code quality tools (`ruff`), static type checking (`pyright`), and security auditing utilities (`pip-audit`, `pip-tools`).
 
-```bash
-pip-compile requirements.in
+Install development dependencies into the active virtual environment:
+
+```powershell
+pip install -r requirements-dev.txt
 ```
+
+### Regenerating Python Dependencies (pip-tools)
+
+Dependency compilation and updates are controlled development tasks. Always recompile manifests from `.in` sources using `pip-tools` rather than editing compiled `.txt` files directly:
+
+1. Recompile runtime dependencies:
+
+   ```powershell
+   pip-compile requirements.in
+   ```
+
+2. Recompile development dependencies:
+
+   ```powershell
+   pip-compile --output-file=requirements-dev.txt requirements-dev.in
+   ```
+
+### Core Packaging Tools & Unsafe Package Policy
+
+`pip-tools` excludes core packaging utilities (`pip` and `setuptools`) by default from compiled `.txt` manifests because upgrading the active installer or build system while pip is running can destabilize the running environment.
+
+Baseline packaging tools are upgraded directly during environment initialization to ensure known vulnerabilities (such as `GHSA-xmj3-9gf7-h52w` and `PYSEC-2026-3721`) are resolved:
+
+```powershell
+python -m pip install --upgrade pip "setuptools>=84.1.0"
+```
+
+### Static Type Checking (Pyright)
+
+The project uses **Pyright** as its authoritative static type checker. Pyright is managed as a reproducible Python development dependency via `pyright` in `requirements-dev.in` (which provisions `pyright`, `nodeenv`, and `typing-extensions`).
+
+Virtual environment path resolution is configured in the repository root [pyrightconfig.json](pyrightconfig.json):
+
+```json
+{
+  "venvPath": ".",
+  "venv": "Venv"
+}
+```
+
+Run static type checking across the entire project from the repository root:
+
+```powershell
+python -m pyright
+```
+
+### Python Security Auditing (pip-audit)
+
+Python dependencies are audited against the PyPA Advisory Database using `pip-audit`. Both runtime and development requirement manifests must be audited:
+
+```powershell
+python -m pip_audit -r requirements.txt
+python -m pip_audit -r requirements-dev.txt
+```
+
+Or audit the active virtual environment directly:
+
+```powershell
+python -m pip_audit
+```
+
+#### Note on Windows 8.3 Path Normalization in pip-audit
+
+When auditing requirement files, `pip-audit` constructs an ephemeral temporary virtual environment. On Windows, Python 3.13's `venv` module resolves short 8.3 directory aliases (e.g. `LITTLE~1`) to the long directory path (`Little Prince`) using `os.path.realpath()`. When the requested path string differs from the canonical real path, Python emits:
+
+```text
+WARNING:venv:Actual environment location may have moved due to redirects, links or junctions.
+  Requested location: "C:\Users\LITTLE~1\AppData\Local\Temp\...\Scripts\python.exe"
+  Actual location: "C:\Users\Little Prince\AppData\Local\Temp\...\Scripts\python.exe"
+```
+
+This warning is purely a harmless Windows 8.3 path-string normalization artifact in temporary directories; it does not indicate environment movement, corrupt files, or audit inaccuracy.
+
+---
+
+### Frontend Dependencies & Security Auditing
+
+The frontend application is structured as an independent Node.js project located in the [frontend/](frontend/) subdirectory.
+
+* **Project Root vs. Frontend Subdirectory**: The repository root is **not** an npm workspace and contains no `package.json` or `package-lock.json`. Running `npm audit` or `npm install` at the repository root will fail with `ENOLOCK`.
+* **Authoritative Lockfile**: [frontend/package-lock.json](frontend/package-lock.json) is the single source of truth for frontend dependencies and must be committed.
+
+#### Frontend npm Audit Procedure
+
+Third-party npm registry mirrors (such as `https://registry.npmmirror.com`) do not implement the bulk security advisory query endpoint (`/-/npm/v1/security/advisories/bulk`), returning `501 Not Implemented` (`[NOT_IMPLEMENTED]`).
+
+To execute a reliable security audit of frontend dependencies, always target the `frontend/` directory and explicitly specify the official npm registry:
+
+```powershell
+npm --prefix frontend audit --registry=https://registry.npmjs.org/
+```
+
+### Security Audit Reproducibility & Dependency Pinning
+
+When remediating security advisories (CVEs):
+1. **Targeted Minimum Pins**: Pin the exact minimum safe release in `requirements.in` or `requirements-dev.in` (e.g., `msgpack==1.2.3` for `CVE-2026-114613`).
+2. **Avoid Indiscriminate Upgrades**: Do not run broad upgrades (`pip-compile --upgrade` or unconstrained `npm audit fix --force`) that introduce breaking changes or untested major version bumps. Use targeted package upgrades (`pip-compile -P <package>`) and verify with regression suites.
 
 ## Testing
 
@@ -405,11 +505,16 @@ Notes:
   persistent-data location, and every other child of `data.root`, remains
   rejected.
 * The `Core` class holds a single active reference note representing the
-  central research thesis of the repository (carrying the highest default
-  analytical and retrieval weight, while previous Core versions move to
-  `Archive`). With no `--core-root` or when Core is unresolved, proposals
-  never hallucinate a cold-start bypass and resolve conservatively to
-  `NEEDS_REVIEW` (or safe-stop for human resolution in the UI).
+  central research thesis of the repository (carrying dynamic retrieval
+  priority boosting, while superseded Core versions move to `99 Archive`).
+  Under Cold Start Governance, a missing, empty, unreadable, malformed, or
+  otherwise invalid Core is strictly an operational and infrastructure
+  failure, not an empty Core and not a normal knowledge-analysis outcome.
+  The system fails closed: it never produces a normal proposal or downgrades
+  the failure to `NEEDS_REVIEW`. Instead, it halts immediately as an
+  operational `ERROR`, writes durable audit records under the established
+  `errors/` partition, and requires correcting the underlying Core note
+  followed by fresh validation/retry through the recovery path.
 * This is not a vault migration and not an authoritative write. `CREATE`
   means creation into the isolated staging area only.
 

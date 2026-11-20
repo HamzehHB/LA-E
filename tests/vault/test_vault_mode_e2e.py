@@ -202,7 +202,7 @@ def create_synthetic_obsidian_vault(root: Path) -> dict[str, Path]:
 
     core_note_1.write_text(
 
-        "---\ntitle: Core Epistemology\ncanonical_type: Core\n---\n\n"
+        "---\ntitle: Core Epistemology\ncanonical_type: Core\ndraft: false\n---\n\n"
 
         "Methodological foundation: All knowledge must trace back to authentic empirical observations.\n"
 
@@ -214,19 +214,6 @@ def create_synthetic_obsidian_vault(root: Path) -> dict[str, Path]:
 
 
 
-    core_note_persian = core_dir / "اصول_معرفت_شناختی.md"
-
-    core_note_persian.write_text(
-
-        "---\ntitle: اصول معرفت‌شناختی\ncanonical_type: Core\n---\n\n"
-
-        "اصل بنیادین: هیچ تغییر خودکاری در دانش بنیادین بدون نظارت مستقیم انسان مجاز نیست.\n"
-
-        "شواهد تجربی و تحلیل انتقادی مبنای ارزیابی گزاره‌های جدید هستند.\n",
-
-        encoding="utf-8",
-
-    )
 
 
 
@@ -349,6 +336,22 @@ def create_synthetic_obsidian_vault(root: Path) -> dict[str, Path]:
         "---\ntitle: مفهوم یادگیری معنادار\ntype: Concept\n---\n\n"
 
         "یادگیری معنادار زمانی رخ می‌دهد که اطلاعات جدید با چارچوب‌های شناختی موجود پیوند برقرار کنند.\n",
+
+        encoding="utf-8",
+
+    )
+
+
+    core_note_persian = concepts_dir / "اصول_معرفت_شناختی.md"
+    concept_persian_principles = core_note_persian
+
+    concept_persian_principles.write_text(
+
+        "---\ntitle: اصول معرفت‌شناختی\ncanonical_type: Concept\n---\n\n"
+
+        "اصل بنیادین: هیچ تغییر خودکاری در دانش بنیادین بدون نظارت مستقیم انسان مجاز نیست.\n"
+
+        "شواهد تجربی و تحلیل انتقادی مبنای ارزیابی گزاره‌های جدید هستند.\n",
 
         encoding="utf-8",
 
@@ -1026,75 +1029,35 @@ def test_vault_mode_empty_core_produces_needs_review(tmp_path):
 
     status = launcher.run_status(run_id)
 
-    assert status.get("accepted") is True, f"Run failed with status: {status}"
-
-    assert status.get("held") == 1, f"Expected held=1 for NEEDS_REVIEW, got {status}"
-
+    # Under Cold Start governance, missing/empty Core is an operational halt, not a successful hold
+    assert status.get("accepted") is False, f"Expected accepted=False on empty core, got: {status}"
+    assert status.get("terminal_outcome") == "infrastructure_error"
+    assert status.get("held") == 0
     assert status.get("executed") == 0
-
-    # Verify no staging file was written (non-executable NEEDS_REVIEW)
-
+    # Verify no staging file was written
     assert list(staging_dir.glob("*.md")) == []
 
-
-
-    # Verify proposal action is explicitly NEEDS_REVIEW and NOT DO_NOT_IMPORT
-
+    # Verify NO human review proposal event was emitted (Safe Pipeline Halt before proposal)
     hr_events = [ev for ev in recorded_events if ev.get("kind") == "human_review_required"]
+    assert len(hr_events) == 0
 
-    assert len(hr_events) >= 1
+    # Verify run_rejected event was emitted with recovery options
+    reject_events = [ev for ev in recorded_events if ev.get("kind") == "run_rejected"]
+    assert len(reject_events) >= 1
+    assert "retry" in reject_events[0].get("recovery_options", [])
+    assert "stop" in reject_events[0].get("recovery_options", [])
 
-    assert hr_events[0]["proposal_action"] == "NEEDS_REVIEW"
-
-    assert hr_events[0]["proposal_action"] != "DO_NOT_IMPORT"
-
-    assert hr_events[0]["is_executable"] is False
-
-
-
-    # Verify clear explanation event was emitted
-
-    core_status_events = [
-
-        ev for ev in recorded_events
-
-        if ev.get("kind") == "status" and "no approved Core units found" in ev.get("message", "")
-
-    ]
-
-    assert len(core_status_events) >= 1
-
-    assert "01 Core" in core_status_events[0]["message"]
-
-
-
-    # Verify terminal audit record in audit/failed/ reflects NEEDS_REVIEW
-
-    failed_audit = audit_dir / "failed" / "audit.jsonl"
-
-    assert failed_audit.exists()
-
-    records = [json.loads(line) for line in failed_audit.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
-
+    # Verify terminal audit record is in audit/errors/ (ERROR partition)
+    errors_audit = audit_dir / "errors" / "audit.jsonl"
+    assert errors_audit.exists()
+    records = [json.loads(line) for line in errors_audit.read_text(encoding="utf-8").strip().splitlines() if line.strip()]
     matching = [r for r in records if r.get("run_id") == run_id]
-
     assert len(matching) == 1
-
-    assert matching[0]["proposal_action"] == "NEEDS_REVIEW"
-
-    assert matching[0]["terminal_outcome"] in ("held_non_executable", "held")
-
-    assert matching[0]["storage_category"] == "failed"
-
-    assert matching[0]["approval_approved"] is False
-
-    assert matching[0]["execution_executed"] is False
-
-
-
-
-
-
+    assert matching[0]["terminal_outcome"] == "infrastructure_error"
+    assert matching[0]["storage_category"] == "errors"
+    assert matching[0]["validation_result"] == "FAILED"
+    assert launcher._paused_run is not None
+    assert "retry" in launcher._paused_run["recovery_options"]
 
 def test_vault_mode_user_selection_through_application(tmp_path):
 
@@ -1508,7 +1471,7 @@ def test_vault_mode_honest_status_telemetry_reporting(tmp_path):
 
     (vault_dir / "01 Core").mkdir(parents=True, exist_ok=True)
 
-    (vault_dir / "01 Core" / "core.md").write_text("Authoritative core.\n", encoding="utf-8")
+    (vault_dir / "01 Core" / "core.md").write_text("---\ntitle: Authoritative Core\ncanonical_type: Core\ndraft: false\n---\n\nAuthoritative core.\n", encoding="utf-8")
 
     (vault_dir / "valid_note.md").write_text("Valid note.\n", encoding="utf-8")
 

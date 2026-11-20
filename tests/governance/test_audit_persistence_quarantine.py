@@ -300,13 +300,24 @@ class TestAuditDurabilityAndQuarantine:
         staging_dir = tmp_path / "staging"
         staging_dir.mkdir()
 
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        from tests._test_core_helpers import build_test_validated_core
+        core_u = KnowledgeUnit(
+            id="core-base", source="core.md", original_text="Core empirical thesis.",
+            meaning="Core empirical thesis.", cleaned_text="Core empirical thesis.",
+            normalized_text="core empirical thesis.", context="", proposed_type="Core", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core.md",
+        )
+        val_core = build_test_validated_core([core_u], source_path="core.md", core_hash="mock_test_core_hash")
         report = run_bounded_integration(
             str(source_dir),
             str(staging_dir),
+            core_units=list(val_core.units),
             guarded_roots=(),
             approval_reader=lambda: "y",
             max_files=1,
             audit_root="",
+            validated_core=val_core,
         )
         # When audit_root is empty, no audit persistence was requested,
         # so the run should be accepted (not fail-closed).
@@ -3555,11 +3566,19 @@ def _make_core_sample():
     )
     sample = "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n"
     return KnowledgeUnit(
-        id="core1", source="core", original_text=sample,
+        id="core1", source="core.md", original_text=sample,
         meaning=sample, cleaned_text=sample,
         normalized_text=sample,
-        context="", proposed_type="", position=0,
+        context="", proposed_type="Core", position=0,
+        is_core=True, core_hash="mock_test_core_hash", core_source_path="core.md",
     )
+
+
+def _make_core_bundle():
+    from tests._test_core_helpers import build_test_validated_core
+    u = _make_core_sample()
+    val_core = build_test_validated_core([u], source_path="core.md", core_hash="mock_test_core_hash")
+    return list(val_core.units), val_core
 
 
 class TestMandatoryAuditWriterOnExecution:
@@ -3577,7 +3596,7 @@ class TestMandatoryAuditWriterOnExecution:
 
         from tests._synthetic_synthesis import SyntheticSynthesis
         from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         report = run_bounded_integration(
             str(source), str(staging),
@@ -3585,6 +3604,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
         )
 
@@ -3603,7 +3623,7 @@ class TestMandatoryAuditWriterOnExecution:
         staging.mkdir()
 
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         report = run_bounded_integration(
             str(source), str(staging),
@@ -3612,6 +3632,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
         )
 
@@ -3629,7 +3650,7 @@ class TestMandatoryAuditWriterOnExecution:
         staging.mkdir()
 
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         report = run_bounded_integration(
             str(source), str(staging),
@@ -3639,6 +3660,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
         )
 
@@ -3656,7 +3678,7 @@ class TestMandatoryAuditWriterOnExecution:
         staging.mkdir()
 
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         unusable_writer = UnusableAuditWriter()
 
@@ -3668,6 +3690,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
         )
 
@@ -3687,7 +3710,7 @@ class TestMandatoryAuditWriterOnExecution:
         audit_root.mkdir()
 
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         writer = AuditWriter(str(audit_root))
 
@@ -3699,6 +3722,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
             event_sink=lambda e: events.append(e),
         )
@@ -3726,7 +3750,7 @@ class TestMandatoryAuditWriterOnExecution:
         audit_root.mkdir()
 
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         # Real production AuditWriter subclass with failing primary append
         writer = RealAuditWriterWithFailingPrimary(str(audit_root))
@@ -3749,6 +3773,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
             event_sink=lambda e: events.append(e),
         )
@@ -3795,7 +3820,7 @@ class TestMandatoryAuditWriterOnExecution:
         audit_root.mkdir()
 
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         writer = RealAuditWriterWithFailingPrimary(str(audit_root))
 
@@ -3813,6 +3838,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
             event_sink=lambda e: events.append(e),
         )
@@ -3864,6 +3890,7 @@ class TestMandatoryAuditWriterOnExecution:
             id="core1", source="core", original_text=core_text,
             meaning=core_text, cleaned_text=core_text, normalized_text=core_text,
             context="", proposed_type="Observation", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core",
         )
         input_text = "Observation:\nA mindfulness observation regarding mental calm in daily routines.\n"
 
@@ -3874,6 +3901,8 @@ class TestMandatoryAuditWriterOnExecution:
         staging.mkdir()
 
         pipe = EvidenceFirstPipeline()
+        from tests._test_core_helpers import build_test_validated_core
+        val_core = build_test_validated_core([core_unit], source_path="core", core_hash="mock_test_core_hash")
 
         report = run_bounded_integration(
             str(source), str(staging),
@@ -3884,9 +3913,10 @@ class TestMandatoryAuditWriterOnExecution:
             synthesis=SyntheticSynthesis(),
             pipeline=pipe,
             corpus=(),
-            core_units=[core_unit],
+            core_units=list(val_core.units),
             executor=spy,
             max_files=1,
+            validated_core=val_core,
         )
 
         # 1. Non-executable analysis succeeds
@@ -3928,6 +3958,7 @@ class TestMandatoryAuditWriterOnExecution:
             id="corpus1", source="vault/note1.md", original_text=dup_text,
             meaning=dup_text, cleaned_text=dup_text, normalized_text=dup_text,
             context="", proposed_type="Observation", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core",
         )
 
         source = tmp_path / "source"
@@ -3938,6 +3969,14 @@ class TestMandatoryAuditWriterOnExecution:
 
         pipe = EvidenceFirstPipeline()
 
+        core_u = KnowledgeUnit(
+            id="core-base-2", source="core.md", original_text="Core empirical thesis.",
+            meaning="Core empirical thesis.", cleaned_text="Core empirical thesis.",
+            normalized_text="core empirical thesis.", context="", proposed_type="Core", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core.md",
+        )
+        from tests._test_core_helpers import build_test_validated_core
+        val_core = build_test_validated_core([core_u], source_path="core.md", core_hash="mock_test_core_hash")
         report = run_bounded_integration(
             str(source), str(staging),
             audit_writer=None,
@@ -3947,9 +3986,10 @@ class TestMandatoryAuditWriterOnExecution:
             synthesis=SyntheticSynthesis(),
             pipeline=pipe,
             corpus=[corpus_unit],
-            core_units=(),
+            core_units=list(val_core.units),
             executor=spy,
             max_files=1,
+            validated_core=val_core,
         )
 
         # 1. Non-executable analysis succeeds
@@ -3969,7 +4009,7 @@ class TestMandatoryAuditWriterOnExecution:
         any executable CREATE proposal approved by human review strictly FAILS CLOSED when an AuditWriter
         is missing, verifying that the mandatory audit invariant remains fully enforced for execution."""
         from tests._synthetic_synthesis import SyntheticSynthesis
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
 
         source = tmp_path / "source"
         source.mkdir()
@@ -3985,6 +4025,7 @@ class TestMandatoryAuditWriterOnExecution:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
         )
 
@@ -4017,7 +4058,7 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
         audit_root.mkdir()
 
         # Core units for comparison
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
         corpus = [
             KnowledgeUnit(
                 id="corpus1", source="vault/method.md", original_text=dup_text,
@@ -4035,6 +4076,7 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(title="T", body="B"),
             core_units=cores,
+            validated_core=val_core,
             corpus=corpus,
             max_files=2,
             event_sink=lambda e: events.append(e),
@@ -4076,7 +4118,7 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
         audit_root = tmp_path / "audit"
         audit_root.mkdir()
 
-        cores = [_make_core_sample()]
+        cores, val_core = _make_core_bundle()
         writer = AuditWriter(str(audit_root))
         events = []
         report = run_bounded_integration(
@@ -4086,6 +4128,7 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(title="T", body="B"),
             core_units=cores,
+            validated_core=val_core,
             max_files=1,
             event_sink=lambda e: events.append(e),
         )
@@ -4121,7 +4164,16 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
         staging = tmp_path / "staging"
         staging.mkdir()
 
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        core_u = KnowledgeUnit(
+            id="core-policy", source="core.md", original_text="Observation on testing non-executable policy without audit writer.",
+            meaning="Observation on testing non-executable policy without audit writer.", cleaned_text="Observation on testing non-executable policy without audit writer.",
+            normalized_text="observation on testing non-executable policy without audit writer.", context="", proposed_type="Core", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core.md",
+        )
         events = []
+        from tests._test_core_helpers import build_test_validated_core
+        val_core = build_test_validated_core([core_u], source_path="core.md", core_hash="mock_test_core_hash")
         report = run_bounded_integration(
             str(source), str(staging),
             audit_writer=None,
@@ -4129,9 +4181,10 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
             audit_requested=False,
             approval_reader=lambda: "acknowledge",
             synthesis=SyntheticSynthesis(title="T", body="B"),
-            core_units=[],  # Empty core -> NEEDS_REVIEW
+            core_units=list(val_core.units),  # Valid core with overlap -> analytically yields NEEDS_REVIEW
             max_files=1,
             event_sink=lambda e: events.append(e),
+            validated_core=val_core,
         )
 
         # 1. Non-executable outcome produces 0 staging notes
@@ -4164,7 +4217,16 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
         staging = tmp_path / "staging"
         staging.mkdir()
 
+        from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
+        core_u = KnowledgeUnit(
+            id="core-policy-2", source="core.md", original_text="Observation on testing requested audit with missing writer.",
+            meaning="Observation on testing requested audit with missing writer.", cleaned_text="Observation on testing requested audit with missing writer.",
+            normalized_text="observation on testing requested audit with missing writer.", context="", proposed_type="Core", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core.md",
+        )
         events = []
+        from tests._test_core_helpers import build_test_validated_core
+        val_core = build_test_validated_core([core_u], source_path="core.md", core_hash="mock_test_core_hash")
         report = run_bounded_integration(
             str(source), str(staging),
             audit_writer=None,
@@ -4172,9 +4234,10 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
             audit_requested=True,
             approval_reader=lambda: "acknowledge",
             synthesis=SyntheticSynthesis(title="T", body="B"),
-            core_units=[],  # Empty core -> NEEDS_REVIEW
+            core_units=list(val_core.units),  # Valid core with overlap -> analytically yields NEEDS_REVIEW
             max_files=1,
             event_sink=lambda e: events.append(e),
+            validated_core=val_core,
         )
 
         assert report.accepted is False
@@ -4195,6 +4258,7 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
         staging.mkdir()
 
         events = []
+        cores, val_core = _make_core_bundle()
         # should_cancel returns True before execution
         report = run_bounded_integration(
             str(source), str(staging),
@@ -4204,9 +4268,10 @@ class TestMixedAuditTelemetryAndUnavailableWriterPolicy:
             approval_reader=lambda: "y",
             should_cancel=lambda: True,
             synthesis=SyntheticSynthesis(title="T", body="B"),
-            core_units=[_make_core_sample()],
+            core_units=cores,
             max_files=1,
             event_sink=lambda e: events.append(e),
+            validated_core=val_core,
         )
 
         # 1. Cancelled outcome with 0 staging notes

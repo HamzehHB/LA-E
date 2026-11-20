@@ -36,13 +36,21 @@ def _corpus():
     )]
 
 
-def _core_units():
-    """Explicit approved Core units; unresolved Core forces NEEDS_REVIEW."""
-    return [_unit(
+from tests._test_core_helpers import build_test_validated_core
+
+def _make_example_val_core():
+    u = _unit(
         "core-1",
         "Quantum calibration ledger for laboratory balances and reagent "
         "inventory in the synthetic example Core set.",
-    )]
+    )
+    return build_test_validated_core([u], source_path="01 Core/01-core-calibration.md", core_hash="mock_test_core_hash_example")
+
+VAL_CORE = _make_example_val_core()
+
+def _core_units():
+    """Explicit approved Core units; unresolved Core forces NEEDS_REVIEW."""
+    return list(VAL_CORE.units)
 
 
 def _approve_all(_request=None):
@@ -73,7 +81,8 @@ def test_example_run_reaches_controlled_execution(tmp_path):
     report = run_bounded_integration(
         str(EXAMPLE_INPUT), str(staging), guarded_roots=(),
         approval_reader=_approve_all, corpus=_corpus(),
-        core_units=_core_units(), max_files=1, synthesis=synthesis,
+        core_units=_core_units(),
+        validated_core=VAL_CORE, max_files=1, synthesis=synthesis,
         audit_root=str(audit_root), authorized_audit_root=str(audit_root),
     )
     assert synthesis.calls >= 1, "the formal LLM stage must run"
@@ -102,7 +111,8 @@ def test_example_inputs_are_never_written_to(tmp_path):
     run_bounded_integration(
         str(EXAMPLE_INPUT), str(staging), guarded_roots=(),
         approval_reader=_approve_all, corpus=_corpus(),
-        core_units=_core_units(), max_files=1,
+        core_units=_core_units(),
+        validated_core=VAL_CORE, max_files=1,
         synthesis=SyntheticSynthesis(),
     )
     after = {
@@ -117,7 +127,8 @@ def test_rejection_prevents_execution_for_every_unit(tmp_path):
     report = run_bounded_integration(
         str(EXAMPLE_INPUT), str(staging), guarded_roots=(),
         approval_reader=_reject_all, corpus=_corpus(),
-        core_units=_core_units(), max_files=2,
+        core_units=_core_units(),
+        validated_core=VAL_CORE, max_files=2,
         synthesis=SyntheticSynthesis(),
     )
     assert report.accepted is True
@@ -132,7 +143,8 @@ def test_max_files_bound_is_respected(tmp_path):
     report = run_bounded_integration(
         str(EXAMPLE_INPUT), str(staging), guarded_roots=(),
         approval_reader=_reject_all, corpus=_corpus(),
-        core_units=_core_units(), max_files=2,
+        core_units=_core_units(),
+        validated_core=VAL_CORE, max_files=2,
         synthesis=SyntheticSynthesis(),
     )
     assert report.files_seen == 4
@@ -147,7 +159,8 @@ def test_no_provider_means_no_candidate_and_no_execution(tmp_path):
     report = run_bounded_integration(
         str(EXAMPLE_INPUT), str(staging), guarded_roots=(),
         approval_reader=_approve_all, corpus=_corpus(),
-        core_units=_core_units(), max_files=1,
+        core_units=_core_units(),
+        validated_core=VAL_CORE, max_files=1,
         synthesis=FailingSynthesis(),
     )
     assert report.accepted is True

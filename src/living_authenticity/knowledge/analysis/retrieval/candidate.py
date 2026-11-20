@@ -16,6 +16,10 @@ class RetrievedCandidate:
     the normalized query text and the normalized candidate text. It measures
     textual overlap only. It must never be interpreted as confidence,
     certainty, identity, authorization, or approval.
+
+    ``is_core`` indicates whether the candidate originates from the validated
+    authoritative Core knowledge source, preserving explicit machine-verifiable
+    identity through retrieval, comparison, relation, and ranking.
     """
 
     unit_id: str
@@ -28,6 +32,8 @@ class RetrievedCandidate:
     evidence_basis: str = ""
     candidate_identity_key: str = ""
     vector_distance: float | None = None
+    is_core: bool = False
+    core_hash: str = ""
 
     def __post_init__(self) -> None:
         if not self.candidate_identity_key:

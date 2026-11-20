@@ -130,25 +130,18 @@ def read_vault_context(vault_root: str, max_files=_MAX_FILES,
 def _schema_core_folder() -> str:
     """Return the authoritative Core folder name from ``Knowledge-Schema.yaml``.
 
-    ``folder_structure`` is the single source of truth: the Core folder is
-    the entry whose ``canonical_type`` is ``"Core"``. Reading it (same
-    ``yaml.safe_load`` pattern as ``governance/revalidation/schema_version.py``)
-    keeps the folder definition out of code, so no duplicated literal or
-    machine-specific value can become a competing authority. Returns ``""``
-    when the schema cannot be read, so callers report no Core rather than
-    guessing.
+    Delegates to ``resolve_schema_core_folder`` to ensure that the canonical
+    Core folder name and schema invariants are validated through a single
+    authoritative implementation without duplicate or divergent logic.
+    Returns ``""`` when the schema cannot be read or is invalid.
     """
     try:
-        data = yaml.safe_load(_SCHEMA_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError, yaml.YAMLError):
+        from src.living_authenticity.knowledge.vault.core_validator import (
+            resolve_schema_core_folder,
+        )
+        return resolve_schema_core_folder(_SCHEMA_PATH)
+    except Exception:
         return ""
-    structure = data.get("folder_structure") if isinstance(data, dict) else None
-    if not isinstance(structure, dict):
-        return ""
-    for folder, spec in structure.items():
-        if isinstance(spec, dict) and spec.get("canonical_type") == "Core":
-            return str(folder)
-    return ""
 
 
 def resolve_vault_core_root(vault_root):

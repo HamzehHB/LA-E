@@ -181,7 +181,8 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
              interactive: bool = False,
              allow_test_output: bool = False,
              audit_requested: bool = False,
-             resumed_from_run_id: str = "", resumed_from_record_id: str = "") -> str:
+             resumed_from_run_id: str = "", resumed_from_record_id: str = "",
+             validated_core: Any = None) -> str:
     """Ingest (unless already ingested), analyse, then govern every unit.
 
     Returns:
@@ -209,6 +210,8 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
                 rf_kwargs["run_id"] = run_id
             if "should_cancel" in rf_sig.parameters or has_var_rf:
                 rf_kwargs["should_cancel"] = should_cancel
+            if "validated_core" in rf_sig.parameters or has_var_rf:
+                rf_kwargs["validated_core"] = validated_core
             ingestion = pipe.run_file(str(child), **rf_kwargs)
         except Exception as exc:
             cls_outcome = _classify_ingestion_exception(exc)
@@ -264,6 +267,8 @@ def _run_one(child, ingestion, pipe, corpus_units, cores, gate, validator,
                 ri_kwargs["run_id"] = run_id
             if "should_cancel" in ri_sig.parameters or has_var_ri:
                 ri_kwargs["should_cancel"] = should_cancel
+            if "validated_core" in ri_sig.parameters or has_var_ri:
+                ri_kwargs["validated_core"] = validated_core
             ingestion = pipe.run_ingestion(ingestion, **ri_kwargs)
         except Exception as exc:
             cls_outcome = _classify_ingestion_exception(exc)
@@ -437,7 +442,7 @@ def _derive_audit_telemetry(audits, audit_receipts, has_executed_units):
 
 
 def run_bounded_integration(source_root, staging_root, pipeline=None,
-                            approval_gate=None, corpus=(), core_units=(),
+                            approval_gate=None, corpus=(), core_units=None,
                             max_files: int = 1, guarded_roots=None,
                             executor=None, approval_reader=None,
                             schema_version: str = "",
@@ -460,7 +465,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                             audit_writer=None,
                             audit_requested: bool | None = None,
                             recoverable_errors: int = 0,
-                            resumed_from_run_id: str = "", resumed_from_record_id: str = "") -> IntegrationRunReport:
+                            resumed_from_run_id: str = "", resumed_from_record_id: str = "",
+                            validated_core: Any = None) -> IntegrationRunReport:
     """Run one bounded local-integration pass; return an in-memory report.
 
     Three explicit input shapes, one governance path:
@@ -636,6 +642,96 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
             run_outcome="accounting_integrity_failure",
         )
 
+    effective_val_core = validated_core if validated_core is not None else getattr(pipe, "validated_core", None)
+    from src.living_authenticity.knowledge.vault.core_validator import is_validated_core_unit
+    has_valid_cores = (
+        effective_val_core is not None
+        and bool(cores)
+        and all(is_validated_core_unit(c, context=effective_val_core) for c in cores)
+    )
+    if has_valid_cores and pipe is not None and hasattr(pipe, "set_validated_core") and callable(pipe.set_validated_core):
+        pipe.set_validated_core(effective_val_core)
+    if not has_valid_cores:
+        err_msg = (
+            "authoritative Core is mandatory; cannot run integration without validated Core"
+            if not cores
+            else "supplied Core units lack authoritative validated Core provenance; cannot run integration"
+        )
+        emit({"kind": "stage_failed", "stage": "core", "message": err_msg})
+        import uuid as _uuid
+        rec_id = f"aud-{_uuid.uuid4().hex[:12]}"
+        from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+        from src.living_authenticity.knowledge.governance.audit.persistence import (
+            AuditWriter,
+            persist_record_resilient,
+        )
+        rec = AuditRecord(
+            record_id=rec_id,
+            run_id=run_id,
+            query_source="<core-preflight>",
+            terminal_outcome="infrastructure_error",
+            validation_result="FAILED",
+            stop_reason=err_msg,
+            errors=(err_msg,),
+            operating_mode=operating_mode,
+            resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id,
+        )
+
+        effective_writer = audit_writer
+        if effective_writer is None and audit_root and Path(audit_root).is_dir():
+            try:
+                effective_writer = AuditWriter(audit_root, authorized_passed, authorized_failed)
+            except Exception:
+                effective_writer = None
+
+        audit_persisted = False
+        if effective_writer is not None:
+            try:
+                receipt = persist_record_resilient(effective_writer, rec)
+                audit_persisted = bool(receipt.get("persisted", False))
+                if not audit_persisted:
+                    emit({
+                        "kind": "audit_failed",
+                        "stage": "audit",
+                        "run_id": run_id,
+                        "message": "audit persistence failed for Core preflight infrastructure error",
+                        "audit_mode": "failed",
+                        "audit_partition": "errors",
+                    })
+            except Exception:
+                audit_persisted = False
+                emit({
+                    "kind": "audit_failed",
+                    "stage": "audit",
+                    "run_id": run_id,
+                    "message": "audit persistence exception for Core preflight infrastructure error",
+                    "audit_mode": "failed",
+                    "audit_partition": "errors",
+                })
+        else:
+            emit({
+                "kind": "audit_failed",
+                "stage": "audit",
+                "run_id": run_id,
+                "message": "audit writer unavailable for Core preflight infrastructure error",
+                "audit_mode": "unconfigured" if not audit_root else "failed",
+                "audit_partition": "errors",
+            })
+
+        return IntegrationRunReport(
+            source_root=source_root if isinstance(source_root, str) else "",
+            staging_root=staging_root if isinstance(staging_root, str) else "",
+            max_files=max_files if isinstance(max_files, int) and not isinstance(max_files, bool) else 1,
+            accepted=False,
+            rejection_reason=err_msg,
+            rejection_check="core_preflight",
+            run_outcome="operational_failure",
+            resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id,
+            audit_persisted=audit_persisted,
+        )
+
     if ingestion is None:
         if not isinstance(source_root, str) or not source_root.strip():
             return IntegrationRunReport(
@@ -688,7 +784,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                        allow_test_output=is_test,
                        audit_requested=audit_requested,
                        resumed_from_run_id=resumed_from_run_id,
-                       resumed_from_record_id=resumed_from_record_id)
+                       resumed_from_record_id=resumed_from_record_id,
+                       validated_core=effective_val_core)
         if res == "completed":
             processed = 1
         elif res == "failed_operational":
@@ -753,7 +850,8 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
                            allow_test_output=is_test,
                            audit_requested=audit_requested,
                        resumed_from_run_id=resumed_from_run_id,
-                       resumed_from_record_id=resumed_from_record_id)
+                       resumed_from_record_id=resumed_from_record_id,
+                       validated_core=effective_val_core)
             if res == "completed":
                 processed += 1
             elif res == "failed_operational":

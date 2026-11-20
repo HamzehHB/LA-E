@@ -121,7 +121,7 @@ def test_production_vector_db_key_resolves_from_config():
 
 def test_schema_records_optional_position():
     names = KNOWLEDGE_VECTOR_SCHEMA.names
-    assert names == ["id", "text", "source", "position", "embedding"]
+    assert names == ["id", "text", "source", "position", "is_core", "core_hash", "embedding"]
     assert KNOWLEDGE_VECTOR_SCHEMA.field("position").nullable is True
 
 
@@ -184,9 +184,23 @@ def test_vector_retrieval_round_trip_through_pipeline(tmp_path):
     pipe = EvidenceFirstPipeline()
     _service, store, retriever = build_vector_components(
         str(tmp_path / "index-db"), embedder=_embedder())
-    index_corpus(str(source), pipe, _embedder(), store, 1)
-    pipe = EvidenceFirstPipeline(retriever=retriever)
-    result = pipe.run_file(str(source / "note.md"), corpus=[], core_units=[])
+    figures = index_corpus(str(source), pipe, _embedder(), store, 1)
+    store.save_metadata({
+        "status": "fresh",
+        "indexed_vectors": figures[2],
+        "indexed_notes": figures[0],
+        "core_hash": "mock_test_core_hash_round_trip",
+    })
+    from tests._test_core_helpers import build_test_validated_core
+    core_u = KnowledgeUnit(
+        id="core-v", source="core.md", original_text="Core thesis.",
+        meaning="Core thesis.", cleaned_text="Core thesis.",
+        normalized_text="core thesis.", context="", proposed_type="Core", position=0,
+        is_core=True, core_hash="mock_test_core_hash_round_trip", core_source_path="core.md",
+    )
+    val_core = build_test_validated_core([core_u], source_path="core.md", core_hash="mock_test_core_hash_round_trip")
+    pipe = EvidenceFirstPipeline(retriever=retriever, validated_core=val_core)
+    result = pipe.run_file(str(source / "note.md"), corpus=[], core_units=[core_u])
     retrieval = result.units[0].retrieval_result
     assert retrieval.strategy == "lancedb_vector"
     assert retrieval.candidates, "indexed corpus must be retrievable"

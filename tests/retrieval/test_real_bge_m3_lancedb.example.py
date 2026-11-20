@@ -37,6 +37,7 @@ def test_synthetic_embedding_and_lancedb_lifecycle(tmp_path):
         embedding=service.embed("Synthetic document content."),
         metadata={"source": "synthetic.md"}
     )
+    manager.save_metadata({"status": "fresh", "indexed_vectors": 1})
 
     records = manager.show_all()
     assert len(records) == 1

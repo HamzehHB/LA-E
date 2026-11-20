@@ -14,6 +14,9 @@ from src.living_authenticity.knowledge.analysis.core_analysis import (
 from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import KnowledgeUnit
 
 
+from tests._test_core_helpers import build_test_validated_core
+
+
 def _unit(body="", *, id="q", source="s.md", position=0):
     return KnowledgeUnit(
         id=id, source=source, original_text=body, cleaned_text=body,
@@ -22,14 +25,24 @@ def _unit(body="", *, id="q", source="s.md", position=0):
 
 
 def _core(body, *, id="core1", source="core.md", position=1):
-    return _unit(body, id=id, source=source, position=position)
+    u = _unit(body, id=id, source=source, position=position)
+    u.is_core = True
+    u.core_hash = "mock_core_hash_test_core_analysis"
+    u.core_source_path = source
+    return u
+
+
+def _analyze(query, cores):
+    cores_list = list(cores) if cores is not None else []
+    val_core = build_test_validated_core(cores_list, source_path="core.md", core_hash="mock_core_hash_test_core_analysis")
+    return TokenOverlapCoreAnalyzer().analyze(query, cores_list, context=val_core)
 
 
 class TestRelevance:
     def test_potentially_relevant(self):
         query = _unit("calmness restores the mind and body balance")
         core = _core("calmness restores the mind during evening practice")
-        result = TokenOverlapCoreAnalyzer().analyze(query, [core])
+        result = _analyze(query, [core])
         assert result.relevance == "potentially_relevant"
         assert result.is_potentially_relevant is True
         assert result.shared_terms == ("calmness", "mind", "restores", "the")
@@ -38,23 +51,23 @@ class TestRelevance:
     def test_no_observed_relevance(self):
         query = _unit("calmness restores the mind")
         core = _core("engine repair manual tractor")
-        result = TokenOverlapCoreAnalyzer().analyze(query, [core])
+        result = _analyze(query, [core])
         assert result.relevance == "no_observed_relevance"
         assert result.is_potentially_relevant is False
 
     def test_single_shared_term_is_not_enough(self):
         query = _unit("calmness restores the mind")
         core = _core("calmness engine tractor repair")
-        result = TokenOverlapCoreAnalyzer().analyze(query, [core])
+        result = _analyze(query, [core])
         assert result.relevance == "no_observed_relevance"
 
     def test_empty_query_is_insufficient(self):
-        result = TokenOverlapCoreAnalyzer().analyze(_unit(""), [_core("calmness mind")])
+        result = _analyze(_unit(""), [_core("calmness mind")])
         assert result.relevance == "insufficient_evidence"
 
-    def test_no_core_supplied_is_insufficient(self):
-        result = TokenOverlapCoreAnalyzer().analyze(_unit("calmness mind"), [])
-        assert result.relevance == "insufficient_evidence"
+    def test_no_core_supplied_raises_error(self):
+        with pytest.raises(ValueError, match="core_units must contain at least one validated KnowledgeUnit"):
+            _analyze(_unit("calmness mind"), [])
 
     def test_closed_vocabulary(self):
         assert set(CORE_RELEVANCE_VALUES) == {
@@ -65,7 +78,7 @@ class TestRelevance:
 class TestContract:
     def test_provenance(self):
         query = _unit("calmness mind", id="q1", source="q.md", position=3)
-        result = TokenOverlapCoreAnalyzer().analyze(query, [_core("calmness mind")])
+        result = _analyze(query, [_core("calmness mind")])
         assert result.query_unit_id == "q1"
         assert result.query_source == "q.md"
         assert result.query_position == 3
@@ -74,18 +87,18 @@ class TestContract:
     def test_deterministic(self):
         query = _unit("calmness restores the mind")
         cores = [_core("calmness restores the mind slowly"), _core("engine repair")]
-        first = TokenOverlapCoreAnalyzer().analyze(query, cores)
-        second = TokenOverlapCoreAnalyzer().analyze(query, cores)
+        first = _analyze(query, cores)
+        second = _analyze(query, cores)
         assert first == second
 
     def test_frozen(self):
-        result = TokenOverlapCoreAnalyzer().analyze(
+        result = _analyze(
             _unit("calmness mind"), [_core("calmness mind")])
         with pytest.raises(FrozenInstanceError):
             result.note = "x"  # type: ignore[misc]
 
     def test_non_authoritative(self):
-        result = TokenOverlapCoreAnalyzer().analyze(
+        result = _analyze(
             _unit("calmness restores the mind"),
             [_core("calmness restores the mind slowly")])
         assert result.is_authoritative is False
@@ -99,13 +112,13 @@ class TestContract:
         query = _unit("calmness mind", id="q")
         core = _core("calmness mind fully", id="c1")
         before_q, before_c = asdict(query), asdict(core)
-        TokenOverlapCoreAnalyzer().analyze(query, [core])
+        _analyze(query, [core])
         assert asdict(query) == before_q
         assert asdict(core) == before_c
 
     def test_multilingual(self):
         body = "Aramesh baraye zohn"
-        result = TokenOverlapCoreAnalyzer().analyze(_unit(body), [_core(body)])
+        result = _analyze(_unit(body), [_core(body)])
         assert result.relevance == "potentially_relevant"
 
 
@@ -140,6 +153,6 @@ class TestRegistry:
             reg.get("missing")
 
     def test_result_type(self):
-        result = TokenOverlapCoreAnalyzer().analyze(
+        result = _analyze(
             _unit("calmness mind"), [_core("calmness mind")])
         assert isinstance(result, CoreAnalysisResult)

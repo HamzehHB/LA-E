@@ -61,9 +61,13 @@ class TestEndToEndRetrievalNarrativeWorkflow:
         corpus = [
             _make_unit("c-1", "A ledger of unrelated vocabulary about tide charts and harbour moorings.", source="archive.md", position=1),
         ]
-        core_units = [
-            _make_unit("core-1", "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n", source="core.md"),
-        ]
+        cu1 = _make_unit("core-1", "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n", source="core.md")
+        cu1.is_core = True
+        cu1.core_hash = "mock_test_core_hash_e2e_1"
+        cu1.core_source_path = "core.md"
+        from tests._test_core_helpers import build_test_validated_core
+        val_core_1 = build_test_validated_core([cu1], source_path="core.md", core_hash="mock_test_core_hash_e2e_1")
+        core_units = list(val_core_1.units)
 
         events = []
 
@@ -80,6 +84,7 @@ class TestEndToEndRetrievalNarrativeWorkflow:
             corpus=corpus,
             core_units=core_units,
             max_files=1,
+            validated_core=val_core_1,
             synthesis=synthesis,
             audit_root=str(audit_root),
             authorized_audit_root=str(audit_root),
@@ -162,9 +167,13 @@ class TestEndToEndRetrievalNarrativeWorkflow:
         corpus = [
             _make_unit("c-3", "A ledger of unrelated vocabulary about tide charts and harbour moorings.", source="ethics.md", position=1),
         ]
-        core_units = [
-            _make_unit("core-2", "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n", source="core_ethics.md"),
-        ]
+        cu2 = _make_unit("core-2", "Method:\nA method for calibrating laboratory instruments with a step by step procedure.\n", source="core_ethics.md")
+        cu2.is_core = True
+        cu2.core_hash = "mock_test_core_hash_e2e_2"
+        cu2.core_source_path = "core_ethics.md"
+        from tests._test_core_helpers import build_test_validated_core
+        val_core_2 = build_test_validated_core([cu2], source_path="core_ethics.md", core_hash="mock_test_core_hash_e2e_2")
+        core_units = list(val_core_2.units)
 
         events = []
 
@@ -176,6 +185,7 @@ class TestEndToEndRetrievalNarrativeWorkflow:
             corpus=corpus,
             core_units=core_units,
             max_files=1,
+            validated_core=val_core_2,
             synthesis=SyntheticSynthesis(),
             audit_root=str(audit_root),
             authorized_audit_root=str(audit_root),

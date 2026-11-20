@@ -1,5 +1,6 @@
 """Tests for embedding service and LanceDB vector retriever integration."""
 import numpy as np
+import pytest
 
 from src.living_authenticity.database.lancedb_manager import LanceDBManager
 from src.living_authenticity.database.schema import VECTOR_DIMENSION
@@ -64,6 +65,7 @@ def test_lancedb_vector_retriever(tmp_path):
     doc2 = "Mathematical logic and formal verification techniques."
     manager.store(doc1, service.embed(doc1), {"source": "reflections.md"})
     manager.store(doc2, service.embed(doc2), {"source": "math.md"})
+    manager.save_metadata({"status": "fresh", "indexed_vectors": 2})
 
     retriever = LanceDBVectorRetriever(embedding_service=service, db_manager=manager, max_candidates=2)
     assert retriever.name == "lancedb_vector"
@@ -97,6 +99,7 @@ def test_lancedb_vector_retriever_corpus_size_ignores_unsearched_in_memory_corpu
     # Store 1 document in the vector store
     doc = "Authentic clarity and disciplined inquiry."
     manager.store(doc, service.embed(doc), {"source": "truth.md"})
+    manager.save_metadata({"status": "fresh", "indexed_vectors": 1})
 
     retriever = LanceDBVectorRetriever(embedding_service=service, db_manager=manager, max_candidates=2)
     query_unit = KnowledgeUnit(
@@ -144,6 +147,10 @@ def test_lancedb_vector_retriever_unknown_corpus_size_handling(tmp_path):
         def search(self, *args, **kwargs):
             return self._inner.search(*args, **kwargs)
 
+        @property
+        def version(self):
+            return self._inner.version
+
         def count_rows(self):
             raise RuntimeError("size unmeasurable")
 
@@ -190,6 +197,7 @@ def test_lancedb_vector_retriever_relevance_assessment_real_work_and_events(tmp_
     doc2 = "Mathematical logic and formal verification techniques."
     manager.store(doc1, service.embed(doc1), {"source": "reflections.md", "position": 1})
     manager.store(doc2, service.embed(doc2), {"source": "math.md", "position": 2})
+    manager.save_metadata({"status": "fresh", "indexed_vectors": 2})
 
     events = []
     def observer(evt):
@@ -320,3 +328,159 @@ def test_empty_query_result_construction_failure_emits_failed_not_completed(tmp_
     assert rec_events[1]["phase"] == "failed"
     assert "simulated empty result construction failure" in rec_events[1]["error"]
     assert not any(e.get("phase") == "completed" and e.get("operation") == "retrieval_evidence_recording" for e in events)
+
+
+# ==============================================================================
+# Precision Regression Suite: Default Multiplier (0.30 / 1.30x) & Store Anti-Bypass (8 Direct-Call Tests)
+# ==============================================================================
+
+def test_default_core_boost_factor_multiplier_exact_1_30x(tmp_path):
+    """The default core_boost_factor must be 0.30, resulting in exactly a 1.30x multiplier."""
+    from tests._test_core_helpers import (
+        build_test_sync_authorization,
+        build_test_validated_core,
+    )
+    from src.living_authenticity.knowledge.vault.core_validator import compute_core_record_id
+    import pytest
+
+    db_dir = tmp_path / "boost_test_db"
+    store = LanceDBManager(str(db_dir))
+    store.create_knowledge_vector_table()
+    embedder = DeterministicEmbedder(dimension=VECTOR_DIMENSION)
+
+    core_text = "Foundational authenticity calibration standard."
+    core_unit = KnowledgeUnit(
+        id="core-u1",
+        source="01 Core/core.md",
+        original_text=core_text,
+        meaning=core_text,
+        cleaned_text=core_text,
+        normalized_text=core_text.lower(),
+        position=0,
+    )
+    val_core = build_test_validated_core(
+        units=[core_unit],
+        source_path="01 Core/core.md",
+        core_hash="sha256_core_boost_test",
+    )
+    rec_id = compute_core_record_id(core_unit, val_core)
+
+    store.store(
+        text=core_text,
+        embedding=embedder.embed(core_text),
+        metadata={
+            "source": "01 Core/core.md",
+            "position": 0,
+            "is_core": True,
+            "core_hash": "sha256_core_boost_test",
+        },
+        record_id=rec_id,
+        validated_core=val_core,
+    )
+    val_auth = build_test_sync_authorization(val_core)
+    store.save_metadata(
+        {"status": "fresh", "indexed_vectors": 1},
+        validated_core=val_core,
+        sync_auth=val_auth,
+    )
+
+    retriever = LanceDBVectorRetriever(
+        embedding_service=embedder,
+        db_manager=store,
+        validated_core=val_core,
+    )
+    assert retriever.core_boost_factor == pytest.approx(0.30)
+
+    query = KnowledgeUnit(
+        id="q-boost",
+        source="query.md",
+        original_text=core_text,
+        meaning=core_text,
+        cleaned_text=core_text,
+        normalized_text=core_text.lower(),
+        position=0,
+    )
+
+    res = retriever.retrieve(query, corpus=[])
+    assert len(res.candidates) == 1
+    cand = res.candidates[0]
+    assert cand.is_core is True
+    assert cand.core_hash == "sha256_core_boost_test"
+
+
+@pytest.mark.parametrize(
+    "case_num,source,text_override,position,record_id_override,core_hash,use_context,expected_is_core",
+    [
+        (1, "02 Notes/ordinary.md", None, 0, None, "hash123", True, False),   # Valid context with ordinary source
+        (2, "01 Core/core.md", "arbitrary text mismatch", 0, None, "hash123", True, False), # Valid context with arbitrary text
+        (3, "01 Core/core.md", None, 99, None, "hash123", True, False),       # Valid context with mismatched position
+        (4, "01 Core/core.md", None, 0, "core_vec_forged_id", "hash123", True, False), # Forged deterministic ID
+        (5, "01 Core/core.md", None, 0, None, "wrong_hash", True, False),      # Mismatched core_hash
+        (6, "01 Core/core.md", None, 0, None, "hash123", True, True),         # Valid Core unit with correct metadata
+        (7, "01 Core/core.md", None, 0, "core_vec_fake", "hash123", False, False), # Ordinary unit carrying Core flags (context=None)
+        (8, "01 Core/core.md", "core text with mutated suffix", 0, None, "hash123", True, False), # Cloned/mutated Core unit
+    ],
+)
+def test_lancedb_manager_store_anti_bypass_eight_cases(
+    tmp_path, case_num, source, text_override, position, record_id_override, core_hash, use_context, expected_is_core
+):
+    """Direct-call anti-bypass verification on LanceDBManager.store across all 8 adversarial cases."""
+    from tests._test_core_helpers import (
+        build_test_sync_authorization,
+        build_test_validated_core,
+    )
+    from src.living_authenticity.knowledge.vault.core_validator import compute_core_record_id
+
+    db_dir = tmp_path / f"db_antibypass_{case_num}"
+    store = LanceDBManager(str(db_dir))
+    store.create_knowledge_vector_table()
+    embedder = DeterministicEmbedder(dimension=VECTOR_DIMENSION)
+
+    genuine_text = "Authentic core unit thesis for testing anti-bypass mechanisms."
+    core_unit = KnowledgeUnit(
+        id="unit-antibypass",
+        source="01 Core/core.md",
+        original_text=genuine_text,
+        meaning=genuine_text,
+        cleaned_text=genuine_text,
+        normalized_text=genuine_text.lower(),
+        position=0,
+    )
+    val_core = build_test_validated_core(
+        units=[core_unit],
+        source_path="01 Core/core.md",
+        core_hash="hash123",
+    )
+    canonical_rec_id = compute_core_record_id(core_unit, val_core)
+
+    active_text = text_override if text_override is not None else genuine_text
+    active_rec_id = record_id_override if record_id_override is not None else canonical_rec_id
+    active_context = val_core if use_context else None
+
+    stored_id = store.store(
+        text=active_text,
+        embedding=embedder.embed(active_text),
+        metadata={
+            "source": source,
+            "position": position,
+            "is_core": True,  # Caller always attempts to claim Core
+            "core_hash": core_hash,
+        },
+        record_id=active_rec_id,
+        validated_core=active_context,
+    )
+
+    rows = store.show_all()
+    assert len(rows) == 1
+    row = rows[0]
+
+    if expected_is_core:
+        assert row["is_core"] is True
+        assert row["core_hash"] == "hash123"
+        assert row["id"] == canonical_rec_id
+        assert stored_id == canonical_rec_id
+    else:
+        assert row["is_core"] is False
+        assert row["core_hash"] == ""
+        # Caller CANNOT forge core_vec_ IDs
+        assert not str(row["id"]).startswith("core_vec_")

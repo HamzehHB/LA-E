@@ -61,7 +61,7 @@ class EvidenceFirstPipeline:
                  retriever=None, comparator=None, relation_detector=None, core_analyzer=None,
                  classifier=None, proposal_builder=None, confidence_guard=None,
                  knowledge_filter=None, output_generator=None, destination: str = "",
-                 stage_observer=None) -> None:
+                 stage_observer=None, validated_core=None) -> None:
         from src.living_authenticity.knowledge.ingestion.chunking.chunker_registry import ChunkerRegistry as _CR
         from src.living_authenticity.knowledge.analysis.classification.rule_based_classifier import DefaultClassifier
         from src.living_authenticity.knowledge.ingestion.cleaning.cleaner import Cleaner as _Cleaner
@@ -114,6 +114,22 @@ class EvidenceFirstPipeline:
         if not isinstance(destination, str):
             raise TypeError("destination must be a string")
         self.destination = destination
+        self.set_validated_core(validated_core)
+
+    def set_validated_core(self, validated_core: Any) -> None:
+        from src.living_authenticity.knowledge.vault.core_validator import (
+            CoreValidationContext,
+            is_trusted_validation_context,
+        )
+        val_ctx = getattr(validated_core, "validation_context", None) if validated_core is not None else None
+        if val_ctx is None and isinstance(validated_core, CoreValidationContext):
+            val_ctx = validated_core
+        if val_ctx is not None and is_trusted_validation_context(val_ctx):
+            self.validated_core = validated_core
+        else:
+            self.validated_core = None
+        if hasattr(self.retriever, "set_validated_core") and callable(self.retriever.set_validated_core):
+            self.retriever.set_validated_core(self.validated_core)
 
     def _observe(self, kind: str, stage: str, message: str = "", run_id: str = "") -> None:
         if self._stage_observer is None:
@@ -128,14 +144,15 @@ class EvidenceFirstPipeline:
     @property
     def stage_order(self) -> tuple:
         return STAGE_ORDER
-    def run_file(self, file_path: str, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None) -> IntegratedResult:
+    def run_file(self, file_path: str, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None, validated_core: Any = None) -> IntegratedResult:
         if not isinstance(file_path, str) or not file_path:
             raise TypeError("file_path must be a non-empty string")
+        eff_core = validated_core if validated_core is not None else self.validated_core
         return self.run_ingestion(
             self.ingestion.ingest(file_path, observer=self._stage_observer), corpus, core_units,
-            run_id=run_id, should_cancel=should_cancel)
+            run_id=run_id, should_cancel=should_cancel, validated_core=eff_core)
 
-    def run_ingestion(self, ingestion, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None) -> IntegratedResult:
+    def run_ingestion(self, ingestion, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None, validated_core: Any = None) -> IntegratedResult:
         """Run the analytical chain over one already-ingested result.
 
         Where input comes from (file, explicit directory, or terminal
@@ -146,16 +163,20 @@ class EvidenceFirstPipeline:
         """
         if not isinstance(ingestion, IngestionResult):
             raise TypeError("ingestion must be an IngestionResult")
+        eff_core = validated_core if validated_core is not None else self.validated_core
         corpus_units = self._corpus_units(corpus)
         cores = list(core_units) if core_units is not None else []
-        for item in cores:
-            if not isinstance(item, KnowledgeUnit):
-                raise TypeError("core_units must hold KnowledgeUnit objects")
+        if not cores and eff_core is not None:
+            eff_units = getattr(eff_core, "units", None)
+            if eff_units:
+                cores = list(eff_units)
+        from src.living_authenticity.knowledge.vault.core_validator import verify_core_units_provenance
+        verify_core_units_provenance(cores, context=eff_core)
         unit_results_list = []
         for u in ingestion.knowledge_units:
             if should_cancel is not None and (should_cancel() if callable(should_cancel) else bool(should_cancel)):
                 break
-            res = self.run_unit(u, corpus_units, cores, run_id=run_id, should_cancel=should_cancel)
+            res = self.run_unit(u, corpus_units, cores, run_id=run_id, should_cancel=should_cancel, validated_core=eff_core)
             if res is not None:
                 unit_results_list.append(res)
         unit_results = tuple(unit_results_list)
@@ -178,14 +199,24 @@ class EvidenceFirstPipeline:
             source=ingestion.file_path, ingestion=ingestion,
             units=unit_results, note=note)
 
-    def run_unit(self, query: KnowledgeUnit, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None) -> IntegratedUnitResult | None:
+    def run_unit(self, query: KnowledgeUnit, corpus=(), core_units=(), run_id: str = "", should_cancel: Any = None, validated_core: Any = None) -> IntegratedUnitResult | None:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError("query must be a KnowledgeUnit")
+        eff_core = validated_core if validated_core is not None else self.validated_core
         corpus_units = self._corpus_units(corpus)
         cores = list(core_units) if core_units is not None else []
+        if not cores and eff_core is not None:
+            eff_units = getattr(eff_core, "units", None)
+            if eff_units:
+                cores = list(eff_units)
         for item in cores:
             if not isinstance(item, KnowledgeUnit):
                 raise TypeError("core_units must hold KnowledgeUnit objects")
+        if cores:
+            from src.living_authenticity.knowledge.vault.core_validator import verify_core_units_provenance
+            verify_core_units_provenance(cores, context=eff_core)
+        if hasattr(self.retriever, "set_validated_core") and callable(self.retriever.set_validated_core):
+            self.retriever.set_validated_core(eff_core)
         uid = query.id if isinstance(query, KnowledgeUnit) else ""
         self._observe("stage_started", "retrieval", uid, run_id=run_id)
 
@@ -222,7 +253,11 @@ class EvidenceFirstPipeline:
         if not isinstance(relation, RelationDetectionResult):
             raise TypeError("detector must return a RelationDetectionResult")
         self._observe("stage_started", "core", uid, run_id=run_id)
-        core = self.core_analyzer.analyze(query, cores)
+        ca_sig = inspect.signature(self.core_analyzer.analyze)
+        if "context" in ca_sig.parameters:
+            core = self.core_analyzer.analyze(query, cores, context=eff_core)
+        else:
+            core = self.core_analyzer.analyze(query, cores)
         self._observe("stage_completed", "core", uid, run_id=run_id)
         if not isinstance(core, CoreAnalysisResult):
             raise TypeError("analyzer must return a CoreAnalysisResult")

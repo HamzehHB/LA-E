@@ -1,4 +1,6 @@
 ---
+canonical_type: Core
+draft: false
 origin: "synthetic-example"
 status: "example"
 tags: "example, fixture, core"

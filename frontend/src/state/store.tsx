@@ -101,6 +101,7 @@ interface Store {
   liveEditProposal: (title: string, body: string, reason: string) => Promise<void>;
   liveAccept: () => Promise<void>;
   liveFix: (inputText?: string) => Promise<void>;
+  liveRetry: () => Promise<void>;
   liveStop: () => Promise<void>;
   liveTranslate: (
     text: string,
@@ -112,7 +113,7 @@ interface Store {
   liveIndexVault: () => Promise<{ indexed: boolean; reason?: string }>;
   liveAuthorizeVaultSync: (vaultRoot?: string) => Promise<{ indexed: boolean; reason?: string; vault_id?: string; status?: string }>;
   liveRevokeVaultSync: () => Promise<{ authorized: boolean; status: string }>;
-  liveReconcileVaultSync: () => Promise<unknown>;
+  liveReconcileVaultSync: (ticket_id?: string) => Promise<unknown>;
   liveGetVaultSyncStatus: () => Promise<VaultSyncStatusResponse | null>;
   liveRevealFolder: (purpose: FolderPurpose) => Promise<Array<{ name: string; is_dir: boolean; size: number; modified: string }>>;
   liveConsent: (decision: "approve" | "reject") => Promise<void>;
@@ -311,7 +312,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     if (event.kind === "sync_approval_required") {
       const vaultId = String(extra.vault_id ?? "");
+      const approvalId = extra.approval_id !== undefined && extra.approval_id !== null
+        ? String(extra.approval_id).trim()
+        : "";
       const diff = extra.diff as VaultChangeDiff | undefined;
+      if (!approvalId) {
+        // Do not silently accept or dispatch a pending approval event without a valid non-empty approval ID.
+        return;
+      }
       if (runId && diff) {
         if (stateRef.current.run.stopped && (!runId || runId === stateRef.current.run.run_id)) {
           return;
@@ -319,6 +327,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setPendingSyncApproval({
           run_id: runId,
           vault_id: vaultId,
+          approval_id: approvalId,
           diff,
           message: message || "Obsidian Vault changes detected — synchronization requires approval before retrieval",
           created_at: event.timestamp || new Date().toISOString(),
@@ -347,8 +356,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         const confScore = typeof extra.confidence_score === "number"
           ? extra.confidence_score
-          : (extra.confidence_score ? Number(extra.confidence_score) : 0.89);
-        const confBand = String(extra.confidence_score_band ?? (confScore >= 0.8 ? "high" : confScore >= 0.5 ? "moderate" : "low"));
+          : (extra.confidence_score !== undefined && extra.confidence_score !== null && String(extra.confidence_score).trim() !== "" ? Number(extra.confidence_score) : undefined);
+        const confBand = String(extra.confidence_score_band ?? (confScore !== undefined ? (confScore >= 0.8 ? "high" : confScore >= 0.5 ? "moderate" : "low") : "unassessed"));
         const classType = String(extra.classification_type ?? "Observation");
         const action = String(extra.proposal_action ?? "");
         const isExecutable = extra.is_executable !== undefined ? Boolean(extra.is_executable) : action === "CREATE";
@@ -1223,6 +1232,41 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setLiveError((e as Error)?.message ?? "backend_error");
         }
       },
+      liveRetry: async () => {
+        if (!live.available) return;
+        setLiveError(null);
+        try {
+          const res = await live.retryPausedRun(state.run.run_id);
+          if (res && res.run_id) {
+            currentRunIdRef.current = res.run_id;
+            isStoppedRef.current = false;
+            setState((s) => ({
+              ...s,
+              runEvents: [],
+              run: {
+                ...s.run,
+                run_id: res.run_id,
+                current_stage: "core_preflight",
+                status: "retrying run after core resolution",
+                stopped: false,
+                stop_reason: "",
+                error: null,
+              },
+            }));
+          }
+        } catch (e) {
+          const errMsg = (e as Error)?.message ?? "backend_error";
+          setLiveError(errMsg);
+          setState((s) => ({
+            ...s,
+            run: {
+              ...s.run,
+              stopped: true,
+              stop_reason: errMsg,
+            },
+          }));
+        }
+      },
       liveStop: async () => {
         if (!live.available) return;
         setLiveError(null);
@@ -1307,10 +1351,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return { authorized: false, status: "error" };
         }
       },
-      liveReconcileVaultSync: async () => {
+      liveReconcileVaultSync: async (ticket_id?: string) => {
         if (!live.available) return null;
         try {
-          return await live.reconcileVaultSync();
+          return await live.reconcileVaultSync(ticket_id);
         } catch {
           return null;
         }
@@ -1347,12 +1391,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       },
       liveDecideVaultSync: async (decision: "approve" | "reject") => {
         if (!live.available || !pendingSyncApproval) return;
+        const approvalId = pendingSyncApproval.approval_id ? pendingSyncApproval.approval_id.trim() : "";
+        if (!approvalId) {
+          setLiveError("missing_approval_id");
+          return;
+        }
         setLiveError(null);
         try {
-          await live.decideVaultSync({
+          const res = await live.decideVaultSync({
             run_id: pendingSyncApproval.run_id,
             vault_id: pendingSyncApproval.vault_id,
             decision,
+            approval_id: approvalId,
           });
           setPendingSyncApproval(null);
           setState((s) => ({
@@ -1365,6 +1415,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                   : "synchronization rejected — halting run safely",
             },
           }));
+          if (decision === "approve" && res && res.ticket_id && !state.run.run_id) {
+            await live.reconcileVaultSync(res.ticket_id);
+          }
         } catch (e) {
           setLiveError((e as Error)?.message ?? "backend_error");
         }
@@ -1529,7 +1582,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             lastInstanceIdRef.current = st.instance_id;
           }
           if (st?.pending_sync_approval) {
-            setPendingSyncApproval(st.pending_sync_approval);
+            const apprId = st.pending_sync_approval.approval_id ? String(st.pending_sync_approval.approval_id).trim() : "";
+            if (apprId) {
+              setPendingSyncApproval({
+                ...st.pending_sync_approval,
+                approval_id: apprId,
+              });
+            } else {
+              setPendingSyncApproval(null);
+            }
           } else if (!st?.active_run_id) {
             setPendingSyncApproval(null);
           }
@@ -1603,7 +1664,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             lastInstanceIdRef.current = st.instance_id;
           }
           if (st?.pending_sync_approval) {
-            setPendingSyncApproval(st.pending_sync_approval);
+            const apprId = st.pending_sync_approval.approval_id ? String(st.pending_sync_approval.approval_id).trim() : "";
+            if (apprId) {
+              setPendingSyncApproval({
+                ...st.pending_sync_approval,
+                approval_id: apprId,
+              });
+            } else {
+              setPendingSyncApproval(null);
+            }
           } else if (!st?.active_run_id) {
             setPendingSyncApproval(null);
           }

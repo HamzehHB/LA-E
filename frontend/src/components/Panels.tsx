@@ -150,6 +150,7 @@ export function ProcessingResult() {
     liveEditProposal,
     liveAccept,
     liveFix,
+    liveRetry,
     liveStop,
     liveError,
     dismissRunOutcome,
@@ -451,9 +452,16 @@ export function ProcessingResult() {
               <div className="safestop-actions">
                 {liveAvailable ? (
                   <>
-                    <button type="button" className="btn approve" onClick={() => void liveFix(fixQueryInput)}>
-                      {t("ui.recovery.fixResume")}
-                    </button>
+                    {state.inputRecoveryOptions?.includes("retry") && (
+                      <button type="button" className="btn approve" onClick={() => void liveRetry()}>
+                        {t("ui.recovery.retry")}
+                      </button>
+                    )}
+                    {(!state.inputRecoveryOptions || state.inputRecoveryOptions.includes("fix_input")) && (
+                      <button type="button" className="btn approve" onClick={() => void liveFix(fixQueryInput)}>
+                        {t("ui.recovery.fixResume")}
+                      </button>
+                    )}
                     <button type="button" className="btn reject" onClick={() => void liveStop()}>
                       {t("ui.recovery.stopRun")}
                     </button>

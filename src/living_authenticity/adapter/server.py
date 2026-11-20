@@ -325,6 +325,9 @@ def _make_handler(launcher: Launcher):
             if path == "/api/run/fix":
                 self._handle_fix()
                 return
+            if path == "/api/run/retry":
+                self._handle_retry()
+                return
             if path == "/api/run/stop":
                 self._handle_stop()
                 return
@@ -509,10 +512,22 @@ def _make_handler(launcher: Launcher):
             self._send_json(200, result)
 
         def _handle_vault_sync_reconcile(self):
+            data = self._read_json() if self.headers.get("Content-Length") else {}
+            if data is None:
+                data = {}
+            ticket_id = data.get("ticket_id") or data.get("approval_ticket_id")
             try:
-                result = launcher.reconcile_vault_sync()
+                result = launcher.reconcile_vault_sync(ticket_id=ticket_id)
             except AdapterError as exc:
-                self._error(400, exc.kind, exc.message)
+                if exc.kind == "approval_required":
+                    self._error(403, "approval_required", exc.message)
+                elif exc.kind in ("conflict", "stale_approval"):
+                    self._error(409, "stale_approval", exc.message)
+                else:
+                    self._error(400, exc.kind, exc.message)
+                return
+            except Exception as exc:
+                self._error(500, "internal_error", str(exc))
                 return
             self._send_json(200, result)
 
@@ -523,6 +538,7 @@ def _make_handler(launcher: Launcher):
             run_id = data.get("run_id")
             vault_id = data.get("vault_id")
             decision = data.get("decision")
+            approval_id = data.get("approval_id")
             if not isinstance(run_id, str) or not run_id.strip():
                 self._error(400, "validation_error", "run_id is required")
                 return
@@ -533,14 +549,16 @@ def _make_handler(launcher: Launcher):
                 self._error(400, "validation_error", "decision must be 'approve' or 'reject'")
                 return
             try:
-                result = launcher.decide_vault_sync(run_id, vault_id, decision)
+                result = launcher.decide_vault_sync(run_id, vault_id, decision, approval_id=approval_id)
             except AdapterError as exc:
                 if exc.kind == "not_found":
                     code = 404
-                elif exc.kind == "conflict":
+                elif exc.kind in ("conflict", "stale_approval"):
                     code = 409
                 elif exc.kind == "unprocessable_entity":
                     code = 422
+                elif exc.kind == "approval_required":
+                    code = 403
                 else:
                     code = 400
                 self._error(code, exc.kind, exc.message)
@@ -592,6 +610,18 @@ def _make_handler(launcher: Launcher):
                     source_mode=str(raw_source) if raw_source is not None else None,
                     retrieval_mode=str(raw_retrieval) if raw_retrieval is not None else None,
                 )
+            except AdapterError as exc:
+                self._error(400, exc.kind, exc.message)
+                return
+            self._send_json(202, result)
+
+        def _handle_retry(self):
+            data = self._read_json()
+            if data is None:
+                data = {}
+            try:
+                run_id = str(data.get("run_id") or "")
+                result = launcher.retry_paused_run(run_id=run_id)
             except AdapterError as exc:
                 self._error(400, exc.kind, exc.message)
                 return

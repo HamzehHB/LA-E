@@ -11,9 +11,32 @@ from .context import (
 )
 from .identity import compute_vault_id, resolve_vault_index_dir
 from .sync import (
+    VaultSyncApprovalTicket,
+    VaultSyncConcurrencyError,
     VaultSyncError,
     VaultSyncMonitor,
+    VaultSyncRollbackError,
+    VaultSyncSchemaResolutionError,
     VaultSyncSession,
+    VaultSyncSnapshotDriftError,
+    VaultSyncStaleApprovalError,
+    VaultSyncUnauthorizedError,
+    compute_diff_fingerprint,
+    compute_snapshot_fingerprint,
+)
+from .core_validator import (
+    CoreFailureCategory,
+    CoreResolutionError,
+    CoreValidationContext,
+    ValidatedCore,
+    VAULT_CORE_FOLDER,
+    is_core_relative_path,
+    is_trusted_validation_context,
+    is_validated_core_unit,
+    normalize_source_identity,
+    resolve_schema_core_folder,
+    validate_and_load_core,
+    verify_core_units_provenance,
 )
 
 __all__ = [
@@ -30,4 +53,25 @@ __all__ = [
     "VaultSyncSession",
     "VaultSyncMonitor",
     "VaultSyncError",
+    "VaultSyncSchemaResolutionError",
+    "VaultSyncUnauthorizedError",
+    "VaultSyncRollbackError",
+    "VaultSyncConcurrencyError",
+    "VaultSyncSnapshotDriftError",
+    "VaultSyncStaleApprovalError",
+    "VaultSyncApprovalTicket",
+    "compute_snapshot_fingerprint",
+    "compute_diff_fingerprint",
+    "CoreFailureCategory",
+    "CoreResolutionError",
+    "CoreValidationContext",
+    "ValidatedCore",
+    "VAULT_CORE_FOLDER",
+    "is_core_relative_path",
+    "is_trusted_validation_context",
+    "is_validated_core_unit",
+    "normalize_source_identity",
+    "resolve_schema_core_folder",
+    "validate_and_load_core",
+    "verify_core_units_provenance",
 ]

@@ -170,7 +170,16 @@ def test_downstream_execution_trace_order():
         position=0,
     )
 
-    result = pipe.run_unit(unit, corpus=[], core_units=[])
+    from tests._test_core_helpers import build_test_validated_core
+    core_u = KnowledgeUnit(
+        id="core-ord", source="core.md", original_text="Core thesis.",
+        meaning="Core thesis.", cleaned_text="Core thesis.",
+        normalized_text="core thesis.", context="", proposed_type="Core", position=0,
+        is_core=True, core_hash="mock_test_core_hash_ord", core_source_path="core.md",
+    )
+    val_core = build_test_validated_core([core_u], source_path="core.md", core_hash="mock_test_core_hash_ord")
+    pipe.set_validated_core(val_core)
+    result = pipe.run_unit(unit, corpus=[], core_units=[core_u])
     assert result is not None
     assert result.query_unit.id == "ku-downstream-test"
 

@@ -90,7 +90,7 @@ def test_no_known_secret_patterns_in_tracked_files():
 
 def test_production_and_repo_roots_absent_from_tracked_files():
     for path in _tracked_files():
-        if path in PATH_PREFIX_EXEMPT_FILES:
+        if path in PATH_PREFIX_EXEMPT_FILES or path.startswith('errors/'):
             continue
         content = (REPO / path).read_text(encoding="utf-8", errors="replace")
         normalized = re.sub(

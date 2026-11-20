@@ -114,6 +114,27 @@ def _ingestion_pipeline():
 
 # === invariants (continued below) ===
 
+
+
+from tests._test_core_helpers import build_test_validated_core
+
+
+_SHARED_SEC_VAL_CORE = build_test_validated_core(
+    [KnowledgeUnit(id="core-sec", source="core.md", original_text="Epistemic anchor thesis.",
+        meaning="Epistemic anchor thesis.", cleaned_text="Epistemic anchor thesis.",
+        normalized_text="epistemic anchor thesis.", context="", proposed_type="Core", position=0,
+        is_core=True, core_hash="mock_test_core_hash", core_source_path="core.md")],
+    source_path="core.md", core_hash="mock_test_core_hash"
+)
+
+
+def _core_sec():
+    return _SHARED_SEC_VAL_CORE.units[0]
+
+
+def _pipeline_with_core(core_u=None):
+    val_core = _SHARED_SEC_VAL_CORE if core_u is None else build_test_validated_core([core_u], source_path=core_u.source, core_hash=core_u.core_hash)
+    return EvidenceFirstPipeline(validated_core=val_core)
 def test_certain_classification_cannot_authorize_execution(tmp_path):
     """Invariant: Classification cannot authorize execution."""
     query = KnowledgeUnit(
@@ -124,7 +145,7 @@ def test_certain_classification_cannot_authorize_execution(tmp_path):
         normalized_text="A governing principle of calm attention.",
         context="Core", proposed_type="", position=0,
     )
-    result = EvidenceFirstPipeline().run_unit(query, corpus=[], core_units=[])
+    result = _pipeline_with_core().run_unit(query, corpus=[], core_units=[_core_sec()])
     assert result is not None
     assert result.classification.is_certain is True
     assert result.classification.proposed_type == "Core"
@@ -207,6 +228,7 @@ def test_core_conflict_resolves_conservatively_and_stays_non_executable(tmp_path
         id="core-1", source="vault/Core.md", original_text=core_text,
         meaning=core_text, cleaned_text=core_text, normalized_text=core_text,
         context="Core", proposed_type="Core", position=0,
+        is_core=True, core_hash="mock_test_core_hash_sec_inv", core_source_path="vault/Core.md",
     )
     query_text = "Calmness challenges the foundational principle of attention."
     query = KnowledgeUnit(
@@ -214,7 +236,7 @@ def test_core_conflict_resolves_conservatively_and_stays_non_executable(tmp_path
         cleaned_text=query_text, normalized_text=query_text, context="",
         proposed_type="", position=1,
     )
-    result = EvidenceFirstPipeline().run_unit(query, corpus=[], core_units=[core])
+    result = _pipeline_with_core(core).run_unit(query, corpus=[], core_units=[core])
     assert result is not None
     assert result.core_analysis.relevance == "potentially_relevant"
     assert result.core_analysis.is_authoritative is False
@@ -283,9 +305,9 @@ def test_oversized_input_stays_bounded_and_deterministic(tmp_path):
     big = paragraph * 1200
     note = tmp_path / "big.md"
     note.write_text(big, encoding="utf-8")
-    pipeline = EvidenceFirstPipeline()
-    first = pipeline.run_file(str(note))
-    second = pipeline.run_file(str(note))
+    pipeline = _pipeline_with_core()
+    first = pipeline.run_file(str(note), core_units=[_core_sec()])
+    second = pipeline.run_file(str(note), core_units=[_core_sec()])
     assert first == second
     assert first.ingestion is not None
     assert len(first.ingestion.knowledge_units) == len(first.units)

@@ -14,8 +14,16 @@ def _unit(body, *, id="q"):
     )
 
 
+from tests._test_core_helpers import build_test_validated_core
+
+
 def _analyze(query_body, core_body):
-    return TokenOverlapCoreAnalyzer().analyze(_unit(query_body), [_unit(core_body, id="c")])
+    u = _unit(core_body, id="c")
+    u.is_core = True
+    u.core_hash = "mock_test_core_hash_sec"
+    u.core_source_path = "core.md"
+    val_core = build_test_validated_core([u], source_path="core.md", core_hash="mock_test_core_hash_sec")
+    return TokenOverlapCoreAnalyzer().analyze(_unit(query_body), [u], context=val_core)
 
 
 class TestInert:

@@ -106,6 +106,7 @@ def test_semantic_retrieval_with_vector_store_and_temporary_cache(tmp_path):
     embedder = StubEmbedder()
     doc = "Prior knowledge regarding quiet observation and presence."
     manager.store(doc, embedder.embed(doc), {"source": "prior.md"})
+    manager.save_metadata({"status": "fresh", "indexed_vectors": 1})
 
     launcher = Launcher(
         paths={

@@ -226,4 +226,89 @@ describe("live client availability", () => {
       run_id: "run-3",
     });
   });
+
+  it("enforces wire contract and includes approval_id in decideVaultSync", async () => {
+    (window as unknown as Record<string, unknown>).__LAE_BOOTSTRAP__ = {
+      token: "secret-token",
+      instanceId: "inst-1",
+      version: "0.1.0",
+    };
+    const seen: { url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        seen.push({ url, body: JSON.parse(init?.body as string) });
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok",
+            run_id: "run-sync-1",
+            vault_id: "vault-1",
+            decision: "approve",
+            ticket_id: "ticket-1",
+          }),
+        } as Response;
+      }),
+    );
+    const client = createLiveClient();
+    const res = await client.decideVaultSync({
+      run_id: "run-sync-1",
+      vault_id: "vault-1",
+      decision: "approve",
+      approval_id: "appr-sync-123",
+    });
+    expect(res.status).toBe("ok");
+    expect(res.ticket_id).toBe("ticket-1");
+    expect(seen).toHaveLength(1);
+    expect(seen[0].url).toBe("/api/vault/sync/decide");
+    expect(seen[0].body).toEqual({
+      run_id: "run-sync-1",
+      vault_id: "vault-1",
+      decision: "approve",
+      approval_id: "appr-sync-123",
+    });
+  });
+
+  it("enforces wire contract and includes approval_id in decideVaultSync for reject decision", async () => {
+    (window as unknown as Record<string, unknown>).__LAE_BOOTSTRAP__ = {
+      token: "secret-token",
+      instanceId: "inst-1",
+      version: "0.1.0",
+    };
+    const seen: { url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        seen.push({ url, body: JSON.parse(init?.body as string) });
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok",
+            run_id: "run-sync-2",
+            vault_id: "vault-2",
+            decision: "reject",
+            ticket_id: null,
+          }),
+        } as Response;
+      }),
+    );
+    const client = createLiveClient();
+    const res = await client.decideVaultSync({
+      run_id: "run-sync-2",
+      vault_id: "vault-2",
+      decision: "reject",
+      approval_id: "appr-sync-456",
+    });
+    expect(res.status).toBe("ok");
+    expect(res.decision).toBe("reject");
+    expect(res.ticket_id).toBeNull();
+    expect(seen).toHaveLength(1);
+    expect(seen[0].url).toBe("/api/vault/sync/decide");
+    expect(seen[0].body).toEqual({
+      run_id: "run-sync-2",
+      vault_id: "vault-2",
+      decision: "reject",
+      approval_id: "appr-sync-456",
+    });
+  });
 });

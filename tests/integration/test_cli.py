@@ -164,10 +164,18 @@ def test_main_forwards_language_flags(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli_module, "run_bounded_integration", _fake_run)
 
+    core_dir = tmp_path / "core"
+    core_dir.mkdir()
+    (core_dir / "core.md").write_text(
+        "---\ntitle: Core\ncanonical_type: Core\ndraft: false\n---\n\nCore thesis.\n",
+        encoding="utf-8"
+    )
+
     # 1. Text mode
     code = main([
         "--text", "sample prompt",
         "--staging-root", str(staging),
+        "--core-root", str(core_dir),
         "--staging-language", "fa",
         "--audit-language", "fa",
     ])
@@ -181,6 +189,7 @@ def test_main_forwards_language_flags(tmp_path, monkeypatch):
     code = main([
         "--input-file", str(sample_file),
         "--staging-root", str(staging),
+        "--core-root", str(core_dir),
         "--staging-language", "en",
         "--audit-language", "fa",
     ])
@@ -194,6 +203,7 @@ def test_main_forwards_language_flags(tmp_path, monkeypatch):
     code = main([
         "--source-root", str(source_dir),
         "--staging-root", str(staging),
+        "--core-root", str(core_dir),
         "--staging-language", "fa",
         "--audit-language", "en",
     ])

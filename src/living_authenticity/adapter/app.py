@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,8 @@ class _PendingSyncApproval:
     """One pending human Vault sync approval decision, run-bound."""
 
     def __init__(self, run_id: str, vault_id: str, vault_root: str,
-                 diff: dict, manifest: dict | None = None) -> None:
+                 diff: dict, manifest: dict | None = None, approval_id: str = "") -> None:
+        self.approval_id = str(approval_id).strip() if approval_id else ""
         self.run_id = run_id
         self.vault_id = vault_id
         self.vault_root = vault_root
@@ -142,20 +143,38 @@ class _PendingSyncApproval:
         self.manifest = manifest or {}
         self.created_at = _utcnow()
         self.state = ApprovalState.PENDING
+        self.ticket = None
         self._lock = threading.Lock()
         self._event = threading.Event()
 
-    def resolve(self, decision: str) -> bool:
+    def resolve(self, decision: str, ticket=None) -> bool:
         """Atomically transition state from PENDING. Returns True if first transition."""
         with self._lock:
             if self.state != ApprovalState.PENDING:
                 return False
             if decision == "approve":
+                if ticket is None:
+                    return False
+                if not self.approval_id:
+                    return False
+                if not getattr(ticket, "is_valid", lambda: False)():
+                    return False
+                if not hasattr(ticket, "approval_id") or getattr(ticket, "approval_id") != self.approval_id:
+                    return False
+                if not hasattr(ticket, "run_id") or getattr(ticket, "run_id") != self.run_id:
+                    return False
+                if not hasattr(ticket, "vault_id") or getattr(ticket, "vault_id") != self.vault_id:
+                    return False
+                if not hasattr(ticket, "decision") or getattr(ticket, "decision") != "approve":
+                    return False
                 self.state = ApprovalState.APPROVED
+                self.ticket = ticket
             elif decision == "reject":
                 self.state = ApprovalState.REJECTED
+                self.ticket = None
             elif decision == "cancelled":
                 self.state = ApprovalState.CANCELLED
+                self.ticket = None
             else:
                 return False
             self._event.set()
@@ -325,6 +344,7 @@ class Launcher:
         from src.living_authenticity.knowledge.vault.sync import VaultSyncSession
 
         self._vault_sync_session = VaultSyncSession(stage_observer=self._sink)
+        self._reconcile_lock = threading.Lock()
         self._embedder: VectorEmbeddingService | None = None
         self.events = RunEventLog()
         self._bootstrap_from_paths()
@@ -758,9 +778,12 @@ class Launcher:
 
         try:
             from contextlib import nullcontext
-            from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
+            from src.living_authenticity.knowledge.integration.guard import (
+                TestOutputAuthorizationToken,
+                authorized_test_mode,
+            )
 
-            auth_ctx = nullcontext()
+            auth_ctx: ContextManager[TestOutputAuthorizationToken | None] = nullcontext()
             if self._is_test_mode and self._test_authorizer_factory is not None:
                 authorizer = self._test_authorizer_factory(f"run_{run_id}")
                 auth_ctx = authorized_test_mode(authorizer)
@@ -1069,10 +1092,28 @@ class Launcher:
                     "audit_partition": "errors",
                 })
 
+            from src.living_authenticity.knowledge.vault.core_validator import (
+                CoreResolutionError,
+            )
+            if isinstance(exc, CoreResolutionError):
+                is_core_error = True
+                err_cat = str(exc.category.value)
+                recovery_opts = ["retry", "fix_core", "stop"]
+            else:
+                cat_attr = getattr(exc, "category", None)
+                if cat_attr is not None:
+                    is_core_error = True
+                    err_cat = str(getattr(cat_attr, "value", cat_attr))
+                    recovery_opts = ["retry", "fix_core", "stop"]
+                else:
+                    is_core_error = False
+                    err_cat = ""
+                    recovery_opts = ["fix_input", "stop"]
             with self._lock:
                 existing = self._reports.get(run_id, {})
                 rep = {
                     "run_id": run_id,
+                    "accepted": False,
                     "error": type(exc).__name__,
                     "outcome": existing.get("outcome", "FAILED"),
                     "reason": safe_stop_reason,
@@ -1094,7 +1135,9 @@ class Launcher:
                     "source_mode": mode_value,
                     "retrieval_mode": retrieval_mode,
                     "error": type(exc).__name__,
+                    "error_category": err_cat,
                     "error_message": safe_stop_reason,
+                    "recovery_options": recovery_opts,
                     "timestamp": _utcnow(),
                 }
                 if resumed_from_run_id:
@@ -1109,7 +1152,8 @@ class Launcher:
                 "message": f"run paused on error: {safe_stop_reason}",
                 "outcome": "FAILED",
                 "terminal_outcome": "infrastructure_error",
-                "recovery_options": ["fix_input", "stop"],
+                "recovery_options": recovery_opts,
+                "error_category": err_cat,
             })
         finally:
             with self._lock:
@@ -1151,7 +1195,7 @@ class Launcher:
                 "reason": "cancellation will take effect at the next "
                           "safe boundary"}
 
-    def decide_vault_sync(self, run_id: str, vault_id: str, decision: str) -> dict:
+    def decide_vault_sync(self, run_id: str, vault_id: str, decision: str, approval_id: str | None = None) -> dict:
         """Validate and record explicit operator decision for pending Vault sync."""
         if not isinstance(run_id, str) or not run_id.strip():
             raise AdapterError("validation_error", "run_id is required")
@@ -1166,15 +1210,66 @@ class Launcher:
                 raise AdapterError("not_found", f"no pending vault sync approval for run_id '{run_id}'")
             if pending.vault_id != vault_id:
                 raise AdapterError("unprocessable_entity", f"vault_id mismatch: expected '{pending.vault_id}', got '{vault_id}'")
-
-            if not pending.resolve(decision):
+            if pending.state != ApprovalState.PENDING:
                 raise AdapterError("conflict", f"vault sync approval for run '{run_id}' is already {pending.state.value}")
+
+            clean_pending_approval_id = str(pending.approval_id).strip() if pending.approval_id else ""
+            if not clean_pending_approval_id:
+                raise AdapterError("validation_error", f"pending vault sync approval for run '{run_id}' has no valid approval_id")
+
+            clean_submitted_approval_id = str(approval_id).strip() if approval_id else ""
+            if not clean_submitted_approval_id:
+                raise AdapterError("validation_error", f"approval_id is required for pending approval on run '{run_id}'")
+
+            if clean_pending_approval_id != clean_submitted_approval_id:
+                raise AdapterError("unprocessable_entity", f"approval_id mismatch: expected '{clean_pending_approval_id}', got '{clean_submitted_approval_id}'")
+
+            if decision == "approve":
+                if self._vault_sync_session is None:
+                    raise AdapterError("conflict", f"VaultSyncSession does not exist; cannot approve vault sync for run '{run_id}'")
+
+                try:
+                    res = self._vault_sync_session.resolve_approval(
+                        clean_pending_approval_id, "approve", run_id=run_id, vault_id=vault_id
+                    )
+                    ticket_id = res.get("ticket_id")
+                    ticket = getattr(self._vault_sync_session, "_active_ticket", None)
+                except Exception as exc:
+                    raise AdapterError("conflict", str(exc)) from exc
+
+                if ticket is None:
+                    raise AdapterError("conflict", f"failed to obtain valid synchronization ticket for run '{run_id}'")
+                if getattr(ticket, "approval_id", None) != clean_pending_approval_id:
+                    raise AdapterError("conflict", f"ticket approval_id mismatch: expected '{clean_pending_approval_id}', got '{getattr(ticket, 'approval_id', None)}'")
+                if getattr(ticket, "run_id", None) and getattr(ticket, "run_id", None) != run_id:
+                    raise AdapterError("conflict", f"ticket run_id mismatch: expected '{run_id}', got '{getattr(ticket, 'run_id', None)}'")
+                if getattr(ticket, "vault_id", None) and getattr(ticket, "vault_id", None) != vault_id:
+                    raise AdapterError("conflict", f"ticket vault_id mismatch: expected '{vault_id}', got '{getattr(ticket, 'vault_id', None)}'")
+                if not getattr(ticket, "is_valid", lambda: False)():
+                    raise AdapterError("conflict", f"issued ticket is not valid for run '{run_id}'")
+
+                if not pending.resolve("approve", ticket=ticket):
+                    raise AdapterError("conflict", f"vault sync approval for run '{run_id}' is already {pending.state.value}")
+
+            else:  # decision == "reject"
+                ticket_id = None
+                if self._vault_sync_session is not None:
+                    try:
+                        self._vault_sync_session.resolve_approval(
+                            clean_pending_approval_id, "reject", run_id=run_id, vault_id=vault_id
+                        )
+                    except Exception as exc:
+                        raise AdapterError("conflict", str(exc)) from exc
+
+                if not pending.resolve("reject", ticket=None):
+                    raise AdapterError("conflict", f"vault sync approval for run '{run_id}' is already {pending.state.value}")
 
         return {
             "status": "ok",
             "run_id": run_id,
             "vault_id": vault_id,
             "decision": decision,
+            "ticket_id": ticket_id,
         }
 
     def _cancelled(self, run_id: str) -> bool:
@@ -1372,7 +1467,7 @@ class Launcher:
             summary["active"] = run_id == self._active_run_id
         return summary
 
-    def _load_knowledge_corpus(self, mode_value, pipeline, paths, run_id=""):
+    def _load_knowledge_corpus(self, mode_value, pipeline, paths, run_id="", validated_core=None):
         """Load corpus units, core units, and optional vault context according to mode.
 
         Test Mode ("examples"):
@@ -1393,21 +1488,22 @@ class Launcher:
         from src.living_authenticity.knowledge.integration.indexing import ingest_units
 
         if mode_value == "examples":
+            from src.living_authenticity.knowledge.vault.core_validator import (
+                validate_and_load_core,
+            )
             examples_root = Path(REPOSITORY_ROOT) / "examples" / "bounded_local_integration"
             corpus_dir = examples_root / "corpus"
-            core_dir = examples_root / "core"
             corpus_units = []
-            core_units = []
             if corpus_dir.is_dir():
                 try:
                     corpus_units = ingest_units(str(corpus_dir), pipeline, max_files=50)
                 except Exception:
                     corpus_units = []
-            if core_dir.is_dir():
-                try:
-                    core_units = ingest_units(str(core_dir), pipeline, max_files=50)
-                except Exception:
-                    core_units = []
+            if validated_core is not None:
+                core_units = list(validated_core.units)
+            else:
+                c_res = validate_and_load_core("examples", paths=paths, pipeline=pipeline)
+                core_units = list(c_res.units)
             self._sink({
                 "kind": "status",
                 "stage": "retrieval",
@@ -1425,7 +1521,11 @@ class Launcher:
             read_vault_context,
             resolve_vault_core_root,
         )
-        vault_root = self.session_destination("vault") or paths.get("obsidian", {}).get("vault", "")
+        vault_root = (
+            self.session_destination("vault")
+            or paths.get("obsidian", {}).get("vault", "")
+            or paths.get("vault", {}).get("root", "")
+        )
         if not vault_root or not Path(vault_root).is_dir():
             self._sink({
                 "kind": "status",
@@ -1452,14 +1552,14 @@ class Launcher:
             })
             return [], [], None
 
-        core_units = []
-        core_root = resolve_vault_core_root(vault_root)
-        if core_root and Path(core_root).is_dir():
-            try:
-                core_units_list, _, _ = read_vault_units(core_root, pipeline)
-                core_units = list(core_units_list)
-            except Exception:
-                core_units = []
+        if validated_core is not None:
+            core_units = list(validated_core.units)
+        else:
+            from src.living_authenticity.knowledge.vault.core_validator import (
+                validate_and_load_core,
+            )
+            c_res = validate_and_load_core("personal_vault", paths=paths, pipeline=pipeline, vault_root=vault_root)
+            core_units = list(c_res.units)
 
         vault_context = None
         try:
@@ -1478,17 +1578,6 @@ class Launcher:
                 f"({len(vault_units)} vault unit(s), {len(core_units)} core unit(s), {vault_files} file(s) discovered, {vault_skipped} skipped)"
             ),
         })
-        if not core_units:
-            core_folder_name = Path(core_root).name if core_root else "01 Core"
-            self._sink({
-                "kind": "status",
-                "stage": "retrieval",
-                "run_id": run_id,
-                "message": (
-                    f"Vault Mode: no approved Core units found in the vault's Core directory ('{core_folder_name}'); "
-                    "proposals will transparently require human review (NEEDS_REVIEW) without automated assumptions."
-                ),
-            })
         if vault_skipped > 0:
             self._sink({
                 "kind": "status",
@@ -1528,6 +1617,39 @@ class Launcher:
             effective_retrieval = strategy_defn.name
         except UnsupportedStrategyError as exc:
             raise AdapterError("validation_error", str(exc))
+
+        # Step 0: Authoritative Pre-Flight Core Validation
+        from src.living_authenticity.knowledge.vault.core_validator import (
+            validate_and_load_core,
+            CoreResolutionError,
+        )
+        vault_dest = (
+            self.session_destination("vault")
+            or paths.get("obsidian", {}).get("vault", "")
+            or paths.get("vault", {}).get("root", "")
+        )
+        examples_dest = paths.get("examples", {}).get("root", "")
+        self._sink({
+            "kind": "stage_started",
+            "stage": "core_preflight",
+            "run_id": run_id,
+            "message": f"validating authoritative Core (mode={mode_value})",
+        })
+        validated_core = validate_and_load_core(
+            mode_value=mode_value,
+            paths=paths,
+            vault_root=vault_dest,
+            examples_root=examples_dest,
+        )
+        self._sink({
+            "kind": "stage_completed",
+            "stage": "core_preflight",
+            "run_id": run_id,
+            "message": f"authoritative Core validated: '{validated_core.title}' ({len(validated_core.units)} unit(s), sha256={validated_core.sha256[:12]})",
+            "core_id": validated_core.core_id,
+            "core_title": validated_core.title,
+            "core_sha256": validated_core.sha256,
+        })
 
         vector_components = None
         vector_service = None
@@ -1607,12 +1729,20 @@ class Launcher:
 
                     if changes.get("stale", False):
                         sync_requested = True
+                        app_req = self._vault_sync_session.request_approval(run_id=run_id)
+                        req_approval_id = str(app_req.get("approval_id", "")).strip() if isinstance(app_req, dict) else ""
+                        if not req_approval_id:
+                            raise AdapterError(
+                                "validation_error",
+                                f"Vault synchronization approval request failed to generate a valid approval_id for run '{run_id}'",
+                            )
                         pending = _PendingSyncApproval(
                             run_id=run_id,
                             vault_id=active_vault_id,
                             vault_root=str(Path(vault_dest).resolve()),
                             diff=changes,
                             manifest=getattr(self._vault_sync_session, "_manifest", {}),
+                            approval_id=req_approval_id,
                         )
                         with self._lock:
                             self._pending_vault_sync = pending
@@ -1622,6 +1752,7 @@ class Launcher:
                             "stage": "synchronization",
                             "run_id": run_id,
                             "vault_id": active_vault_id,
+                            "approval_id": req_approval_id,
                             "message": (
                                 f"Vault changes detected ({len(changes.get('added', []))} added, "
                                 f"{len(changes.get('modified', []))} modified, "
@@ -1661,7 +1792,7 @@ class Launcher:
                                     "message": "User approved persistent index synchronization; updating index explicitly.",
                                 })
                                 try:
-                                    reconcile_res = self._vault_sync_session.reconcile()
+                                    reconcile_res = self._vault_sync_session.reconcile(ticket=pending.ticket)
                                 except Exception as exc:
                                     from src.living_authenticity.security.diagnostic import (
                                         safe_exception_diagnostic,
@@ -1868,6 +1999,8 @@ class Launcher:
                     embedding_service=service,
                     db_manager=store,
                     vault_id=active_vault_id,
+                    validated_core_hash=validated_core.sha256 if validated_core is not None else "",
+                    validated_core=validated_core,
                 )
             else:
                 if not model_path:
@@ -1879,6 +2012,8 @@ class Launcher:
                     service, store, retriever = _vector.build_vector_components(
                         target_vector_db, model_path=model_path, vault_id=active_vault_id
                     )
+                    if hasattr(retriever, "set_validated_core_hash") and validated_core is not None:
+                        retriever.set_validated_core_hash(validated_core.sha256)
                 except Exception as exc:
                     raise AdapterError(
                         "validation_error",
@@ -1918,6 +2053,9 @@ class Launcher:
             )
         else:
             pipe = EvidenceFirstPipeline(stage_observer=self._sink)
+
+        if validated_core is not None and hasattr(pipe, "set_validated_core"):
+            pipe.set_validated_core(validated_core)
 
         if effective_retrieval == "semantic":
             self._sink(
@@ -2085,7 +2223,7 @@ class Launcher:
                     config=llm_config,
                 )
             corpus_units, core_units, vault_ctx = self._load_knowledge_corpus(
-                mode_value, pipe, paths, run_id=run_id
+                mode_value, pipe, paths, run_id=run_id, validated_core=validated_core
             )
             report = _integration.run_bounded_integration(
                 "",
@@ -2115,6 +2253,7 @@ class Launcher:
                 resumed_from_run_id=resumed_from_run_id,
                 resumed_from_record_id=resumed_from_record_id,
                 recoverable_errors=1 if bool(resumed_from_run_id) else 0,
+                validated_core=validated_core,
             )
             with self._lock:
                 self._vault_sync_run_info[run_id] = {
@@ -2439,9 +2578,12 @@ class Launcher:
         if status != STATUS_CONFIGURED:
             return (status, "", reason)
         from contextlib import nullcontext
-        from src.living_authenticity.knowledge.integration.guard import authorized_test_mode
+        from src.living_authenticity.knowledge.integration.guard import (
+            TestOutputAuthorizationToken,
+            authorized_test_mode,
+        )
 
-        auth_ctx = nullcontext()
+        auth_ctx: ContextManager[TestOutputAuthorizationToken | None] = nullcontext()
         if self._is_test_mode and self._test_authorizer_factory is not None:
             authorizer = self._test_authorizer_factory(f"pick_folder_{canonical}")
             auth_ctx = authorized_test_mode(authorizer)
@@ -2555,6 +2697,7 @@ class Launcher:
                 {
                     "run_id": self._pending_vault_sync.run_id,
                     "vault_id": self._pending_vault_sync.vault_id,
+                    "approval_id": self._pending_vault_sync.approval_id,
                     "diff": self._pending_vault_sync.diff,
                     "message": "Vault changes detected requiring synchronization approval",
                     "created_at": self._pending_vault_sync.created_at,
@@ -2852,6 +2995,133 @@ class Launcher:
                 "proposal_hash": prop_hash,
             }
 
+    def retry_paused_run(self, run_id: str = "") -> dict:
+        """Retry a paused run after resolving the external cause (e.g. creating/fixing Core note).
+
+        Governance invariant:
+        - Revalidates Core BEFORE clearing _paused_run.
+        - If revalidation fails, writes a new ERROR record with resumed_from_run_id and keeps _paused_run.
+        - If revalidation succeeds, clears _paused_run and starts the run with resumed_from_run_id and resumed_from_record_id.
+        """
+        from src.living_authenticity.knowledge.vault.core_validator import (
+            validate_and_load_core,
+            CoreResolutionError,
+        )
+        from src.living_authenticity.knowledge.governance.audit import AuditWriter
+        from src.living_authenticity.knowledge.governance.audit.outcome import AuditRecord
+        from src.living_authenticity.knowledge.integration.guard import (
+            resolve_authorized_audit_root,
+        )
+
+        with self._lock:
+            paused = self._paused_run
+            if not paused or (run_id and paused.get("run_id") != run_id):
+                raise AdapterError("validation_error", "no paused run matching run_id")
+            prev_run_id = paused.get("run_id", "") or run_id
+            prev_record_id = paused.get("error_record_id", "")
+            text = paused.get("input_text", "")
+            src_mode = paused.get("source_mode", self._active_source_mode)
+            ret_mode = paused.get("retrieval_mode", self._active_retrieval_mode)
+
+        paths = self.paths()
+        vault_dest = (
+            self.session_destination("vault")
+            or paths.get("obsidian", {}).get("vault", "")
+            or paths.get("vault", {}).get("root", "")
+        )
+        examples_dest = paths.get("examples", {}).get("root", "")
+
+        # Revalidate Core before clearing paused run state
+        try:
+            validate_and_load_core(
+                mode_value=src_mode,
+                paths=paths,
+                vault_root=vault_dest,
+                examples_root=examples_dest,
+            )
+        except CoreResolutionError as c_err:
+            from src.living_authenticity.security.diagnostic import (
+                safe_exception_diagnostic,
+            )
+            safe_reason, safe_errs = safe_exception_diagnostic(
+                c_err, stage="infrastructure", category="operational_error"
+            )
+            session_audit = self._session_destinations.get("audit", "")
+            auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+            if not auth_audit:
+                auth_audit = paths.get("audit", {}).get("root", "") or resolve_authorized_audit_root(paths)
+
+            new_record_id = ""
+            audit_persisted = False
+            if auth_audit and Path(auth_audit).is_dir():
+                try:
+                    from src.living_authenticity.knowledge.governance.audit.persistence import (
+                        persist_record_resilient,
+                    )
+                    writer = AuditWriter(auth_audit)
+                    rec = AuditRecord(
+                        run_id=prev_run_id,
+                        operating_mode=src_mode,
+                        terminal_outcome="infrastructure_error",
+                        validation_result="FAILED",
+                        stop_reason=safe_reason,
+                        errors=safe_errs,
+                        resumed_from_run_id=prev_run_id,
+                        resumed_from_record_id=prev_record_id,
+                    )
+                    receipt = persist_record_resilient(writer, rec)
+                    audit_persisted = bool(receipt.get("persisted", False))
+                    new_record_id = str(receipt.get("record_id", ""))
+                except Exception:
+                    audit_persisted = False
+                    new_record_id = ""
+
+            if not audit_persisted:
+                self._sink({
+                    "kind": "audit_failed",
+                    "stage": "audit",
+                    "run_id": prev_run_id,
+                    "message": "operational error audit persistence failed on retry",
+                    "audit_mode": "unconfigured" if not auth_audit else "failed",
+                    "audit_partition": "errors",
+                })
+
+            with self._lock:
+                if self._paused_run and self._paused_run.get("run_id") == prev_run_id:
+                    if new_record_id:
+                        self._paused_run["error_record_id"] = new_record_id
+                    self._paused_run["error_message"] = safe_reason
+                    self._paused_run["error_category"] = getattr(c_err.category, "value", str(c_err.category))
+                    self._paused_run["audit_persisted"] = audit_persisted
+
+            self._sink({
+                "kind": "run_rejected",
+                "stage": "paused",
+                "run_id": prev_run_id,
+                "message": f"retry failed; run paused on error: {safe_reason}",
+                "outcome": "FAILED",
+                "terminal_outcome": "infrastructure_error",
+                "recovery_options": ["retry", "fix_core", "stop"],
+                "error_category": getattr(c_err.category, "value", str(c_err.category)),
+                "audit_persisted": audit_persisted,
+            })
+            raise AdapterError("validation_error", f"Core revalidation failed: {safe_reason}") from c_err
+
+        # Successful revalidation: clear paused run state and restart
+        with self._lock:
+            self._paused_run = None
+
+        return self.start_run(
+            input_text=text,
+            source_mode=src_mode,
+            retrieval_mode=ret_mode,
+            app_language=self._app_language,
+            staging_language=self._staging_language,
+            audit_language=self._audit_language,
+            resumed_from_run_id=prev_run_id,
+            resumed_from_record_id=prev_record_id,
+        )
+
     def fix_paused_run(
         self,
         run_id: str = "",
@@ -3074,11 +3344,11 @@ class Launcher:
                 audit_root=audit_root,
                 auto_watch=False,
             )
-            if not report.get("fresh", False):
+            if report.get("status") not in ("fresh", "stale", "sync_active"):
                 err = report.get("error") or "Initial synchronization failed to produce a fresh index"
                 raise AdapterError("validation_error", f"Vault synchronization authorization failed: {err}")
             return {
-                "indexed": report.get("fresh", False),
+                "indexed": report.get("status") in ("fresh", "stale"),
                 "vault_id": report.get("vault_id", ""),
                 "files_discovered": report.get("indexed_notes", 0),
                 "notes_indexed": report.get("indexed_vectors", 0),
@@ -3099,9 +3369,27 @@ class Launcher:
         """Return the current synchronization and freshness status."""
         return self._vault_sync_session.get_status()
 
-    def reconcile_vault_sync(self) -> dict:
+    def reconcile_vault_sync(self, ticket_id: str | None = None) -> dict:
         """Explicitly reconcile changes for the authorized Vault."""
-        return self._vault_sync_session.reconcile()
+        with self._reconcile_lock:
+            if ticket_id is not None:
+                ticket = getattr(self._vault_sync_session, "_active_ticket", None)
+                if ticket is None or ticket.ticket_id != ticket_id:
+                    raise AdapterError("stale_approval", "Approval ticket is invalid, expired, or already used")
+                try:
+                    return self._vault_sync_session.reconcile(ticket=ticket)
+                except Exception as exc:
+                    raise AdapterError("reconcile_error", str(exc)) from exc
+            else:
+                changes = self._vault_sync_session.check_changes()
+                if changes.get("case_a_eligible"):
+                    try:
+                        return self._vault_sync_session.reconcile()
+                    except Exception as exc:
+                        raise AdapterError("reconcile_error", str(exc)) from exc
+                if changes.get("stale"):
+                    raise AdapterError("approval_required", "Vault changes detected; explicit operator approval required")
+                return self._vault_sync_session.reconcile()
 
     def check_vault_sync_changes(self) -> dict:
         """Inspect current Vault changes against recorded index manifest without mutating."""

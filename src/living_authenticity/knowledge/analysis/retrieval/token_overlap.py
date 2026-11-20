@@ -92,6 +92,10 @@ class TokenOverlapRetriever(KnowledgeRetriever):
         min_shared_terms: int = 1,
         max_candidates: int = 5,
         observer: Any = None,
+        validated_core_hash: str = "",
+        core_boost_factor: float = 0.0,
+        validated_core_source_path: str = "",
+        validated_core: Any = None,
     ) -> None:
         if isinstance(min_shared_terms, bool) or not isinstance(min_shared_terms, int):
             raise TypeError("min_shared_terms must be an int")
@@ -107,11 +111,33 @@ class TokenOverlapRetriever(KnowledgeRetriever):
         self._max_candidates = max_candidates
         self._name = "token_overlap"
         self._observer = observer
+        self._core_boost_factor = float(core_boost_factor) if core_boost_factor is not None else 0.0
+        self.set_validated_core(validated_core)
+
+    def set_validated_core(self, validated_core: Any) -> None:
+        from src.living_authenticity.knowledge.vault.core_validator import is_trusted_validation_context
+        val_ctx = getattr(validated_core, "validation_context", None) if validated_core is not None else None
+        if val_ctx is not None and is_trusted_validation_context(val_ctx):
+            self.validated_core = validated_core
+            self._validated_core_hash = val_ctx.core_hash
+            self._validated_core_source_path = val_ctx.source_path
+        else:
+            self.validated_core = None
+            self._validated_core_hash = ""
+            self._validated_core_source_path = ""
 
     def set_observer(self, observer: Any) -> None:
         if observer is not None and not callable(observer):
             raise TypeError("observer must be callable or None")
         self._observer = observer
+
+    def set_validated_core_hash(self, core_hash: str) -> None:
+        # Neutralized: raw hash alone cannot establish or modify validated Core authority
+        pass
+
+    def set_validated_core_source_path(self, path: str) -> None:
+        # Neutralized: raw path alone cannot establish or modify validated Core authority
+        pass
 
     @property
     def name(self) -> str:
@@ -148,6 +174,10 @@ class TokenOverlapRetriever(KnowledgeRetriever):
             min_shared_terms=self._min_shared_terms,
             max_candidates=self._max_candidates,
             observer=eff_obs,
+            validated_core_hash=self._validated_core_hash,
+            core_boost_factor=self._core_boost_factor,
+            validated_core_source_path=self._validated_core_source_path,
+            validated_core=getattr(self, "validated_core", None),
         )
         return coordinator.run(
             query, corpus, run_id=run_id, should_cancel=should_cancel

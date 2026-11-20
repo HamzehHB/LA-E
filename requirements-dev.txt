@@ -52,8 +52,12 @@ mdurl==0.1.2
     # via
     #   -c requirements.txt
     #   markdown-it-py
-msgpack==1.2.2
-    # via cachecontrol
+msgpack==1.2.3
+    # via
+    #   -r requirements-dev.in
+    #   cachecontrol
+nodeenv==1.12.0
+    # via pyright
 packageurl-python==0.17.6
     # via cyclonedx-python-lib
 packaging==26.2
@@ -89,6 +93,8 @@ pyproject-hooks==1.2.0
     # via
     #   build
     #   pip-tools
+pyright==1.1.414
+    # via -r requirements-dev.in
 pytest==9.1.1
     # via -r requirements-dev.in
 requests==2.34.2
@@ -105,6 +111,10 @@ tomli==2.4.1
     # via pip-audit
 tomli-w==1.2.0
     # via pip-audit
+typing-extensions==4.15.0
+    # via
+    #   -c requirements.txt
+    #   pyright
 urllib3==2.8.0
     # via
     #   -c requirements.txt

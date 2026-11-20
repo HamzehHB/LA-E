@@ -65,7 +65,7 @@ export interface LiveClient {
   getVaultSyncStatus(): Promise<VaultSyncStatusResponse>;
   authorizeVaultSync(vault_root?: string): Promise<VaultIndexResponse>;
   revokeVaultSync(): Promise<{ authorized: boolean; status: string }>;
-  reconcileVaultSync(): Promise<unknown>;
+  reconcileVaultSync(ticket_id?: string): Promise<unknown>;
   decideVaultSync(req: VaultSyncDecideRequest): Promise<VaultSyncDecideResponse>;
   startRun(req: RunRequest): Promise<RunResponse>;
   approve(req: ApproveRequest): Promise<ApproveResponse>;
@@ -74,6 +74,7 @@ export interface LiveClient {
   consent(req: ConsentRequest): Promise<ConsentResponse>;
   cancel(req: CancelRequest): Promise<CancelResponse>;
   fixPausedRun(req: { run_id?: string; input_text?: string; source_mode?: string; retrieval_mode?: string }): Promise<RunResponse>;
+  retryPausedRun(run_id?: string): Promise<RunResponse>;
   stopPausedRun(run_id?: string): Promise<{ stopped: boolean; run_id: string }>;
   translate(req: TranslateRequest): Promise<TranslateResponse>;
   journals(): Promise<JournalsResponse>;
@@ -206,8 +207,8 @@ class FetchLiveClient implements LiveClient {
     return this.post<{ authorized: boolean; status: string }>("/api/vault/sync/revoke", {});
   }
 
-  reconcileVaultSync(): Promise<unknown> {
-    return this.post<unknown>("/api/vault/sync/reconcile", {});
+  reconcileVaultSync(ticket_id?: string): Promise<unknown> {
+    return this.post<unknown>("/api/vault/sync/reconcile", ticket_id ? { ticket_id } : {});
   }
 
   decideVaultSync(req: VaultSyncDecideRequest): Promise<VaultSyncDecideResponse> {
@@ -241,6 +242,10 @@ class FetchLiveClient implements LiveClient {
 
   fixPausedRun(req: { run_id?: string; input_text?: string; source_mode?: string; retrieval_mode?: string }): Promise<RunResponse> {
     return this.post<RunResponse>("/api/run/fix", req);
+  }
+
+  retryPausedRun(run_id?: string): Promise<RunResponse> {
+    return this.post<RunResponse>("/api/run/retry", { run_id });
   }
 
   stopPausedRun(run_id?: string): Promise<{ stopped: boolean; run_id: string }> {
@@ -334,7 +339,7 @@ const unavailable: LiveClient = {
   getVaultSyncStatus: () => Promise.reject(new Error("connection_unavailable")),
   authorizeVaultSync: () => Promise.reject(new Error("connection_unavailable")),
   revokeVaultSync: () => Promise.reject(new Error("connection_unavailable")),
-  reconcileVaultSync: () => Promise.reject(new Error("connection_unavailable")),
+  reconcileVaultSync: (_ticket_id?: string) => Promise.reject(new Error("connection_unavailable")),
   decideVaultSync: () => Promise.reject(new Error("connection_unavailable")),
   startRun: () => Promise.reject(new Error("connection_unavailable")),
   approve: () => Promise.reject(new Error("connection_unavailable")),
@@ -343,6 +348,7 @@ const unavailable: LiveClient = {
   consent: () => Promise.reject(new Error("connection_unavailable")),
   cancel: () => Promise.reject(new Error("connection_unavailable")),
   fixPausedRun: () => Promise.reject(new Error("connection_unavailable")),
+  retryPausedRun: () => Promise.reject(new Error("connection_unavailable")),
   stopPausedRun: () => Promise.reject(new Error("connection_unavailable")),
   translate: () => Promise.reject(new Error("connection_unavailable")),
   journals: () => Promise.reject(new Error("connection_unavailable")),

@@ -179,13 +179,16 @@ def test_schema_rejects_a_destination_naming_field():
         def synthesize(self, *args, **kwargs):
             raise Unavailable("llm_unavailable")
 
-    pipe = EvidenceFirstPipeline()
     from src.living_authenticity.knowledge.ingestion.extraction.knowledge_unit import (
         KnowledgeUnit as _Unit,
     )
+    from tests._test_core_helpers import build_test_validated_core
+    cu = _Unit(id="c1", source="c", original_text="core", meaning="core", context="", proposed_type="Core", position=0, is_core=True, core_hash="mock_test_core_hash_llm", core_source_path="c")
+    val_core = build_test_validated_core([cu], source_path="c", core_hash="mock_test_core_hash_llm")
+    pipe = EvidenceFirstPipeline(validated_core=val_core)
     unit = pipe.run_unit(_Unit(
         id="q9", source="s", original_text="hello world this is",
-        meaning="hello world this is"))
+        meaning="hello world this is"), core_units=[cu])
     entries: list = []
     audits: list = []
     _handle_unit("child.md", unit, synthesis=_Failing(), entries=entries,

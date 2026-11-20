@@ -414,14 +414,66 @@ def main(argv=None) -> int:
             print("  vault units loaded: " + str(len(vault_units)))
             print("  vault files skipped: " + str(vault_skipped))
         corpus_units.extend(vault_units)
-    if core_source:
-        try:
-            core_units = ingest_units(core_source, pipe, args.max_files)
-        except ValueError as exc:
-            print("error: core ingestion failed: " + str(exc))
-            return 2
-        print("core units loaded: " + str(len(core_units)))
-        print("core access is read-only; Core is never modified")
+    if not core_source:
+        print("error: Core is mandatory; neither --core-root nor a valid vault Core directory was provided")
+        return 2
+    from src.living_authenticity.knowledge.vault.core_validator import (
+        validate_and_load_core,
+        CoreResolutionError,
+    )
+    try:
+        if core_origin == "vault":
+            val_core = validate_and_load_core(
+                "personal_vault",
+                paths=paths,
+                pipeline=pipe,
+                vault_root=paths.get("obsidian", {}).get("vault", ""),
+            )
+        else:
+            from pathlib import Path
+            from src.living_authenticity.knowledge.vault.core_validator import (
+                _validate_core_note_file,
+                resolve_schema_core_folder,
+            )
+            p_core = Path(core_source)
+            if p_core.is_file():
+                val_core = _validate_core_note_file(p_core, source_mode="cli", pipeline=pipe)
+            elif (p_core / "01-core-calibration.md").is_file():
+                val_core = _validate_core_note_file(p_core / "01-core-calibration.md", source_mode="cli", pipeline=pipe)
+            elif (p_core / "core" / "01-core-calibration.md").is_file():
+                val_core = _validate_core_note_file(p_core / "core" / "01-core-calibration.md", source_mode="cli", pipeline=pipe)
+            elif (p_core / resolve_schema_core_folder()).is_dir():
+                val_core = validate_and_load_core("personal_vault", vault_root=str(p_core), pipeline=pipe)
+            else:
+                target_dir = p_core / "core" if (p_core / "core").is_dir() else p_core
+                mds = [f for f in target_dir.iterdir() if f.is_file() and f.suffix.lower() == ".md" and not f.is_symlink()] if target_dir.is_dir() else []
+                if len(mds) == 1:
+                    val_core = _validate_core_note_file(mds[0], source_mode="cli", pipeline=pipe)
+                else:
+                    ex_root = str(p_core.parent) if p_core.name == "core" else str(p_core)
+                    val_core = validate_and_load_core(
+                        "examples",
+                        paths=paths,
+                        pipeline=pipe,
+                        examples_root=ex_root,
+                    )
+        core_units = list(val_core.units)
+        if val_core is not None:
+            if hasattr(pipe, "set_validated_core") and callable(pipe.set_validated_core):
+                pipe.set_validated_core(val_core)
+            if hasattr(pipe.retriever, "set_validated_core") and callable(pipe.retriever.set_validated_core):
+                pipe.retriever.set_validated_core(val_core)
+    except CoreResolutionError as exc:
+        print("error: Core validation failed: " + exc.safe_diagnostic)
+        return 2
+    except Exception as exc:
+        print("error: Core validation failed: " + str(exc))
+        return 2
+    if not core_units:
+        print("error: Core is mandatory; Core source contains no valid units")
+        return 2
+    print("core units loaded: " + str(len(core_units)))
+    print("core access is read-only; Core is never modified")
 
     vault_context_excerpts: list = []
     vault_context_skipped = 0
@@ -477,6 +529,7 @@ def main(argv=None) -> int:
             authorized_audit_failed=audit_failed_arg,
             staging_language=staging_lang,
             audit_language=audit_lang,
+            validated_core=val_core,
         )
     elif args.input_file.strip():
         from pathlib import Path as _Path
@@ -506,6 +559,7 @@ def main(argv=None) -> int:
             authorized_audit_failed=audit_failed_arg,
             staging_language=staging_lang,
             audit_language=audit_lang,
+            validated_core=val_core,
         )
     else:
         authorized_audit = resolve_authorized_audit_root(paths)
@@ -526,6 +580,7 @@ def main(argv=None) -> int:
             authorized_audit_failed=audit_failed_arg,
             staging_language=staging_lang,
             audit_language=audit_lang,
+            validated_core=val_core,
         )
     if not report.accepted:
         print("run rejected: " + report.rejection_reason)

@@ -15,6 +15,7 @@ trick — no arbitrary child of a guarded root can become a staging
 destination.
 """
 import asyncio
+from collections.abc import Iterator
 import contextvars
 from contextlib import contextmanager
 import hmac
@@ -201,7 +202,7 @@ def issue_test_authorizer(purpose: str = "test", harness_secret: str = "") -> Te
 
 
 @contextmanager
-def authorized_test_mode(authorizer: Any = None):
+def authorized_test_mode(authorizer: Any = None) -> Iterator[TestOutputAuthorizationToken]:
     """Explicitly controlled test-mode entry point.
 
     Requires an explicit, active TestModeAuthorizer capability instance. Ordinary callers,

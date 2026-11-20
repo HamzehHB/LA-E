@@ -64,7 +64,7 @@ class TokenOverlapCoreAnalyzer(CoreRelevanceAnalyzer):
         return self._name
 
     def analyze(
-        self, query: KnowledgeUnit, core_units: Sequence[Any]
+        self, query: KnowledgeUnit, core_units: Sequence[Any], context: Any = None
     ) -> CoreAnalysisResult:
         if not isinstance(query, KnowledgeUnit):
             raise TypeError("query must be a KnowledgeUnit")
@@ -74,6 +74,8 @@ class TokenOverlapCoreAnalyzer(CoreRelevanceAnalyzer):
         for item in cores:
             if not isinstance(item, KnowledgeUnit):
                 raise TypeError("core_units must hold KnowledgeUnit objects")
+        from src.living_authenticity.knowledge.vault.core_validator import verify_core_units_provenance
+        verify_core_units_provenance(cores, context=context)
         examined = tuple(unit.id for unit in cores)
         query_text = unit_text(query)
         if not query_text.strip():
@@ -87,12 +89,6 @@ class TokenOverlapCoreAnalyzer(CoreRelevanceAnalyzer):
             return self._result(
                 query, examined, "insufficient_evidence",
                 "Query has no content tokens; Core relevance is unresolved.",
-                (), (),
-            )
-        if not cores:
-            return self._result(
-                query, examined, "insufficient_evidence",
-                "No approved Core units were supplied; Core relevance is unresolved.",
                 (), (),
             )
         best_shared: tuple = ()

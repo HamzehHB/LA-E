@@ -67,10 +67,21 @@ def _request(server, method, path, body=None, token=None):
     return resp.status, data
 
 
+def _create_vault_base_note(vault: Path, filename: str = "note1.md", title: str = "Authentic Note", content: str = "Content for testing.") -> Path:
+    core_dir = vault / "01 Core"
+    core_dir.mkdir(parents=True, exist_ok=True)
+    note_path = core_dir / filename
+    note_path.write_text(
+        f"---\nid: authentic_core\ntitle: {title}\ncanonical_type: Core\ndraft: false\n---\n# {title}\n{content}",
+        encoding="utf-8",
+    )
+    return note_path
+
+
 def test_vault_sync_http_endpoints_lifecycle(tmp_path: Path):
     vault = tmp_path / "vault"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Authentic Note\nContent for testing.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Authentic Note", "Content for testing.")
     vdb = tmp_path / "vector_db"
     vdb.mkdir()
     staging = tmp_path / "staging"
@@ -153,6 +164,7 @@ def test_semantic_retrieval_fails_closed_when_vault_index_empty(tmp_path: Path):
     """Personal vault semantic retrieval must NOT fall back silently if index is empty."""
     vault = tmp_path / "vault"
     vault.mkdir()
+    _create_vault_base_note(vault, "note1.md", "Authentic Note", "Content for testing.")
     vdb = tmp_path / "vector_db"
     vdb.mkdir()
     staging = tmp_path / "staging"
@@ -188,7 +200,7 @@ def test_semantic_retrieval_with_authorized_vault_records_audit(tmp_path: Path):
     """Authorized vault semantic retrieval uses isolated index and records vault_id on audit."""
     vault = tmp_path / "vault"
     vault.mkdir()
-    (vault / "note.md").write_text("# Knowledge Note\nGenuine content for matching.", encoding="utf-8")
+    _create_vault_base_note(vault, "note.md", "Knowledge Note", "Genuine content for matching.")
     vdb = tmp_path / "vector_db"
     vdb.mkdir()
     staging = tmp_path / "staging"
@@ -249,7 +261,7 @@ def test_pre_retrieval_auto_reconcile_failure_halts_semantic_search(tmp_path: Pa
     """If auto-reconcile prior to semantic search is not fresh, execution must fail closed."""
     vault = tmp_path / "vault_fail_close"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nContent.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Content.")
     vdb = tmp_path / "vdb_fail_close"
     vdb.mkdir()
     staging = tmp_path / "staging_fail_close"
@@ -276,7 +288,7 @@ def test_pre_retrieval_auto_reconcile_failure_halts_semantic_search(tmp_path: Pa
     (vault / "note2.md").write_text("# Note 2\nContent 2.", encoding="utf-8")
 
     # Now make the session's reconcile fail (simulate stale or failing sync)
-    launcher._vault_sync_session.reconcile = lambda: {
+    launcher._vault_sync_session.reconcile = lambda ticket=None: {
         "authorized": True,
         "vault_id": launcher._vault_sync_session.vault_id,
         "status": "error",
@@ -302,7 +314,7 @@ def test_pre_retrieval_auto_reconcile_failure_halts_semantic_search(tmp_path: Pa
     assert pending_info["run_id"] == run_id
 
     # User explicitly approves sync; reconciliation fails closed
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve")
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id=pending_info["approval_id"])
 
     # Wait for run to fail
     for _ in range(150):
@@ -328,7 +340,7 @@ def test_authorize_endpoint_failure_fails_closed(tmp_path: Path):
     """POST /api/vault/sync/authorize must return 400 validation_error on reconciliation failure."""
     vault = tmp_path / "vault_auth_fail"
     vault.mkdir()
-    (vault / "note.md").write_text("# Note\nContent.", encoding="utf-8")
+    _create_vault_base_note(vault, "note.md", "Note", "Content.")
     vdb = tmp_path / "vdb_auth_fail"
     vdb.mkdir()
     staging = tmp_path / "staging_auth_fail"
@@ -372,7 +384,7 @@ def test_unchanged_vault_does_not_trigger_unnecessary_approval_or_writes(tmp_pat
     """An unchanged Vault does not trigger unnecessary index writes or an unnecessary approval prompt."""
     vault = tmp_path / "vault_unchanged"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nUnchanged note content.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Unchanged note content.")
     vdb = tmp_path / "vdb_unchanged"
     vdb.mkdir()
     staging = tmp_path / "staging_unchanged"
@@ -422,7 +434,7 @@ def test_changed_vault_rejection_halts_safely_without_writes_or_stale_search(tmp
     """When user rejects updating persistent index, run halts safely with outcome STOPPED, 0 writes occur, and no stale retrieval happens."""
     vault = tmp_path / "vault_reject"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nInitial content.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Initial content.")
     vdb = tmp_path / "vdb_reject"
     vdb.mkdir()
     staging = tmp_path / "staging_reject"
@@ -473,7 +485,7 @@ def test_changed_vault_rejection_halts_safely_without_writes_or_stale_search(tmp
     assert pending_info["run_id"] == run_id
 
     # Explicit rejection via decide_vault_sync
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "reject")
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "reject", approval_id=pending_info["approval_id"])
 
     # Wait for run to halt and active run to clear
     for _ in range(150):
@@ -526,7 +538,7 @@ def test_changed_vault_rejection_halts_safely_without_writes_or_stale_search(tmp
 
     pending_info2 = launcher.state().get("pending_sync_approval")
     assert pending_info2 is not None
-    launcher.decide_vault_sync(run_id2, pending_info2["vault_id"], "reject")
+    launcher.decide_vault_sync(run_id2, pending_info2["vault_id"], "reject", approval_id=pending_info2["approval_id"])
 
     for _ in range(150):
         st2 = launcher.run_status(run_id2)
@@ -545,7 +557,7 @@ def test_changed_vault_approval_performs_explicit_sync(tmp_path: Path):
     """When user approves persistent index update, explicit synchronization occurs and index becomes fresh."""
     vault = tmp_path / "vault_approve"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nInitial content.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Initial content.")
     vdb = tmp_path / "vdb_approve"
     vdb.mkdir()
     staging = tmp_path / "staging_approve"
@@ -590,7 +602,7 @@ def test_changed_vault_approval_performs_explicit_sync(tmp_path: Path):
     assert pending_info["run_id"] == run_id
 
     # User explicitly approves sync
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve")
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id=pending_info["approval_id"])
 
     # Wait for run to process past sync
     for _ in range(150):
@@ -614,7 +626,7 @@ def test_sync_approval_does_not_authorize_knowledge_proposal(tmp_path: Path):
     import time
     vault = tmp_path / "vault_prop_gov"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nContent.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Content.")
     vdb = tmp_path / "vdb_prop_gov"
     vdb.mkdir()
     staging = tmp_path / "staging_prop_gov"
@@ -652,7 +664,7 @@ def test_sync_approval_does_not_authorize_knowledge_proposal(tmp_path: Path):
 
     pending_info = launcher.state().get("pending_sync_approval")
     assert pending_info is not None
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve")
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id=pending_info["approval_id"])
 
     # Wait for run to process to proposal approval gate or completion
     for _ in range(150):
@@ -674,7 +686,7 @@ def test_changed_vault_enters_pending_and_resumes_on_approval(tmp_path: Path):
     import time
     vault = tmp_path / "vault_pending_resume"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase content.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base content.")
     vdb = tmp_path / "vdb_pending_resume"
     vdb.mkdir()
     staging = tmp_path / "staging_pending_resume"
@@ -730,7 +742,7 @@ def test_changed_vault_enters_pending_and_resumes_on_approval(tmp_path: Path):
     assert sync_status["indexed_notes"] == 1
 
     # Now human explicitly approves
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve")
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id=pending_info["approval_id"])
 
     # Wait for run to progress past sync
     for _ in range(150):
@@ -752,7 +764,7 @@ def test_single_active_run_enforced_while_pending(tmp_path: Path):
     import time
     vault = tmp_path / "vault_single_active"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base.")
     vdb = tmp_path / "vdb_single_active"
     vdb.mkdir()
     staging = tmp_path / "staging_single_active"
@@ -799,7 +811,7 @@ def test_single_active_run_enforced_while_pending(tmp_path: Path):
 
     # Clean up run 1 by rejecting
     pending_info = launcher.state()["pending_sync_approval"]
-    launcher.decide_vault_sync(run_id1, pending_info["vault_id"], "reject")
+    launcher.decide_vault_sync(run_id1, pending_info["vault_id"], "reject", approval_id=pending_info["approval_id"])
 
     launcher.close()
 
@@ -809,7 +821,7 @@ def test_duplicate_and_stale_sync_decisions_return_409(tmp_path: Path):
     import time
     vault = tmp_path / "vault_duplicate_decision"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base.")
     vdb = tmp_path / "vdb_duplicate_decision"
     vdb.mkdir()
     staging = tmp_path / "staging_duplicate_decision"
@@ -846,13 +858,14 @@ def test_duplicate_and_stale_sync_decisions_return_409(tmp_path: Path):
     pending_info = launcher.state()["pending_sync_approval"]
     assert pending_info is not None
     vault_id = pending_info["vault_id"]
+    approval_id = pending_info["approval_id"]
 
     # First decision succeeds
-    launcher.decide_vault_sync(run_id, vault_id, "reject")
+    launcher.decide_vault_sync(run_id, vault_id, "reject", approval_id=approval_id)
 
     # Second decision immediately conflicts
     with pytest.raises(AdapterError) as exc_info:
-        launcher.decide_vault_sync(run_id, vault_id, "approve")
+        launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id=approval_id)
     assert exc_info.value.kind == "conflict"
 
     launcher.close()
@@ -863,7 +876,7 @@ def test_vault_id_mismatch_returns_422(tmp_path: Path):
     import time
     vault = tmp_path / "vault_mismatch"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base.")
     vdb = tmp_path / "vdb_mismatch"
     vdb.mkdir()
     staging = tmp_path / "staging_mismatch"
@@ -897,14 +910,26 @@ def test_vault_id_mismatch_returns_422(tmp_path: Path):
             break
         time.sleep(0.1)
 
+    pending_info = launcher.state()["pending_sync_approval"]
+    approval_id = pending_info["approval_id"]
+
     # Calling with wrong vault_id
     with pytest.raises(AdapterError) as exc_info:
-        launcher.decide_vault_sync(run_id, "non_matching_vault_id_123", "approve")
+        launcher.decide_vault_sync(run_id, "non_matching_vault_id_123", "approve", approval_id=approval_id)
     assert exc_info.value.kind == "unprocessable_entity"
 
-    # Clean up
-    pending_info = launcher.state()["pending_sync_approval"]
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "reject")
+    # Calling with missing approval_id
+    with pytest.raises(AdapterError) as exc_missing:
+        launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve")
+    assert exc_missing.value.kind == "validation_error"
+
+    # Calling with mismatched approval_id
+    with pytest.raises(AdapterError) as exc_mismatch:
+        launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id="appr_wrong_correlation_id")
+    assert exc_mismatch.value.kind == "unprocessable_entity"
+
+    # Clean up with correct approval_id
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "reject", approval_id=approval_id)
     launcher.close()
 
 
@@ -913,7 +938,7 @@ def test_cancellation_before_reconciliation_linearization(tmp_path: Path):
     import time
     vault = tmp_path / "vault_cancel"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base.")
     vdb = tmp_path / "vdb_cancel"
     vdb.mkdir()
     staging = tmp_path / "staging_cancel"
@@ -984,7 +1009,7 @@ def test_cancellation_during_reconciliation(tmp_path: Path):
 
     vault = tmp_path / "vault_cancel_during_rec"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase note.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base note.")
     vdb = tmp_path / "vdb_cancel_during_rec"
     vdb.mkdir()
     staging = tmp_path / "staging_cancel_during_rec"
@@ -1014,10 +1039,10 @@ def test_cancellation_during_reconciliation(tmp_path: Path):
     reconcile_entered = threading.Event()
     continue_reconcile = threading.Event()
 
-    def intercepted_reconcile():
+    def intercepted_reconcile(ticket=None):
         reconcile_entered.set()
         continue_reconcile.wait(timeout=10.0)
-        return real_reconcile()
+        return real_reconcile(ticket=ticket)
 
     launcher._vault_sync_session.reconcile = intercepted_reconcile
 
@@ -1039,7 +1064,7 @@ def test_cancellation_during_reconciliation(tmp_path: Path):
     assert pending_info["run_id"] == run_id
 
     # User approves sync; worker will enter reconcile
-    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve")
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id=pending_info["approval_id"])
 
     # Wait for reconcile to be entered in worker thread
     assert reconcile_entered.wait(timeout=10.0), "Worker should have entered reconcile"
@@ -1096,7 +1121,7 @@ def test_api_vault_sync_decide_http_endpoint(tmp_path: Path):
     import time
     vault = tmp_path / "vault_http_decide"
     vault.mkdir()
-    (vault / "note1.md").write_text("# Note 1\nBase.", encoding="utf-8")
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base.")
     vdb = tmp_path / "vdb_http_decide"
     vdb.mkdir()
     staging = tmp_path / "staging_http_decide"
@@ -1168,9 +1193,10 @@ def test_api_vault_sync_decide_http_endpoint(tmp_path: Path):
 
         pending = state_data["pending_sync_approval"]
         assert pending["run_id"] == run_id
+        assert pending.get("approval_id")
 
-        # 5. Successful approval via HTTP
-        st, decide_body = _request(
+        # 5. Missing approval_id returns 400 Bad Request
+        st_missing, _ = _request(
             server,
             "POST",
             "/api/vault/sync/decide",
@@ -1181,11 +1207,437 @@ def test_api_vault_sync_decide_http_endpoint(tmp_path: Path):
             },
             token=token,
         )
+        assert st_missing == 400
+
+        # 6. Mismatched approval_id returns 422 Unprocessable Entity
+        st_mismatch, _ = _request(
+            server,
+            "POST",
+            "/api/vault/sync/decide",
+            body={
+                "run_id": run_id,
+                "vault_id": pending["vault_id"],
+                "decision": "approve",
+                "approval_id": "appr_mismatched_wire_id",
+            },
+            token=token,
+        )
+        assert st_mismatch == 422
+
+        # 7. Successful approval via HTTP with correct approval_id
+        st, decide_body = _request(
+            server,
+            "POST",
+            "/api/vault/sync/decide",
+            body={
+                "run_id": run_id,
+                "vault_id": pending["vault_id"],
+                "decision": "approve",
+                "approval_id": pending["approval_id"],
+            },
+            token=token,
+        )
         assert st == 200
         decide_data = json.loads(decide_body)
         assert decide_data["status"] == "ok"
         assert decide_data["decision"] == "approve"
 
+        # 8. Duplicate / stale decision returns 409 Conflict
+        st_stale, _ = _request(
+            server,
+            "POST",
+            "/api/vault/sync/decide",
+            body={
+                "run_id": run_id,
+                "vault_id": pending["vault_id"],
+                "decision": "approve",
+                "approval_id": pending["approval_id"],
+            },
+            token=token,
+        )
+        assert st_stale == 409
+
     finally:
         server.shutdown()
         launcher.close()
+
+
+def test_launcher_type_error_in_reconcile_fails_closed_without_retrying_unticketed(tmp_path: Path):
+    """When reconcile raises TypeError, Launcher fails closed and does NOT retry without a ticket."""
+    import time
+    vault = tmp_path / "vault_launcher_type_err"
+    vault.mkdir()
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Initial content.")
+    vdb = tmp_path / "vdb_launcher_type_err"
+    vdb.mkdir()
+    staging = tmp_path / "staging_launcher_type_err"
+    staging.mkdir()
+    audit = tmp_path / "audit_launcher_type_err"
+    audit.mkdir()
+
+    launcher = Launcher(
+        paths={
+            "vault": {"root": str(vault)},
+            "vector_db": {"root": str(vdb)},
+            "staging": {"root": str(staging)},
+            "audit": {"root": str(audit)},
+        },
+        llm_config={"llm": {"provider": "disabled"}},
+    )
+    launcher._embedder = DummyEmbedder()
+
+    # Authorize cleanly
+    launcher.authorize_vault_sync(str(vault))
+
+    # Add note2 to make vault stale
+    (vault / "note2.md").write_text("# Note 2\nNew content.", encoding="utf-8")
+
+    # Record all calls to reconcile
+    reconcile_calls: list[dict] = []
+    assert launcher._vault_sync_session is not None
+
+    def failing_reconcile(*args, **kwargs):
+        reconcile_calls.append({"args": args, "kwargs": kwargs})
+        raise TypeError("Simulated internal TypeError inside reconcile")
+
+    launcher._vault_sync_session.reconcile = failing_reconcile
+
+    res = launcher.start_run(
+        input_text="Synthetic query input text with enough length for launcher type error test.",
+        source_mode="personal_vault",
+        retrieval_mode="semantic",
+    )
+    run_id = res["run_id"]
+
+    # Wait for pending_sync_approval
+    for _ in range(150):
+        if launcher.state().get("pending_sync_approval"):
+            break
+        time.sleep(0.1)
+
+    pending_info = launcher.state().get("pending_sync_approval")
+    assert pending_info is not None
+
+    # Approve sync
+    launcher.decide_vault_sync(run_id, pending_info["vault_id"], "approve", approval_id=pending_info["approval_id"])
+
+    # Wait for run to fail closed
+    for _ in range(150):
+        st = launcher.run_status(run_id)
+        if st.get("terminal_outcome") or st.get("outcome") == "FAILED":
+            break
+        time.sleep(0.1)
+
+    # Reconcile was called exactly once with the ticket keyword argument
+    assert len(reconcile_calls) == 1
+    assert "ticket" in reconcile_calls[0]["kwargs"]
+    assert reconcile_calls[0]["kwargs"]["ticket"] is not None
+
+    # It was NEVER called a second time without ticket!
+    assert not any(len(c["kwargs"]) == 0 and len(c["args"]) == 0 for c in reconcile_calls)
+
+    # Run terminated safely as infrastructure_error
+    st = launcher.run_status(run_id)
+    assert st.get("terminal_outcome") == "infrastructure_error"
+    assert st.get("outcome") == "FAILED"
+    launcher.close()
+
+
+def test_mandatory_approval_identity_and_ticket_provenance_invariants(tmp_path: Path):
+    """Rigorous verification of mandatory approval identity and ticket provenance invariants."""
+    import time
+    from src.living_authenticity.adapter.app import ApprovalState
+
+    vault = tmp_path / "vault_invariants"
+    vault.mkdir()
+    _create_vault_base_note(vault, "note1.md", "Note 1", "Base content for invariants.")
+    vdb = tmp_path / "vdb_invariants"
+    vdb.mkdir()
+    staging = tmp_path / "staging_invariants"
+    staging.mkdir()
+    audit = tmp_path / "audit_invariants"
+    audit.mkdir()
+
+    launcher = Launcher(
+        paths={
+            "vault": {"root": str(vault)},
+            "vector_db": {"root": str(vdb)},
+            "staging": {"root": str(staging)},
+            "audit": {"root": str(audit)},
+        },
+        llm_config={"llm": {"provider": "disabled"}},
+    )
+    launcher._embedder = DummyEmbedder()
+    launcher.authorize_vault_sync(str(vault))
+    initial_status = launcher.get_vault_sync_status()
+    assert initial_status["fresh"] is True
+    time.sleep(0.05)
+
+    # Add a note to trigger sync staleness
+    (vault / "note2.md").write_text("# Note 2\nStale for invariants.", encoding="utf-8")
+
+    res = launcher.start_run(
+        input_text="Synthetic query input text with enough length for mandatory approval identity test.",
+        source_mode="personal_vault",
+        retrieval_mode="semantic",
+    )
+    run_id = res["run_id"]
+
+    for _ in range(150):
+        if launcher.state().get("pending_sync_approval"):
+            break
+        time.sleep(0.1)
+
+    pending_info = launcher.state().get("pending_sync_approval")
+    assert pending_info is not None
+    real_approval_id = pending_info["approval_id"]
+    vault_id = pending_info["vault_id"]
+    pending = launcher._pending_vault_sync
+    assert pending is not None
+
+    # 1. Direct fallback attempt: pending.resolve("approve", ticket=None) NEVER transitions to APPROVED
+    assert not pending.resolve("approve", ticket=None)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # 2. Missing pending approval ID fails closed
+    original_approval_id = pending.approval_id
+    try:
+        pending.approval_id = ""
+        with pytest.raises(AdapterError) as exc_missing_pending:
+            launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id=real_approval_id)
+        assert exc_missing_pending.value.kind == "validation_error"
+        assert pending.state == ApprovalState.PENDING
+    finally:
+        pending.approval_id = original_approval_id
+
+    # 3. Missing submitted approval ID is rejected (for both approve and reject)
+    with pytest.raises(AdapterError) as exc_missing_sub_appr:
+        launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id=None)
+    assert exc_missing_sub_appr.value.kind == "validation_error"
+    assert pending.state == ApprovalState.PENDING
+
+    with pytest.raises(AdapterError) as exc_missing_sub_rej:
+        launcher.decide_vault_sync(run_id, vault_id, "reject", approval_id="")
+    assert exc_missing_sub_rej.value.kind == "validation_error"
+    assert pending.state == ApprovalState.PENDING
+
+    # 4. Mismatched approval ID is rejected (for both approve and reject)
+    with pytest.raises(AdapterError) as exc_mismatch_appr:
+        launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id="appr_completely_wrong_id")
+    assert exc_mismatch_appr.value.kind == "unprocessable_entity"
+    assert pending.state == ApprovalState.PENDING
+
+    with pytest.raises(AdapterError) as exc_mismatch_rej:
+        launcher.decide_vault_sync(run_id, vault_id, "reject", approval_id="appr_completely_wrong_id")
+    assert exc_mismatch_rej.value.kind == "unprocessable_entity"
+    assert pending.state == ApprovalState.PENDING
+
+    # 5. Missing VaultSyncSession fails closed on approval
+    saved_session = launcher._vault_sync_session
+    try:
+        setattr(launcher, "_vault_sync_session", None)
+        with pytest.raises(AdapterError) as exc_missing_session:
+            launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id=real_approval_id)
+        assert exc_missing_session.value.kind == "conflict"
+        assert pending.state == ApprovalState.PENDING
+    finally:
+        setattr(launcher, "_vault_sync_session", saved_session)
+
+    # 6. Correct approval ID with a valid session produces a valid ticket and succeeds
+    decide_res = launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id=real_approval_id)
+    assert decide_res["status"] == "ok"
+    assert decide_res["decision"] == "approve"
+    assert decide_res["ticket_id"] is not None
+    assert pending.state == ApprovalState.APPROVED
+    assert pending.ticket is not None
+    assert pending.ticket.ticket_id == decide_res["ticket_id"]
+    assert pending.ticket.approval_id == real_approval_id
+
+    # 7. Duplicate decision on already decided pending approval is rejected (409 Conflict)
+    with pytest.raises(AdapterError) as exc_dup:
+        launcher.decide_vault_sync(run_id, vault_id, "approve", approval_id=real_approval_id)
+    assert exc_dup.value.kind == "conflict"
+
+    # Wait for run to progress
+    for _ in range(150):
+        st = launcher.run_status(run_id)
+        if st.get("processed", 0) > 0 or st.get("outcome") or launcher._active_run_id != run_id:
+            break
+        time.sleep(0.1)
+
+    # 8. Rejection remains possible with the correct approval ID on a new pending approval
+    (vault / "note3.md").write_text("# Note 3\nTrigger second staleness.", encoding="utf-8")
+    res2 = launcher.start_run(
+        input_text="Synthetic query input text for rejection verification path in invariants test.",
+        source_mode="personal_vault",
+        retrieval_mode="semantic",
+    )
+    run_id2 = res2["run_id"]
+    for _ in range(150):
+        if launcher.state().get("pending_sync_approval"):
+            break
+        time.sleep(0.1)
+
+    pending_info2 = launcher.state().get("pending_sync_approval")
+    assert pending_info2 is not None
+    real_approval_id2 = pending_info2["approval_id"]
+    pending2 = launcher._pending_vault_sync
+    assert pending2 is not None
+
+    reject_res = launcher.decide_vault_sync(run_id2, pending_info2["vault_id"], "reject", approval_id=real_approval_id2)
+    assert reject_res["status"] == "ok"
+    assert reject_res["decision"] == "reject"
+    assert reject_res["ticket_id"] is None
+    assert pending2.state == ApprovalState.REJECTED
+    assert pending2.ticket is None
+
+    launcher.close()
+
+
+def test_pending_sync_approval_state_transition_boundary_invariants():
+    """Verify ticket-to-pending binding invariants directly at the state-transition boundary."""
+    import time
+    from src.living_authenticity.adapter.app import ApprovalState, _PendingSyncApproval
+    from src.living_authenticity.knowledge.vault.sync import VaultSyncApprovalTicket
+
+    run_id = "run-state-boundary-1"
+    vault_id = "vault-boundary-1"
+    vault_root = "/nonexistent/test/vault"
+    approval_id = "appr-valid-boundary-1"
+    diff = {"added": [], "modified": ["note.md"], "removed": []}
+
+    def _make_ticket(
+        t_id="ticket-1",
+        v_id=vault_id,
+        v_root=vault_root,
+        r_id=run_id,
+        appr_id=approval_id,
+        dec="approve",
+        expired=False,
+        consumed=False,
+    ):
+        ticket = VaultSyncApprovalTicket(
+            ticket_id=t_id,
+            vault_id=v_id,
+            vault_root=v_root,
+            run_id=r_id,
+            snapshot_fingerprint="snap_1",
+            core_hash="core_1",
+            diff_fingerprint="diff_1",
+            expires_at=time.time() - 10.0 if expired else time.time() + 60.0,
+            session_id="session_1",
+            approval_id=appr_id,
+            decision=dec,
+        )
+        if consumed:
+            ticket._consumed = True
+        return ticket
+
+    # 1. resolve("approve", ticket=None) fails and leaves state PENDING
+    pending = _PendingSyncApproval(run_id=run_id, vault_id=vault_id, vault_root=vault_root, diff=diff, approval_id=approval_id)
+    assert pending.state == ApprovalState.PENDING
+    assert not pending.resolve("approve", ticket=None)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # 2. An invalid (expired) ticket fails and leaves state PENDING
+    expired_ticket = _make_ticket(expired=True)
+    assert not expired_ticket.is_valid()
+    assert not pending.resolve("approve", ticket=expired_ticket)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # An invalid (consumed) ticket fails and leaves state PENDING
+    consumed_ticket = _make_ticket(consumed=True)
+    assert not consumed_ticket.is_valid()
+    assert not pending.resolve("approve", ticket=consumed_ticket)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # 3. A valid ticket belonging to another approval fails and leaves state PENDING
+    mismatched_appr_ticket = _make_ticket(appr_id="appr-different-id-999")
+    assert mismatched_appr_ticket.is_valid()
+    assert not pending.resolve("approve", ticket=mismatched_appr_ticket)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # 4. A valid ticket with a mismatched run ID fails and leaves state PENDING
+    mismatched_run_ticket = _make_ticket(r_id="run-different-run-888")
+    assert mismatched_run_ticket.is_valid()
+    assert not pending.resolve("approve", ticket=mismatched_run_ticket)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # 5. A valid ticket with a mismatched Vault ID fails and leaves state PENDING
+    mismatched_vault_ticket = _make_ticket(v_id="vault-different-vault-777")
+    assert mismatched_vault_ticket.is_valid()
+    assert not pending.resolve("approve", ticket=mismatched_vault_ticket)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # A valid ticket with non-approve decision fails and leaves state PENDING
+    reject_decision_ticket = _make_ticket(dec="reject")
+    assert not pending.resolve("approve", ticket=reject_decision_ticket)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # Tickets missing mandatory identity fields fail closed unconditionally
+    ticket_missing_run = _make_ticket()
+    delattr(ticket_missing_run, "run_id")
+    assert not pending.resolve("approve", ticket=ticket_missing_run)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    ticket_missing_vault = _make_ticket()
+    delattr(ticket_missing_vault, "vault_id")
+    assert not pending.resolve("approve", ticket=ticket_missing_vault)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    ticket_missing_appr = _make_ticket()
+    delattr(ticket_missing_appr, "approval_id")
+    assert not pending.resolve("approve", ticket=ticket_missing_appr)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    ticket_missing_dec = _make_ticket()
+    delattr(ticket_missing_dec, "decision")
+    assert not pending.resolve("approve", ticket=ticket_missing_dec)
+    assert pending.state == ApprovalState.PENDING
+    assert pending.ticket is None
+
+    # Pending without approval_id cannot transition to APPROVED even with a valid ticket
+    empty_appr_pending = _PendingSyncApproval(run_id=run_id, vault_id=vault_id, vault_root=vault_root, diff=diff, approval_id="")
+    valid_ticket = _make_ticket()
+    assert not empty_appr_pending.resolve("approve", ticket=valid_ticket)
+    assert empty_appr_pending.state == ApprovalState.PENDING
+
+    # 6. A correctly bound valid ticket succeeds and transitions to APPROVED
+    assert valid_ticket.is_valid()
+    assert pending.resolve("approve", ticket=valid_ticket)
+    assert pending.state == ApprovalState.APPROVED
+    assert pending.ticket is valid_ticket
+
+    # 7. Repeated approval or rejection attempts fail once decided
+    assert not pending.resolve("approve", ticket=valid_ticket)
+    assert pending.state == ApprovalState.APPROVED
+    assert not pending.resolve("reject")
+    assert pending.state == ApprovalState.APPROVED
+
+    # 8. Rejection remains possible without issuing a ticket
+    pending_rej = _PendingSyncApproval(run_id=run_id, vault_id=vault_id, vault_root=vault_root, diff=diff, approval_id=approval_id)
+    assert pending_rej.state == ApprovalState.PENDING
+    assert pending_rej.resolve("reject", ticket=None)
+    assert pending_rej.state == ApprovalState.REJECTED
+    assert pending_rej.ticket is None
+
+    # Repeated decision on rejected pending fails
+    assert not pending_rej.resolve("approve", ticket=valid_ticket)
+    assert pending_rej.state == ApprovalState.REJECTED
+
+    # 9. Cancellation also works cleanly without ticket
+    pending_canc = _PendingSyncApproval(run_id=run_id, vault_id=vault_id, vault_root=vault_root, diff=diff, approval_id=approval_id)
+    assert pending_canc.resolve("cancelled")
+    assert pending_canc.state == ApprovalState.CANCELLED
+    assert pending_canc.ticket is None

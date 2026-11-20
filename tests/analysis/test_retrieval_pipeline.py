@@ -339,6 +339,7 @@ class TestRetrievalCoordinator:
 
         doc1 = "The quiet morning facilitates deep reflection and research."
         manager.store(doc1, service.embed(doc1), {"source": "vault/doc1.md", "position": 2})
+        manager.save_metadata({"status": "fresh", "indexed_vectors": 1})
 
         events = []
         retriever = LanceDBVectorRetriever(

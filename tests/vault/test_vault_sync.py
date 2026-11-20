@@ -11,11 +11,17 @@ Verifies:
 """
 import time
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 import pytest
 
 from src.living_authenticity.database.lancedb_manager import (
     DatabaseOperationError,
     LanceDBManager,
+)
+from src.living_authenticity.knowledge.vault.core_validator import (
+    CoreResolutionError,
+    CoreFailureCategory,
+    ValidatedCore,
 )
 from src.living_authenticity.knowledge.vault.identity import (
     compute_vault_id,
@@ -24,6 +30,8 @@ from src.living_authenticity.knowledge.vault.identity import (
 from src.living_authenticity.knowledge.vault.sync import (
     VaultSyncSession,
     VaultSyncError,
+    VaultSyncSchemaResolutionError,
+    VaultSyncUnauthorizedError,
     SYNC_STATE_UNAUTHORIZED,
     SYNC_STATE_AUTHORIZING,
     SYNC_STATE_FRESH,
@@ -43,6 +51,12 @@ class DummyEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return [0.01] * 1024
+
+
+def _approve_and_reconcile(session: VaultSyncSession, run_id: str = "test_run") -> dict:
+    req = session.request_approval(run_id=run_id)
+    session.resolve_approval(req["approval_id"], "approve")
+    return session.reconcile(ticket=session._active_ticket)
 
 
 def test_vault_id_and_resolution_boundary(tmp_path: Path):
@@ -176,7 +190,9 @@ def test_incremental_change_detection_lifecycle(tmp_path: Path):
     note2 = vault / "note2.md"
     note2.write_text("# Note 2\nSecond note with genuine content.", encoding="utf-8")
 
-    rep2 = session.reconcile()
+    with pytest.raises(VaultSyncUnauthorizedError):
+        session.reconcile()
+    rep2 = _approve_and_reconcile(session, run_id="run_add")
     assert rep2["added"] == 1
     assert rep2["indexed_notes"] == 2
     assert rep2["indexed_vectors"] > initial_vectors
@@ -186,13 +202,17 @@ def test_incremental_change_detection_lifecycle(tmp_path: Path):
     time.sleep(0.05)
     note1.write_text("# Note 1 Modified\nUpdated content with more detail.", encoding="utf-8")
 
-    rep3 = session.reconcile()
+    with pytest.raises(VaultSyncUnauthorizedError):
+        session.reconcile()
+    rep3 = _approve_and_reconcile(session, run_id="run_mod")
     assert rep3["modified"] == 1
     assert rep3["indexed_notes"] == 2
 
     # 4. Delete second note
     note2.unlink()
-    rep4 = session.reconcile()
+    with pytest.raises(VaultSyncUnauthorizedError):
+        session.reconcile()
+    rep4 = _approve_and_reconcile(session, run_id="run_del")
     assert rep4["removed"] == 1
     assert rep4["indexed_notes"] == 1
 
@@ -318,8 +338,12 @@ def test_authorization_does_not_start_background_watcher(tmp_path: Path):
     assert status_unreconciled["sync_active"] is False
     assert status_unreconciled["indexed_notes"] == 1
 
-    # Explicit operator reconciliation indexes the new note
-    reconcile_res = session.reconcile()
+    # Direct reconciliation without approval is rejected
+    with pytest.raises(VaultSyncUnauthorizedError):
+        session.reconcile()
+
+    # Explicit operator reconciliation with approval indexes the new note
+    reconcile_res = _approve_and_reconcile(session, run_id="run_manual")
     assert reconcile_res["fresh"] is True
     assert reconcile_res["indexed_notes"] == 2
 
@@ -469,9 +493,11 @@ def test_metadata_save_failure_halts_freshness(tmp_path: Path):
         ),
     )
 
-    # Add another note and reconcile
+    # Add another note and reconcile with approval
     (vault / "note2.md").write_text("# Note 2\nContent 2.", encoding="utf-8")
-    rep = session.reconcile()
+    req = session.request_approval(run_id="run_meta_fail")
+    session.resolve_approval(req["approval_id"], "approve")
+    rep = session.reconcile(ticket=session._active_ticket)
 
     assert rep["fresh"] is False
     assert session.status == SYNC_STATE_FAILED
@@ -507,7 +533,9 @@ def test_database_delete_failure_on_reconcile_halts_freshness(tmp_path: Path):
 
     # Add a modified or new note to trigger delete_source during reconcile
     (vault / "note1.md").write_text("# Note 1 Updated\nUpdated content.", encoding="utf-8")
-    rep = session.reconcile()
+    req = session.request_approval(run_id="run_del_fail")
+    session.resolve_approval(req["approval_id"], "approve")
+    rep = session.reconcile(ticket=session._active_ticket)
 
     assert rep["fresh"] is False
     assert session.status == SYNC_STATE_FAILED
@@ -568,3 +596,238 @@ def test_check_changes_inspects_freshness_without_modifying_database(tmp_path: P
     assert "note2.md" not in diff_del["added"]
 
     session.close()
+
+
+def test_schema_resolution_failure_prevents_core_path_from_entering_ordinary_indexing(tmp_path: Path):
+    """Fail-closed boundary: schema resolution failure must raise VaultSyncSchemaResolutionError
+
+    and must NEVER allow a Core-path note to be ingested or indexed as an ordinary note.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+    core_dir = vault / "01 Core"
+    core_dir.mkdir()
+    core_file = core_dir / "thesis.md"
+    core_file.write_text("# Core Thesis\nContent", encoding="utf-8")
+
+    session = VaultSyncSession()
+    session._vault_root = str(vault)
+    session._vault_id = "test_vault"
+    session._vector_db_root = str(vdb)
+    session._embedder = DummyEmbedder()
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+    session._pipeline = EvidenceFirstPipeline()
+    session._store = MagicMock()
+
+    schema_err = CoreResolutionError(
+        CoreFailureCategory.SCHEMA_UNAVAILABLE,
+        "Simulated schema resolution failure: file unreadable",
+    )
+
+    with patch(
+        "src.living_authenticity.knowledge.vault.core_validator.resolve_schema_core_folder",
+        side_effect=schema_err,
+    ):
+        with pytest.raises(VaultSyncSchemaResolutionError) as exc_info:
+            session._index_single_file(core_file, validated_core=None)
+
+        assert "Core schema resolution failed while classifying note" in str(exc_info.value)
+        assert "Simulated schema resolution failure" in str(exc_info.value)
+
+    # Verify store was never called to store an ordinary note
+    session._store.store.assert_not_called()
+
+
+def test_core_note_without_validated_core_context_fails_closed(tmp_path: Path):
+    """Core-path note cannot be indexed without active validated_core context."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+    core_dir = vault / "01 Core"
+    core_dir.mkdir()
+    core_file = core_dir / "thesis.md"
+    core_file.write_text("# Core Thesis\nContent", encoding="utf-8")
+
+    session = VaultSyncSession()
+    session._vault_root = str(vault)
+    session._vault_id = "test_vault"
+    session._vector_db_root = str(vdb)
+    session._embedder = DummyEmbedder()
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+    session._pipeline = EvidenceFirstPipeline()
+    session._store = MagicMock()
+
+    with pytest.raises(VaultSyncError, match="without validated_core context"):
+        session._index_single_file(core_file, validated_core=None)
+
+    session._store.store.assert_not_called()
+
+
+def test_extraneous_core_note_mismatch_with_validated_core_fails_closed(tmp_path: Path):
+    """Extraneous Core notes that do not match active validated_core must fail closed."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+    core_dir = vault / "01 Core"
+    core_dir.mkdir()
+    core_auth = core_dir / "authoritative.md"
+    core_auth.write_text("# Authoritative Core\nContent", encoding="utf-8")
+    core_rogue = core_dir / "rogue.md"
+    core_rogue.write_text("# Rogue Core\nContent", encoding="utf-8")
+
+    session = VaultSyncSession()
+    session._vault_root = str(vault)
+    session._vault_id = "test_vault"
+    session._vector_db_root = str(vdb)
+    session._embedder = DummyEmbedder()
+    from src.living_authenticity.knowledge.orchestration import EvidenceFirstPipeline
+    session._pipeline = EvidenceFirstPipeline()
+    session._store = MagicMock()
+
+    fake_core = MagicMock(
+        path=core_auth,
+        sha256="abc123hash",
+        title="Authoritative Core",
+        units=(),
+    )
+
+    with pytest.raises(VaultSyncError, match="extraneous or mismatched Core note"):
+        session._index_single_file(core_rogue, validated_core=fake_core)
+
+    session._store.store.assert_not_called()
+
+
+def test_reconcile_fails_closed_on_schema_resolution_failure(tmp_path: Path):
+    """reconcile() must immediately raise VaultSyncSchemaResolutionError when schema resolution fails."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+
+    session = VaultSyncSession()
+    session.authorize(vault_root=str(vault), vector_db_root=str(vdb), embedder=DummyEmbedder(), auto_watch=False)
+
+    core_dir = vault / "01 Core"
+    core_dir.mkdir()
+    (core_dir / "thesis.md").write_text("# Core\nContent", encoding="utf-8")
+
+    schema_err = CoreResolutionError(
+        CoreFailureCategory.SCHEMA_UNAVAILABLE,
+        "Simulated schema resolution failure: corrupt schema",
+    )
+
+    with patch(
+        "src.living_authenticity.knowledge.vault.core_validator.resolve_schema_core_folder",
+        side_effect=schema_err,
+    ):
+        with pytest.raises(VaultSyncSchemaResolutionError) as exc_info:
+            session.reconcile()
+
+        assert "Core schema resolution failed during reconciliation" in str(exc_info.value)
+        assert session.status == SYNC_STATE_FAILED
+
+
+def test_confirmed_ordinary_note_indexing_succeeds(tmp_path: Path):
+    """Ordinary notes residing outside Core path are ingested and stored cleanly as non-core."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+
+    session = VaultSyncSession()
+    session.authorize(vault_root=str(vault), vector_db_root=str(vdb), embedder=DummyEmbedder(), auto_watch=False)
+
+    notes_dir = vault / "02 Notes"
+    notes_dir.mkdir()
+    note_file = notes_dir / "note.md"
+    note_file.write_text("# Ordinary Note\nClean content.", encoding="utf-8")
+
+    count = session._index_single_file(note_file, validated_core=None)
+    assert count > 0
+
+    assert session._store is not None
+    rows = session._store.show_all()
+    assert len(rows) == count
+    for r in rows:
+        assert r["is_core"] is False
+        assert r["core_hash"] == ""
+        assert not str(r.get("id", "")).startswith("core_vec_")
+
+
+def test_check_changes_surfaces_classification_failure_when_schema_resolution_succeeded(tmp_path: Path):
+    """When schema resolution succeeded, an unexpected failure in is_core_relative_path()
+
+    must raise VaultSyncSchemaResolutionError and must not silently fall back or place the note in ordinary_changes.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+
+    session = VaultSyncSession()
+    session.authorize(vault_root=str(vault), vector_db_root=str(vdb), embedder=DummyEmbedder(), auto_watch=False)
+
+    core_dir = vault / "01 Core"
+    core_dir.mkdir()
+    (core_dir / "thesis.md").write_text("# Core\nContent", encoding="utf-8")
+
+    class_err = CoreResolutionError(
+        CoreFailureCategory.SCHEMA_UNAVAILABLE,
+        "Simulated unexpected classification failure in is_core_relative_path",
+    )
+
+    with patch(
+        "src.living_authenticity.knowledge.vault.core_validator.is_core_relative_path",
+        side_effect=class_err,
+    ):
+        with pytest.raises(VaultSyncSchemaResolutionError) as exc_info:
+            session.check_changes()
+
+        assert "Core path classification failed for" in str(exc_info.value)
+        assert "thesis.md" in str(exc_info.value)
+        assert "Simulated unexpected classification failure" in str(exc_info.value)
+
+
+def test_check_changes_canonical_core_fallback_when_schema_resolution_already_failed(tmp_path: Path):
+    """When schema resolution has already failed, canonical '01 Core' fallback activates deliberately,
+
+    ensuring files under '01 Core' enter core_changes and NEVER enter ordinary_changes.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    vdb = tmp_path / "vdb"
+    vdb.mkdir()
+
+    session = VaultSyncSession()
+    session.authorize(vault_root=str(vault), vector_db_root=str(vdb), embedder=DummyEmbedder(), auto_watch=False)
+
+    core_dir = vault / "01 Core"
+    core_dir.mkdir()
+    (core_dir / "thesis.md").write_text("# Core\nContent", encoding="utf-8")
+    notes_dir = vault / "02 Notes"
+    notes_dir.mkdir()
+    (notes_dir / "note.md").write_text("# Ordinary\nContent", encoding="utf-8")
+
+    schema_err = CoreResolutionError(
+        CoreFailureCategory.SCHEMA_UNAVAILABLE,
+        "Corrupt schema resolution failure",
+    )
+
+    with patch(
+        "src.living_authenticity.knowledge.vault.core_validator.resolve_schema_core_folder",
+        side_effect=schema_err,
+    ):
+        changes = session.check_changes()
+
+    assert changes["core_valid"] is False
+    assert changes["stale"] is True
+    core_added_normalized = [p.replace("\\", "/") for p in changes["core_changes"]["added"]]
+    ord_added_normalized = [p.replace("\\", "/") for p in changes["ordinary_changes"]["added"]]
+    assert "01 Core/thesis.md" in core_added_normalized
+    assert "01 Core/thesis.md" not in ord_added_normalized
+    assert "02 Notes/note.md" in ord_added_normalized
+    assert "02 Notes/note.md" not in core_added_normalized

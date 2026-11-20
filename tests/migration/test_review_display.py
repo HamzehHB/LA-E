@@ -38,6 +38,50 @@ def _unit():
                          normalized_text=_TEXT)
 
 
+from tests._test_core_helpers import build_test_validated_core
+
+
+def _pipeline_with_core(core_u):
+    val_core = build_test_validated_core([core_u], source_path=core_u.source, core_hash=core_u.core_hash)
+    return EvidenceFirstPipeline(validated_core=val_core)
+
+
+def _core_unit():
+    core_text = "Method:\nA calibrated method for authentic observation and synthesis.\n"
+    return KnowledgeUnit(
+        id="core1",
+        source="core",
+        original_text=core_text,
+        meaning=core_text,
+        cleaned_text=core_text,
+        normalized_text=core_text,
+        context="",
+        proposed_type="Method",
+        position=0,
+        is_core=True,
+        core_hash="mock_test_core_hash_rd1",
+        core_source_path="core",
+    )
+
+
+def _core_unit_overlapping():
+    core_text = "Observation:\nI observed reading a short summary before opening documents.\n"
+    return KnowledgeUnit(
+        id="core2",
+        source="core",
+        original_text=core_text,
+        meaning=core_text,
+        cleaned_text=core_text,
+        normalized_text=core_text,
+        context="",
+        proposed_type="Observation",
+        position=0,
+        is_core=True,
+        core_hash="mock_test_core_hash_rd2",
+        core_source_path="core",
+    )
+
+
 def _candidate(**overrides):
     entry = {"title": "Morning reading habit and context switching",
              "body": ("Starting the day with a short summary before opening long documents "
@@ -90,7 +134,8 @@ def _render(unit_result, staged):
 
 
 def test_review_block_shows_every_stage_and_the_verbatim_text():
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     staged = "# Morning writing and attention\n\nBody.\n"
     block = _render(unit_result, staged)
     for label in ("Source", "Title", "Suggested action", "Confidence", "Why",
@@ -107,7 +152,8 @@ def test_llm_synthesis_runs_and_produces_valid_candidate(tmp_path):
     """LLM synthesis runs and produces a validated candidate regardless of proposal action."""
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit_overlapping()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     assert unit_result is not None
     provider = _FakeProvider(_candidate())
     details: list = []
@@ -136,7 +182,8 @@ def test_interactive_review_called_only_for_create_proposals(monkeypatch, capsys
     """The approval reader is only invoked for CREATE proposals (correct behavior)."""
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit_overlapping()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     assert unit_result is not None
     
     # First, check what proposal action was generated
@@ -178,7 +225,8 @@ def test_interactive_review_called_only_for_create_proposals(monkeypatch, capsys
 def test_invalid_llm_output_stops_the_unit_with_the_right_reason(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     for raw in ("not json at all", "{}", ""):
         entries: list = []
         audits: list = []
@@ -198,7 +246,8 @@ def test_invalid_llm_output_stops_the_unit_with_the_right_reason(tmp_path):
 def test_missing_fields_and_bad_types_are_invalid_output(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     missing = json.dumps({"candidates": [
         {"title": "t", "body": "b", "suggested_type": "Concept"}]})
     for raw in (missing, _candidate(body=""), _candidate(body=5)):
@@ -213,7 +262,8 @@ def test_missing_fields_and_bad_types_are_invalid_output(tmp_path):
 def test_unavailable_provider_stops_the_unit_safely(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     entries: list = []
     audits: list = []
     _handle_unit("note.md", unit_result, entries=entries, audits=audits,
@@ -233,7 +283,8 @@ def test_unavailable_provider_stops_the_unit_safely(tmp_path):
 def test_timeout_maps_to_the_timeout_reason(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     entries: list = []
     _handle_unit("note.md", unit_result, entries=entries, audits=[],
                  approval_reader=lambda: "y",
@@ -247,7 +298,8 @@ def test_the_llm_stage_cannot_be_bypassed(tmp_path):
     """No synthesis collaborator means the mandatory stage cannot run."""
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     entries: list = []
     try:
         _handle_unit("note.md", unit_result, entries=entries, audits=[],
@@ -269,7 +321,8 @@ def test_non_create_proposal_exposes_full_inspectable_information(tmp_path):
     """
     staging = tmp_path / "staging"
     staging.mkdir()
-    unit_result = EvidenceFirstPipeline().run_unit(_unit())
+    cu = _core_unit_overlapping()
+    unit_result = _pipeline_with_core(cu).run_unit(_unit(), core_units=[cu])
     assert unit_result is not None
     assert unit_result.proposal.action != "CREATE", (
         "this test must exercise a non-CREATE proposal")

@@ -203,6 +203,7 @@ def test_persistent_vector_store_immutability(tmp_path):
     doc2 = "Second existing note on analytical evidence."
     manager.store(doc1, embedder.embed(doc1), {"source": "note1.md"})
     manager.store(doc2, embedder.embed(doc2), {"source": "note2.md"})
+    manager.save_metadata({"status": "fresh", "indexed_vectors": 2})
 
     records_before = manager.show_all()
     assert len(records_before) == 2

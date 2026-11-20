@@ -1,6 +1,7 @@
 """Full-chain dataflow: identity passes stage to stage, LLM stops safe."""
 import json
 
+from tests._test_core_helpers import build_test_validated_core
 from src.living_authenticity.knowledge.orchestration.orchestrator import (
     EvidenceFirstPipeline,
 )
@@ -14,6 +15,10 @@ def _unit():
                          meaning="alpha beta gamma delta epsilon")
 
 
+def _core_unit():
+    return KnowledgeUnit(id="c1", source="core", original_text="core", meaning="core", context="", proposed_type="Core", position=0, is_core=True, core_hash="mock_test_core_hash_mig1", core_source_path="core")
+
+
 def test_stage_identity_and_llm_safe_stop():
     from src.living_authenticity.knowledge.integration.unit_loop import (
         _handle_unit, _synthesize_candidates,
@@ -22,8 +27,10 @@ def test_stage_identity_and_llm_safe_stop():
         LLMUnavailable, Synthesis, build_llm_context,
     )
 
-    pipe = EvidenceFirstPipeline()
-    unit = pipe.run_unit(_unit())
+    core_u = _core_unit()
+    val_core = build_test_validated_core([core_u], source_path="core", core_hash=core_u.core_hash)
+    pipe = EvidenceFirstPipeline(validated_core=val_core)
+    unit = pipe.run_unit(_unit(), core_units=[core_u])
     assert unit is not None
     prompt = build_llm_context(
         unit.query_unit, unit.proposal, unit.classification,

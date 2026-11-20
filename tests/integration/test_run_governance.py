@@ -17,7 +17,10 @@ def _write(directory, name, text=SAMPLE):
 
 
 def _run(source, staging, spy=None, audit_root=None):
-    cores = [_core()]
+    from tests._test_core_helpers import build_test_validated_core
+    raw_core = _core()
+    val_core = build_test_validated_core([raw_core], source_path="core", core_hash="mock_test_core_hash_run_gov")
+    cores = list(val_core.units)
     synthesis = SyntheticSynthesis()
     if audit_root is None:
         audit_root = str(Path(staging).parent / "audit")
@@ -26,11 +29,13 @@ def _run(source, staging, spy=None, audit_root=None):
         return run_bounded_integration(
             source, staging, guarded_roots=(), approval_reader=_yes,
             core_units=cores, max_files=1, executor=spy,
-            synthesis=synthesis, audit_root=audit_root, authorized_audit_root=audit_root)
+            synthesis=synthesis, audit_root=audit_root, authorized_audit_root=audit_root,
+            validated_core=val_core)
     return run_bounded_integration(
         source, staging, guarded_roots=(), approval_reader=_yes,
         core_units=cores, max_files=1, synthesis=synthesis,
-        audit_root=audit_root, authorized_audit_root=audit_root)
+        audit_root=audit_root, authorized_audit_root=audit_root,
+        validated_core=val_core)
 
 
 def _layouts(tmp_path):
@@ -59,6 +64,7 @@ def _core():
         meaning=CORE_SAMPLE, cleaned_text=CORE_SAMPLE,
         normalized_text=CORE_SAMPLE,
         context="", proposed_type="", position=0,
+        is_core=True, core_hash="mock_test_core_hash_run_gov", core_source_path="core",
     )
 
 

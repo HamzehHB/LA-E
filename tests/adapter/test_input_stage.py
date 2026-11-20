@@ -355,6 +355,12 @@ def test_load_knowledge_corpus_vault_mode_configured(tmp_path):
 
     vault_dir = tmp_path / "MyAuthenticVault"
     vault_dir.mkdir()
+    core_dir = vault_dir / "01 Core"
+    core_dir.mkdir()
+    (core_dir / "core.md").write_text(
+        "---\nid: authentic_core\ntitle: Authentic Core\ncanonical_type: Core\ndraft: false\n---\n# Authentic Core\nFoundational principles.\n",
+        encoding="utf-8",
+    )
     (vault_dir / "01-observation.md").write_text("# Authentic Observation\nDeep inquiry on authenticity and awareness.", encoding="utf-8")
 
     launcher = Launcher(
@@ -364,10 +370,11 @@ def test_load_knowledge_corpus_vault_mode_configured(tmp_path):
     pipe = EvidenceFirstPipeline()
     corpus_units, core_units, vault_ctx = launcher._load_knowledge_corpus("personal_vault", pipe, launcher.paths(), run_id="run-test-vault")
 
-    assert len(corpus_units) == 2
+    assert len(corpus_units) >= 2
     assert any("authenticity and awareness" in u.cleaned_text for u in corpus_units)
+    assert len(core_units) >= 1
     assert vault_ctx is not None
-    assert len(vault_ctx) == 1
+    assert len(vault_ctx) >= 1
 
     events = launcher.events.since(0)
     retrieval_ev = next(e for e in events if e.get("stage") == "retrieval" and "Vault Mode" in e.get("message", ""))

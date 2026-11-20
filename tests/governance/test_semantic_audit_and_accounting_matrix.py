@@ -77,9 +77,16 @@ def _make_core_sample():
         cleaned_text=sample,
         normalized_text=sample,
         context="",
-        proposed_type="Method",
+        proposed_type="Core",
         position=0,
+        is_core=True,
+        core_hash="mock_test_core_hash",
+        core_source_path="core",
     )
+
+
+from tests._test_core_helpers import build_test_validated_core
+VAL_CORE_SAMPLE = build_test_validated_core([_make_core_sample()], source_path="core", core_hash="mock_test_core_hash")
 
 
 def _make_executed_entry(
@@ -134,7 +141,7 @@ class TestReceiptAccountingAndBijection:
             audit_root=str(audit_root),
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -518,7 +525,7 @@ class TestLifecycleValidationAndAccounting:
             approval_reader=lambda: "acknowledge",
             pipeline=ValidationFailingPipeline(),
             synthesis=SyntheticSynthesis(),
-            core_units=[],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -541,8 +548,11 @@ class TestLifecycleValidationAndAccounting:
         core_unit = KnowledgeUnit(
             id="core1", source="core", original_text=core_text,
             meaning=core_text, cleaned_text=core_text, normalized_text=core_text,
-            context="", proposed_type="Observation", position=0,
+            context="", proposed_type="Core", position=0,
+            is_core=True, core_hash="mock_test_core_hash", core_source_path="core",
         )
+        from tests._test_core_helpers import build_test_validated_core
+        val_core = build_test_validated_core([core_unit], source_path="core", core_hash="mock_test_core_hash")
         input_text = "Observation:\nA mindfulness observation regarding mental calm in daily routines.\n"
         (source / "note.md").write_text(input_text, encoding="utf-8")
         staging = tmp_path / "staging"
@@ -556,8 +566,9 @@ class TestLifecycleValidationAndAccounting:
             approval_reader=lambda: "acknowledge",
             synthesis=SyntheticSynthesis(),
             pipeline=EvidenceFirstPipeline(),
-            core_units=[core_unit],
+            core_units=list(val_core.units),
             max_files=1,
+            validated_core=val_core,
         )
 
         units_held = sum(
@@ -586,7 +597,7 @@ class TestLifecycleValidationAndAccounting:
             audit_requested=False,
             approval_reader=lambda: "n",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -621,7 +632,7 @@ class TestLifecycleValidationAndAccounting:
             audit_root=str(audit_root),
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -650,7 +661,7 @@ class TestLifecycleValidationAndAccounting:
             approval_reader=lambda: "acknowledge",
             pipeline=OperationalFailingPipeline(),
             synthesis=SyntheticSynthesis(),
-            core_units=[],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
         assert report.files_failed_operational == 1
@@ -681,7 +692,7 @@ class TestLifecycleValidationAndAccounting:
             audit_root=str(tmp_path),
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -703,7 +714,7 @@ class TestLifecycleValidationAndAccounting:
             should_cancel=lambda: True,  # Pre-cancelled
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -739,7 +750,7 @@ class TestLifecycleValidationAndAccounting:
             should_cancel=cancel_check,
             approval_reader=reader_with_cancel,
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
 
@@ -787,7 +798,7 @@ class TestLifecycleValidationAndAccounting:
             should_cancel=cancel_check,
             approval_reader=reader,
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=2,
         )
 
@@ -826,7 +837,7 @@ class TestLifecycleValidationAndAccounting:
             should_cancel=lambda: cancel_flag[0],
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
             event_sink=on_event,
         )
@@ -859,7 +870,7 @@ class TestLifecycleValidationAndAccounting:
             audit_requested=False,
             approval_reader=lambda: "acknowledge",
             synthesis=SyntheticSynthesis(),
-            core_units=[],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
         )
 
         accounted = (
@@ -985,7 +996,7 @@ class TestFullSuccessAcceptanceMatrix:
             audit_root=str(audit_root),
             approval_reader=lambda: "y",
             synthesis=SyntheticSynthesis(),
-            core_units=[_make_core_sample()],
+            core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
             max_files=1,
         )
         assert report.run_outcome == "full_success"
@@ -2372,6 +2383,7 @@ def test_ingestion_exception_classification_operational_vs_validation(tmp_path):
         pipeline=MockPipelineOpFail(),
         audit_writer=writer,
         synthesis=SyntheticSynthesis(),
+        core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
         approval_reader=lambda: "y",
     )
     assert report_op.files_failed_operational == 1
@@ -2395,6 +2407,7 @@ def test_ingestion_exception_classification_operational_vs_validation(tmp_path):
         pipeline=MockPipelineValFail(),
         audit_writer=writer,
         synthesis=SyntheticSynthesis(),
+        core_units=list(VAL_CORE_SAMPLE.units), validated_core=VAL_CORE_SAMPLE,
         approval_reader=lambda: "y",
     )
     assert report_val.files_failed_operational == 0
@@ -2442,12 +2455,16 @@ def test_restored_canonical_outcome_hierarchy(tmp_path):
     writer = AuditWriter(str(audit_root))
 
     core_text = "Observation:\nCore mindfulness observation regarding mental calm.\n"
-    cores = [KnowledgeUnit(
+    raw_cores = [KnowledgeUnit(
         id="core1", source="core", original_text=core_text,
         meaning=core_text, cleaned_text=core_text,
         normalized_text=core_text,
-        context="", proposed_type="Observation", position=0,
+        context="", proposed_type="Core", position=0,
+        is_core=True, core_hash="mock_test_core_hash", core_source_path="core",
     )]
+    from tests._test_core_helpers import build_test_validated_core
+    val_core_hier = build_test_validated_core(raw_cores, source_path="core", core_hash="mock_test_core_hash")
+    cores = list(val_core_hier.units)
 
     class MockPipelineValAndHold(EvidenceFirstPipeline):
         """File 1 fails structural validation; File 2 extracts 1 unit that gets held."""
@@ -2470,6 +2487,7 @@ def test_restored_canonical_outcome_hierarchy(tmp_path):
         approval_reader=lambda: "n",
         core_units=cores,
         max_files=2,
+        validated_core=val_core_hier,
     )
     assert rep_vh.files_failed_validation == 1
     assert rep_vh.files_failed_operational == 0
@@ -2499,6 +2517,7 @@ def test_restored_canonical_outcome_hierarchy(tmp_path):
         approval_reader=lambda: "n",
         core_units=cores,
         max_files=2,
+        validated_core=val_core_hier,
     )
     assert rep_oh.files_failed_operational == 1
     assert rep_oh.files_failed_validation == 0
@@ -2536,6 +2555,7 @@ def test_restored_canonical_outcome_hierarchy(tmp_path):
         approval_reader=lambda: "n",
         core_units=cores,
         max_files=3,
+        validated_core=val_core_hier,
     )
     assert rep_ovh.files_failed_operational == 1
     assert rep_ovh.files_failed_validation == 1

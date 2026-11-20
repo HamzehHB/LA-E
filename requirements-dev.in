@@ -4,6 +4,9 @@
 pytest
 pip-tools
 pip-audit
+pyright
+# CVE-2026-114613: force patched msgpack (transitive via cachecontrol/pip-audit).
+msgpack==1.2.3
 # Environment packaging tools (pip, setuptools) are excluded from compiled requirements
 # by pip-tools as unsafe packages. Minimum secure versions (e.g. setuptools>=84.1.0 for
 # setuptools advisory GHSA-xmj3-9gf7-h52w, alongside pip upgrade for pip advisory PYSEC-2026-3721)

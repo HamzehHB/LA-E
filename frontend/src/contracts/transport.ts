@@ -212,6 +212,7 @@ export interface VaultChangeDiff {
 export interface PendingSyncApprovalInfo {
   run_id: string;
   vault_id: string;
+  approval_id: string;
   diff: VaultChangeDiff;
   message: string;
   created_at: string;
@@ -222,6 +223,7 @@ export interface VaultSyncDecideRequest {
   run_id: string;
   vault_id: string;
   decision: "approve" | "reject";
+  approval_id: string;
 }
 
 export interface VaultSyncDecideResponse {
@@ -229,6 +231,8 @@ export interface VaultSyncDecideResponse {
   run_id: string;
   vault_id: string;
   decision: "approve" | "reject";
+  ticket_id?: string | null;
+  expires_at?: number;
 }
 
 /** @category transport — POST /api/translate */
