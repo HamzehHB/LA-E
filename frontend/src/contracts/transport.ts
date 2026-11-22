@@ -350,8 +350,10 @@ export type RunEventKind =
 
 /** @category transport */
 export interface RunEvent {
+  seq?: number;
+  run_seq?: number | null;
   kind: RunEventKind;
-  run_id: string;
+  run_id?: string | null;
   stage: string;
   operation?: string;
   message: string;
@@ -399,4 +401,13 @@ export interface RunEvent {
   units_cancelled?: number;
   units_failed_operational?: number;
   recoverable_errors?: number;
+  persisted?: boolean;
+}
+
+/** @category transport */
+export interface TransportErrorEvent {
+  error: "transport_eviction";
+  cursor: number;
+  min_seq: number;
+  total_evicted: number;
 }

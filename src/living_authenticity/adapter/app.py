@@ -19,6 +19,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ContextManager
 
+from .events import RUN_SCOPED_EVENT_KINDS
+
 logger = logging.getLogger(__name__)
 
 APP_NAME = "living-authenticity"
@@ -43,14 +45,7 @@ LANGUAGE_MODES = ("en", "fa")
 # these with the active run_id when the emitter did not set one, so the
 # frontend can attribute every event to the run the user submitted.
 # Events that already carry a run_id are never rewritten.
-_RUN_SCOPED_EVENT_KINDS = frozenset({
-    "run_started", "run_completed", "run_rejected", "stage_started",
-    "stage_completed", "status", "warning", "error", "stopped",
-    "human_review_required", "approval_decided", "consent_required",
-    "revalidation_result", "execution_result", "completed",
-    "sync_approval_required",
-    "audit_persisted", "audit_failed",
-})
+_RUN_SCOPED_EVENT_KINDS = RUN_SCOPED_EVENT_KINDS
 
 
 class AdapterError(Exception):
@@ -331,7 +326,7 @@ class Launcher:
         self._app_language = "en"
         self._staging_language = "en"
         self._audit_language = "en"
-        self._paused_run = None
+        self._paused_run: dict[str, Any] | None = None
         self._pending_approval = None
         self._pending_consent = None
         self._pending_vault_sync: _PendingSyncApproval | None = None
@@ -431,8 +426,10 @@ class Launcher:
         # already carrying an identity are never rewritten, and unknown or
         # future kinds are never attributed to a run they may not belong to.
         if (not event.get("run_id")
-                and event.get("kind") in _RUN_SCOPED_EVENT_KINDS):
-            event["run_id"] = self._active_run_id
+                and event.get("kind") in _RUN_SCOPED_EVENT_KINDS
+                and isinstance(self._active_run_id, str)
+                and self._active_run_id.strip()):
+            event["run_id"] = self._active_run_id.strip()
         if not event.get("timestamp"):
             event["timestamp"] = _utcnow()
         self.events.append(event)
@@ -692,6 +689,49 @@ class Launcher:
 
     # ---- run orchestration ----------------------------------------------
 
+    def _dispatch_run(self, run_id, input_text, source_mode, retrieval_mode,
+                      app_language, staging_language, audit_language,
+                      source_type="chat_input", input_id=None,
+                      resumed_from_run_id="", resumed_from_record_id=""):
+        try:
+            worker = threading.Thread(
+                target=self._run_thread,
+                args=(run_id, input_text, source_mode, retrieval_mode,
+                      staging_language, audit_language, source_type, input_id,
+                      resumed_from_run_id, resumed_from_record_id),
+                daemon=True)
+            worker.start()
+        except Exception as exc:
+            with self._lock:
+                if self._active_run_id == run_id:
+                    self._active_run_id = ""
+                # Preserve paused state so the run can be retried, fixed, or stopped
+                self._paused_run = {
+                    "run_id": run_id,
+                    "input_text": input_text,
+                    "source_mode": source_mode,
+                    "retrieval_mode": retrieval_mode,
+                    "error_record_id": resumed_from_record_id,
+                    "error_message": f"Thread dispatch failed: {exc}",
+                    "error_category": "operational_error",
+                    "error": exc.__class__.__name__,
+                    "audit_persisted": False,
+                    "recovering": False,
+                    "resumed_from_run_id": resumed_from_run_id,
+                }
+            raise
+        res_payload = {"run_id": run_id, "accepted": True, "reason": "",
+                       "retrieval_mode": retrieval_mode,
+                       "app_language": app_language,
+                       "staging_language": staging_language,
+                       "audit_language": audit_language,
+                       "source_type": source_type}
+        if resumed_from_run_id:
+            res_payload["resumed_from_run_id"] = resumed_from_run_id
+        if resumed_from_record_id:
+            res_payload["resumed_from_record_id"] = resumed_from_record_id
+        return res_payload
+
     def start_run(self, input_text, source_mode="personal_vault",
                   retrieval_mode="lexical", app_language="en",
                   staging_language="en", audit_language="en",
@@ -740,26 +780,24 @@ class Launcher:
             if self._active_run_id:
                 raise AdapterError("processing_error",
                                    "a run is already active")
+            if self._paused_run and self._paused_run.get("recovering"):
+                raise AdapterError("conflict",
+                                   "paused run recovery is already in progress")
             run_id = "run-" + uuid.uuid4().hex[:12]
             self._active_run_id = run_id
-        worker = threading.Thread(
-            target=self._run_thread,
-            args=(run_id, input_text, source_mode, retrieval_mode,
-                  staging_language, audit_language, source_type, input_id,
-                  resumed_from_run_id, resumed_from_record_id),
-            daemon=True)
-        worker.start()
-        res_payload = {"run_id": run_id, "accepted": True, "reason": "",
-                       "retrieval_mode": retrieval_mode,
-                       "app_language": app_language,
-                       "staging_language": staging_language,
-                       "audit_language": audit_language,
-                       "source_type": source_type}
-        if resumed_from_run_id:
-            res_payload["resumed_from_run_id"] = resumed_from_run_id
-        if resumed_from_record_id:
-            res_payload["resumed_from_record_id"] = resumed_from_record_id
-        return res_payload
+        return self._dispatch_run(
+            run_id=run_id,
+            input_text=input_text,
+            source_mode=source_mode,
+            retrieval_mode=retrieval_mode,
+            app_language=app_language,
+            staging_language=staging_language,
+            audit_language=audit_language,
+            source_type=source_type,
+            input_id=input_id,
+            resumed_from_run_id=resumed_from_run_id,
+            resumed_from_record_id=resumed_from_record_id,
+        )
 
     def _run_thread(self, run_id, input_text, mode_value,
                     retrieval_mode="lexical", staging_language="en",
@@ -915,6 +953,7 @@ class Launcher:
                             "kind": "audit_persisted",
                             "stage": "audit",
                             "run_id": run_id,
+                            "persisted": True,
                             "message": f"input validation audit persisted ({terminal_outcome})",
                             "audit_mode": "normal",
                             "audit_partition": "failed",
@@ -1077,6 +1116,7 @@ class Launcher:
                     "kind": "audit_persisted",
                     "stage": "audit",
                     "run_id": run_id,
+                    "persisted": True,
                     "message": f"operational error audit persisted ({type(exc).__name__})",
                     "audit_mode": "normal",
                     "audit_partition": "errors",
@@ -1163,6 +1203,9 @@ class Launcher:
                 if self._pending_vault_sync and self._pending_vault_sync.run_id == run_id:
                     self._pending_vault_sync.retire()
                     self._pending_vault_sync = None
+                is_paused = bool(self._paused_run and self._paused_run.get("run_id") == run_id)
+                if not is_paused:
+                    self.events.seal_run(run_id)
                 self._active_run_id = ""
                 self._cancel_flags.discard(run_id)
 
@@ -1594,6 +1637,9 @@ class Launcher:
                      retrieval_mode="lexical", staging_language="en",
                      audit_language="en", input_provenance=None,
                      resumed_from_run_id="", resumed_from_record_id=""):
+        with self._lock:
+            if not self._active_run_id and run_id:
+                self._active_run_id = run_id
         from src.living_authenticity.knowledge import integration as _integration
         from src.living_authenticity.knowledge.integration.guard import (
             resolve_authorized_audit_failed,
@@ -2091,6 +2137,7 @@ class Launcher:
             {
                 "kind": "status",
                 "stage": "localization",
+                "run_id": run_id,
                 "message": (
                     "requested content languages: "
                     f"staging={staging_language} "
@@ -3017,6 +3064,9 @@ class Launcher:
             paused = self._paused_run
             if not paused or (run_id and paused.get("run_id") != run_id):
                 raise AdapterError("validation_error", "no paused run matching run_id")
+            if paused.get("recovering"):
+                raise AdapterError("conflict", "paused run recovery is already in progress")
+            paused["recovering"] = True
             prev_run_id = paused.get("run_id", "") or run_id
             prev_record_id = paused.get("error_record_id", "")
             text = paused.get("input_text", "")
@@ -3093,6 +3143,7 @@ class Launcher:
                     self._paused_run["error_message"] = safe_reason
                     self._paused_run["error_category"] = getattr(c_err.category, "value", str(c_err.category))
                     self._paused_run["audit_persisted"] = audit_persisted
+                    self._paused_run["recovering"] = False
 
             self._sink({
                 "kind": "run_rejected",
@@ -3106,12 +3157,21 @@ class Launcher:
                 "audit_persisted": audit_persisted,
             })
             raise AdapterError("validation_error", f"Core revalidation failed: {safe_reason}") from c_err
+        except Exception:
+            with self._lock:
+                if self._paused_run and self._paused_run.get("run_id") == prev_run_id:
+                    self._paused_run["recovering"] = False
+            raise
 
-        # Successful revalidation: clear paused run state and restart
+        # Successful revalidation: seal prior run, reserve new run, and clear paused run state atomically under lock
         with self._lock:
+            self.events.seal_run(prev_run_id)
+            new_run_id = "run-" + uuid.uuid4().hex[:12]
+            self._active_run_id = new_run_id
             self._paused_run = None
 
-        return self.start_run(
+        return self._dispatch_run(
+            run_id=new_run_id,
             input_text=text,
             source_mode=src_mode,
             retrieval_mode=ret_mode,
@@ -3139,12 +3199,16 @@ class Launcher:
             paused = self._paused_run
             if not paused or (run_id and paused.get("run_id") != run_id):
                 raise AdapterError("validation_error", "no paused run matching run_id")
+            if paused.get("recovering"):
+                raise AdapterError("conflict", "paused run recovery is already in progress")
+            paused["recovering"] = True
             prev_run_id = paused.get("run_id", "") or run_id
             prev_record_id = paused.get("error_record_id", "")
             text = input_text if input_text is not None else paused.get("input_text", "")
             src_mode = source_mode if source_mode is not None else paused.get("source_mode", self._active_source_mode)
             ret_mode = retrieval_mode if retrieval_mode is not None else paused.get("retrieval_mode", self._active_retrieval_mode)
 
+        try:
             # Pre-validate before clearing paused state to preserve run on invalid corrections
             if not isinstance(text, str) or not text.strip():
                 raise AdapterError("validation_error", "input_text is required and cannot be empty")
@@ -3154,16 +3218,26 @@ class Launcher:
                     "source_mode must be one of: " + ", ".join(SOURCE_MODES))
             try:
                 strategy_defn = RetrievalStrategyRegistry().validate(ret_mode)
-                ret_mode = strategy_defn.name
+                effective_retrieval_mode = strategy_defn.name
             except UnsupportedStrategyError as exc:
                 raise AdapterError("validation_error", str(exc))
+        except Exception:
+            with self._lock:
+                if self._paused_run and self._paused_run.get("run_id") == prev_run_id:
+                    self._paused_run["recovering"] = False
+            raise
 
+        with self._lock:
+            self.events.seal_run(prev_run_id)
+            new_run_id = "run-" + uuid.uuid4().hex[:12]
+            self._active_run_id = new_run_id
             self._paused_run = None
 
-        return self.start_run(
+        return self._dispatch_run(
+            run_id=new_run_id,
             input_text=text,
             source_mode=src_mode,
-            retrieval_mode=ret_mode,
+            retrieval_mode=effective_retrieval_mode,
             app_language=self._app_language,
             staging_language=self._staging_language,
             audit_language=self._audit_language,
@@ -3183,91 +3257,103 @@ class Launcher:
             paused = self._paused_run
             if not paused or (run_id and paused.get("run_id") != run_id):
                 return {"stopped": True, "run_id": run_id}
+            if paused.get("recovering"):
+                raise AdapterError("conflict", "paused run recovery is already in progress")
+            paused["recovering"] = True
             target_run_id = paused.get("run_id", "") or run_id
-            self._paused_run = None
 
-        session_audit = self._session_destinations.get("audit", "")
-        auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
-        if not auth_audit:
-            auth_audit = resolve_authorized_audit_root(self.paths())
+        try:
+            session_audit = self._session_destinations.get("audit", "")
+            auth_audit = session_audit.strip() if isinstance(session_audit, str) else ""
+            if not auth_audit:
+                auth_audit = resolve_authorized_audit_root(self.paths())
 
-        audit_persisted = False
-        receipt = None
-        if auth_audit and Path(auth_audit).is_dir():
-            try:
-                from src.living_authenticity.knowledge.governance.audit.persistence import (
-                    validate_persistence_receipt,
-                )
-                from src.living_authenticity.security.diagnostic import (
-                    sanitize_diagnostic_text,
-                )
-                safe_err_msg = sanitize_diagnostic_text(paused.get("error_message", ""))
-                writer = AuditWriter(auth_audit)
-                rec = AuditRecord(
-                    run_id=target_run_id,
-                    operating_mode=paused.get("source_mode", self._active_source_mode),
-                    terminal_outcome="stopped_by_user",
-                    validation_result="STOPPED",
-                    stop_reason="paused run stopped by user",
-                    errors=(f"Paused on {paused.get('error', 'Error')}: {safe_err_msg}",) if safe_err_msg else ("paused run stopped by user",),
-                    resumed_from_run_id=paused.get("resumed_from_run_id", ""),
-                    resumed_from_record_id=paused.get("error_record_id", ""),
-                )
-                receipt = writer.append(rec)
-                is_valid, _ = validate_persistence_receipt(
-                    receipt,
-                    expected_record_id=rec.record_id or None,
-                )
-                audit_persisted = bool(is_valid and receipt.get("persisted") is True)
-            except Exception:
-                audit_persisted = False
+            audit_persisted = False
+            receipt = None
+            if auth_audit and Path(auth_audit).is_dir():
+                try:
+                    from src.living_authenticity.knowledge.governance.audit.persistence import (
+                        validate_persistence_receipt,
+                    )
+                    from src.living_authenticity.security.diagnostic import (
+                        sanitize_diagnostic_text,
+                    )
+                    safe_err_msg = sanitize_diagnostic_text(paused.get("error_message", ""))
+                    writer = AuditWriter(auth_audit)
+                    rec = AuditRecord(
+                        run_id=target_run_id,
+                        operating_mode=paused.get("source_mode", self._active_source_mode),
+                        terminal_outcome="stopped_by_user",
+                        validation_result="STOPPED",
+                        stop_reason="paused run stopped by user",
+                        errors=(f"Paused on {paused.get('error', 'Error')}: {safe_err_msg}",) if safe_err_msg else ("paused run stopped by user",),
+                        resumed_from_run_id=paused.get("resumed_from_run_id", ""),
+                        resumed_from_record_id=paused.get("error_record_id", ""),
+                    )
+                    receipt = writer.append(rec)
+                    is_valid, _ = validate_persistence_receipt(
+                        receipt,
+                        expected_record_id=rec.record_id or None,
+                    )
+                    audit_persisted = bool(is_valid and receipt.get("persisted") is True)
+                except Exception:
+                    audit_persisted = False
 
-        partition = "failed"
-        if audit_persisted and isinstance(receipt, dict):
-            partition = receipt.get("partition", "failed")
+            partition = "failed"
+            if audit_persisted and isinstance(receipt, dict):
+                partition = receipt.get("partition", "failed")
 
-        if audit_persisted:
+            if audit_persisted:
+                self._sink({
+                    "kind": "audit_persisted",
+                    "stage": "audit",
+                    "run_id": target_run_id,
+                    "persisted": True,
+                    "message": f"paused run termination audit persisted ({partition} partition)",
+                    "audit_mode": "normal",
+                    "audit_partition": partition,
+                    "audit_partitions": [partition],
+                })
+            else:
+                self._sink({
+                    "kind": "audit_failed",
+                    "stage": "audit",
+                    "run_id": target_run_id,
+                    "message": "paused run termination audit persistence failed",
+                    "audit_mode": "unconfigured" if not auth_audit else "failed",
+                    "audit_partition": partition,
+                })
+
+            with self._lock:
+                self._reports[target_run_id] = {
+                    "run_id": target_run_id,
+                    "accepted": False,
+                    "outcome": "STOPPED",
+                    "reason": "paused run stopped by user",
+                    "processed": 0,
+                    "executed": 0,
+                    "held": 0,
+                    "terminal_outcome": "stopped_by_user",
+                    "audit_persisted": audit_persisted,
+                }
+
             self._sink({
-                "kind": "audit_persisted",
-                "stage": "audit",
+                "kind": "stopped",
+                "stage": "recovery",
                 "run_id": target_run_id,
-                "message": f"paused run termination audit persisted ({partition} partition)",
-                "audit_mode": "normal",
-                "audit_partition": partition,
-                "audit_partitions": [partition],
-            })
-        else:
-            self._sink({
-                "kind": "audit_failed",
-                "stage": "audit",
-                "run_id": target_run_id,
-                "message": "paused run termination audit persistence failed",
-                "audit_mode": "unconfigured" if not auth_audit else "failed",
-                "audit_partition": partition,
-            })
-
-        with self._lock:
-            self._reports[target_run_id] = {
-                "run_id": target_run_id,
-                "accepted": False,
+                "message": "paused run stopped by user",
                 "outcome": "STOPPED",
-                "reason": "paused run stopped by user",
-                "processed": 0,
-                "executed": 0,
-                "held": 0,
                 "terminal_outcome": "stopped_by_user",
-                "audit_persisted": audit_persisted,
-            }
-
-        self._sink({
-            "kind": "stopped",
-            "stage": "recovery",
-            "run_id": target_run_id,
-            "message": "paused run stopped by user",
-            "outcome": "STOPPED",
-            "terminal_outcome": "stopped_by_user",
-        })
-        return {"stopped": True, "run_id": target_run_id, "terminal_outcome": "stopped_by_user"}
+            })
+            with self._lock:
+                self.events.seal_run(target_run_id)
+                self._paused_run = None
+            return {"stopped": True, "run_id": target_run_id, "terminal_outcome": "stopped_by_user"}
+        except Exception:
+            with self._lock:
+                if self._paused_run and self._paused_run.get("run_id") == target_run_id:
+                    self._paused_run["recovering"] = False
+            raise
 
     def reveal_folder(self, purpose: str) -> dict:
         """List files in the synced directory for the given purpose without leaking secrets."""

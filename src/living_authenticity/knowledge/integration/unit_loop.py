@@ -790,6 +790,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
             _emit("warning", "audit_persistence",
                   "audit recorded in emergency journal")
             _emit("audit_persisted", "audit", "unit audit persisted (emergency)",
+                  persisted=True,
                   query_unit_id=query.id, proposal_hash=request.proposal_hash,
                   record_id=post_receipt.get("record_id", ""),
                   durability="confirmed", emergency=True,
@@ -801,6 +802,7 @@ def _govern_candidate(child, query, proposal, confidence, note, gate,
                 dur = post_receipt.get("durability", "written")
                 cat = post_receipt.get("storage_category", "passed")
                 _emit("audit_persisted", "audit", f"unit audit persisted ({dur})",
+                      persisted=True,
                       query_unit_id=query.id, proposal_hash=request.proposal_hash,
                       record_id=post_receipt.get("record_id", ""),
                       durability=dur, emergency=False,

@@ -1084,6 +1084,7 @@ def run_bounded_integration(source_root, staging_root, pipeline=None,
         emit({
             "kind": "audit_persisted",
             "run_id": active_run_id,
+            "persisted": True,
             "stage": "audit",
             "message": msg,
             "audit_mode": mode,

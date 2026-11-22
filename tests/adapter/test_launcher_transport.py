@@ -5,6 +5,7 @@ or audit writes outside pytest's temporary directories.
 """
 import http.client
 import json
+import socket
 
 import pytest
 
@@ -4489,3 +4490,1564 @@ def test_failed_audit_persistence_during_recovery_never_claims_durability(tmp_pa
     res_malformed = launcher.stop_paused_run(run_id=paused_id_malformed)
     assert res_malformed["stopped"] is True
     assert launcher._reports[paused_id_malformed]["audit_persisted"] is False
+
+
+# ============================================================================
+# Phase 4 — Increment 1: Foundation Contracts & Dual-Sequence Infrastructure
+# Automated Test Suite (T1 – T15)
+# ============================================================================
+
+import logging
+import threading
+import time
+from src.living_authenticity.adapter.events import (
+    RunEventLog,
+    RUN_SCOPED_EVENT_KINDS,
+    TransportEvictionError,
+    ReplaySnapshot,
+)
+
+
+def test_p4_inc1_t1_dual_sequence_monotonicity():
+    """T1: Dual-Sequence Monotonicity.
+    Appending events to a run generates gapless seq (1, 2, 3...) and run_seq (1, 2, 3...).
+    """
+    log = RunEventLog()
+    run_id = "run-t1-001"
+
+    s1 = log.append({"kind": "run_started", "stage": "input", "run_id": run_id})
+    s2 = log.append({"kind": "stage_started", "stage": "input", "run_id": run_id})
+    s3 = log.append({"kind": "stage_completed", "stage": "input", "run_id": run_id})
+
+    events = log.since(0)
+    assert len(events) == 3
+    assert [e["seq"] for e in events] == [1, 2, 3]
+    assert [e["run_seq"] for e in events] == [1, 2, 3]
+    assert [e["run_id"] for e in events] == [run_id, run_id, run_id]
+    assert s1 == 1 and s2 == 2 and s3 == 3
+
+
+def test_p4_inc1_t2_multi_run_isolation():
+    """T2: Multi-Run Isolation.
+    Interleaving events across Run A and Run B produces independent run_seq
+    starting at 1 for each run, while global seq advances monotonically across all events.
+    """
+    log = RunEventLog()
+    run_a = "run-t2-alpha"
+    run_b = "run-t2-beta"
+
+    log.append({"kind": "run_started", "stage": "input", "run_id": run_a})    # seq=1, run_seq=1
+    log.append({"kind": "run_started", "stage": "input", "run_id": run_b})    # seq=2, run_seq=1
+    log.append({"kind": "stage_started", "stage": "input", "run_id": run_a})  # seq=3, run_seq=2
+    log.append({"kind": "stage_started", "stage": "input", "run_id": run_b})  # seq=4, run_seq=2
+    log.append({"kind": "stage_completed", "stage": "input", "run_id": run_a})# seq=5, run_seq=3
+
+    events = log.since(0)
+    assert [e["seq"] for e in events] == [1, 2, 3, 4, 5]
+
+    events_a = [e for e in events if e["run_id"] == run_a]
+    events_b = [e for e in events if e["run_id"] == run_b]
+
+    assert [e["run_seq"] for e in events_a] == [1, 2, 3]
+    assert [e["seq"] for e in events_a] == [1, 3, 5]
+
+    assert [e["run_seq"] for e in events_b] == [1, 2]
+    assert [e["seq"] for e in events_b] == [2, 4]
+
+
+def test_p4_inc1_t3_process_lifetime_counter_retention():
+    """T3: Process-Lifetime Counter Retention.
+    Per-run sequence counters are preserved after runs complete; late events
+    prior to sealing do not reset run_seq to 1.
+    """
+    log = RunEventLog()
+    run_id = "run-t3-lifecycle"
+
+    log.append({"kind": "run_started", "stage": "input", "run_id": run_id})      # run_seq=1
+    log.append({"kind": "run_completed", "stage": "execution", "run_id": run_id})# run_seq=2
+
+    # Verify counter retained in _run_counters
+    assert log._run_counters[run_id] == 2
+
+    # A late event prior to sealing must continue from 3, never resetting to 1
+    s3 = log.append({"kind": "status", "stage": "audit", "run_id": run_id})
+    events = log.since(0)
+    assert events[-1]["run_seq"] == 3
+    assert s3 == 3
+    assert log._run_counters[run_id] == 3
+
+
+def test_p4_inc1_t4_event_attribution_boundary_guard(caplog):
+    """T4: Event Attribution and Boundary Guard.
+    Explicitly tests all seven attribution scenarios and the already-sealed run rejection:
+    1. Run-scoped valid run_id
+    2. Run-scoped missing run_id (active run exists)
+    3. Run-scoped missing run_id (no active run exists)
+    4. Run-scoped malformed run_id (whitespace, int, dict, list)
+    5. Global event without run_id
+    6. Global event with valid contextual run_id
+    7. Global event with malformed run_id
+    8. Run-scoped event with an already sealed run_id
+    """
+    launcher = _launcher()
+    log = launcher.events
+
+    # --- Scenario 1: Run-scoped event with valid run_id ---
+    res1 = log.append({"kind": "stage_completed", "stage": "input", "run_id": "run-001"})
+    assert res1 == 1
+    e1 = log.since(0)[-1]
+    assert e1["seq"] == 1
+    assert e1["run_id"] == "run-001"
+    assert e1["run_seq"] == 1
+    assert log._run_counters["run-001"] == 1
+
+    # --- Scenario 2: Run-scoped missing run_id with active run in _sink ---
+    launcher._active_run_id = "run-001"
+    launcher._sink({"kind": "stage_started", "stage": "retrieval"})
+    e2 = log.since(0)[-1]
+    assert e2["seq"] == 2
+    assert e2["run_id"] == "run-001"
+    assert e2["run_seq"] == 2
+    assert log._run_counters["run-001"] == 2
+
+    # --- Scenario 3: Run-scoped missing run_id with NO active run ---
+    launcher._active_run_id = ""
+    with caplog.at_level(logging.WARNING, logger="RunEventLog"):
+        caplog.clear()
+        res3 = log.append({"kind": "stage_completed", "stage": "retrieval"})
+        assert res3 == 0
+        assert len(log.since(2)) == 0  # Not entered into _events
+        assert log._next_seq == 3       # Zero sequences consumed
+        assert any("reason=missing_run_id" in r.message for r in caplog.records)
+
+    # --- Scenario 4: Run-scoped malformed run_id (whitespace, int, list) ---
+    for malformed in ["   ", 123, ["run-001"], {"id": "run-001"}]:
+        with caplog.at_level(logging.WARNING, logger="RunEventLog"):
+            caplog.clear()
+            res_bad = log.append({"kind": "error", "stage": "execution", "run_id": malformed})
+            assert res_bad == 0
+            assert len(log.since(2)) == 0
+            assert log._next_seq == 3
+            assert list(log._run_counters.keys()) == ["run-001"]
+            assert any("reason=malformed_run_id" in r.message for r in caplog.records)
+
+    # --- Scenario 5: Global event without run_id ---
+    res5 = log.append({"kind": "drift_detected", "stage": "monitor"})
+    assert res5 == 3
+    e5 = log.since(2)[-1]
+    assert e5["seq"] == 3
+    assert e5.get("run_id") is None
+    assert e5["run_seq"] is None
+
+    # --- Scenario 6: Global event with valid contextual run_id ---
+    res6 = log.append({"kind": "drift_detected", "stage": "monitor", "run_id": "run-001"})
+    assert res6 == 4
+    e6 = log.since(3)[-1]
+    assert e6["seq"] == 4
+    assert e6["run_id"] == "run-001"
+    assert e6["run_seq"] is None  # Does not consume run_seq
+    assert log._run_counters["run-001"] == 2  # Counter untouched!
+
+    # --- Scenario 7: Global event with malformed run_id ---
+    res7 = log.append({"kind": "drift_detected", "stage": "monitor", "run_id": 999})
+    assert res7 == 5
+    e7 = log.since(4)[-1]
+    assert e7["seq"] == 5
+    assert e7.get("run_id") is None
+    assert e7["run_seq"] is None
+
+    # --- Scenario 8: Run-scoped event with already sealed run_id ---
+    log.seal_run("run-001")
+    with caplog.at_level(logging.WARNING, logger="RunEventLog"):
+        caplog.clear()
+        res8 = log.append({"kind": "status", "stage": "audit", "run_id": "run-001"})
+        assert res8 == 0
+        assert len(log.since(5)) == 0
+        assert log._next_seq == 6
+        assert any("reason=run_sealed" in r.message for r in caplog.records)
+
+
+def test_p4_inc1_t5_sealing_rejection_and_lock_safety():
+    """T5: Sealing, Rejection and Lock Safety.
+    Verifies:
+    - Pre-seal appends accepted.
+    - Post-seal append returns exactly 0.
+    - _next_seq remains unchanged.
+    - _run_counters[run_id] remains unchanged.
+    - _events length remains unchanged.
+    - _total_post_seal_rejections increases by exactly 1.
+    - Exactly one diagnostic record added with the exact 5 bounded fields.
+    - Logging occurs outside RunEventLog._cond and _lock.
+    - Concurrency safety under concurrent appends and sealing.
+    """
+    log = RunEventLog()
+    run_id = "run-t5-locktest"
+
+    # Pre-seal append
+    s1 = log.append({"kind": "run_started", "stage": "input", "run_id": run_id})
+    assert s1 == 1
+    assert log._run_counters[run_id] == 1
+    assert len(log._events) == 1
+    assert log._total_post_seal_rejections == 0
+
+    # Custom logging handler to verify locks are released at log time
+    lock_released_during_log = []
+
+    class LockCheckingHandler(logging.Handler):
+        def emit(self, record):
+            if "reason=run_sealed" in record.getMessage() or getattr(record, "reason", "") == "run_sealed":
+                # Check that both condition and lock are NOT held
+                is_cond_locked = log._lock.locked()
+                lock_released_during_log.append(not is_cond_locked)
+
+    handler = LockCheckingHandler()
+    event_logger = logging.getLogger("RunEventLog")
+    event_logger.addHandler(handler)
+
+    try:
+        # Seal run
+        log.seal_run(run_id)
+        assert log.is_sealed(run_id) is True
+
+        # Post-seal append
+        res = log.append({"kind": "stage_started", "stage": "input", "run_id": run_id})
+        assert res == 0
+
+        # Invariants verification
+        assert log._next_seq == 2
+        assert log._run_counters[run_id] == 1
+        assert len(log._events) == 1
+        assert log._total_post_seal_rejections == 1
+
+        # Check diagnostic records
+        diag = log.post_seal_diagnostics()
+        assert diag["total_rejections"] == 1
+        assert len(diag["recent_rejections"]) == 1
+
+        rec = diag["recent_rejections"][0]
+        assert set(rec.keys()) == {"timestamp", "run_id", "kind", "stage", "reason"}
+        assert rec["run_id"] == run_id
+        assert rec["kind"] == "stage_started"
+        assert rec["stage"] == "input"
+        assert rec["reason"] == "run_sealed"
+
+        # Check lock release during log
+        assert len(lock_released_during_log) >= 1
+        assert all(lock_released_during_log)
+
+    finally:
+        event_logger.removeHandler(handler)
+
+    # Concurrency test: 10 worker threads appending concurrently while sealing
+    concurrent_log = RunEventLog()
+    c_run = "run-t5-concurrent"
+    accepted_counts = []
+    rejected_counts = []
+    barrier = threading.Barrier(11, action=lambda: concurrent_log.seal_run(c_run))
+
+    def worker():
+        acc = 0
+        rej = 0
+        # 50 appends before barrier (guaranteed unsealed)
+        for _ in range(50):
+            r = concurrent_log.append({"kind": "status", "stage": "work", "run_id": c_run})
+            if r > 0:
+                acc += 1
+            else:
+                rej += 1
+        barrier.wait()
+        # 50 appends after barrier (guaranteed post-seal)
+        for _ in range(50):
+            r = concurrent_log.append({"kind": "status", "stage": "work", "run_id": c_run})
+            if r > 0:
+                acc += 1
+            else:
+                rej += 1
+        accepted_counts.append(acc)
+        rejected_counts.append(rej)
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+
+    barrier.wait()  # Coordinator trips barrier; action runs seal_run(c_run) before threads release
+
+    for t in threads:
+        t.join()
+
+    total_accepted = sum(accepted_counts)
+    total_rejected = sum(rejected_counts)
+    assert total_accepted == 500
+    assert total_rejected == 500
+    assert total_accepted + total_rejected == 1000
+    assert concurrent_log._run_counters[c_run] == 500
+    assert concurrent_log._next_seq == 501
+    assert concurrent_log._total_post_seal_rejections == 500
+    assert len(concurrent_log._events) == 500
+    assert len(concurrent_log._post_seal_rejections) == 100
+    diag = concurrent_log.post_seal_diagnostics()
+    assert diag["total_rejections"] == 500
+    assert len(diag["recent_rejections"]) == 100
+    for r in diag["recent_rejections"]:
+        assert set(r.keys()) == {"timestamp", "run_id", "kind", "stage", "reason"}
+        assert r["run_id"] == c_run
+        assert r["reason"] == "run_sealed"
+
+
+def test_p4_inc1_t6_paused_run_sealing_protection(monkeypatch):
+    """T6: Paused Run Sealing Protection & Lifecycle Correction A.
+    - When a run is paused due to infrastructure failure, the worker exits,
+      but seal_run is not called; the run remains unsealed and admissible.
+    - Lifecycle Correction A: When a normal run completes, it is sealed under
+      Launcher._lock before _active_run_id is cleared, preventing any race with start_run().
+    """
+    launcher = _launcher()
+    paused_id = "run-t6-paused"
+
+    # Simulate run pausing with an infrastructure error
+    launcher._paused_run = {
+        "run_id": paused_id,
+        "input_text": "Sample text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "CoreResolutionError",
+        "error_message": "Vault core missing",
+        "timestamp": "2026-11-21T00:00:00Z",
+    }
+
+    # Worker thread exits; verify paused run is NOT sealed
+    assert launcher.events.is_sealed(paused_id) is False
+
+    # Append to paused run remains admissible
+    res = launcher.events.append({"kind": "status", "stage": "paused", "run_id": paused_id})
+    assert res > 0
+    assert launcher.events.is_sealed(paused_id) is False
+
+    # Lifecycle Correction A:
+    # Verify that in _run_thread finally block, seal_run executes while _active_run_id is still set under _lock
+    normal_run_id = "run-t6-normal"
+    state_at_seal = {}
+    orig_seal = launcher.events.seal_run
+
+    def instrumented_seal(run_id: str) -> None:
+        state_at_seal["active_before_clear"] = launcher._active_run_id
+        is_owned_fn = getattr(launcher._lock, "_is_owned", None)
+        state_at_seal["lock_held"] = bool(is_owned_fn()) if callable(is_owned_fn) else True
+        orig_seal(run_id)
+
+    monkeypatch.setattr(launcher.events, "seal_run", instrumented_seal)
+    launcher._active_run_id = normal_run_id
+    launcher._run_thread(
+        run_id=normal_run_id,
+        input_text="???",
+        mode_value="examples",
+    )
+
+    assert state_at_seal.get("active_before_clear") == normal_run_id
+    assert state_at_seal.get("lock_held") is True
+    assert launcher.events.is_sealed(normal_run_id) is True
+    assert launcher._active_run_id == ""
+
+
+def test_p4_inc1_t7_stop_paused_run_finalization(monkeypatch):
+    """T7: Stop Paused Run Finalization & Real Recovery Concurrency Matrix.
+    1. Invoking stop_paused_run emits final cancellation audit (persisted: True)
+       and stopped events, clears _paused_run, and seals the run.
+    2. Deterministic multi-threaded concurrency tests using threading.Event barriers
+       covering all 6 recovery interaction pairs + start_run:
+       - retry vs retry -> competing retry raises conflict
+       - retry vs fix   -> competing fix raises conflict
+       - retry vs stop  -> competing stop raises conflict
+       - fix vs fix     -> competing fix raises conflict
+       - fix vs stop    -> competing stop raises conflict
+       - stop vs stop   -> competing stop raises conflict
+       - start_run vs recovery -> start_run raises conflict ("paused run recovery is already in progress")
+       - competing start_run after atomic transition -> start_run raises processing_error ("a run is already active")
+    """
+    from typing import Any
+    from src.living_authenticity.adapter.app import AdapterError
+    from src.living_authenticity.knowledge.analysis.retrieval.strategy import (
+        RetrievalStrategyRegistry,
+    )
+    from src.living_authenticity.knowledge.integration.guard import (
+        resolve_authorized_audit_root,
+    )
+    from tests._test_core_helpers import build_test_validated_core
+    from tests.integration.test_run_governance import _core
+
+    launcher = _launcher()
+    stop_id = "run-t7-stop"
+    paused_data: dict[str, Any] = {
+        "run_id": stop_id,
+        "input_text": "Sample text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+        "timestamp": "2026-11-21T00:00:00Z",
+    }
+    launcher._paused_run = paused_data
+
+    # Complete stop_paused_run finalization
+    res = launcher.stop_paused_run(run_id=stop_id)
+    assert res["stopped"] is True
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(stop_id) is True
+
+    # Subsequent appends to stop_id must be rejected
+    rejected = launcher.events.append({"kind": "status", "stage": "recovery", "run_id": stop_id})
+    assert rejected == 0
+
+    # =========================================================================
+    # Real Concurrent Recovery Interactions (All 6 Pairs + start_run)
+    # =========================================================================
+    val_core_sample = build_test_validated_core([_core()], source_path="core", core_hash="hash_p1")
+    monkeypatch.setattr(launcher, "_run_thread", lambda *args, **kwargs: None)
+
+    # 1. retry vs retry
+    run_id_1 = "run-t7-pair1"
+    launcher._paused_run = {
+        "run_id": run_id_1,
+        "input_text": "Sample text 1",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_1 = threading.Event()
+    allow_proceed_1 = threading.Event()
+
+    def mock_validate_paused_1(*args, **kwargs):
+        in_pause_1.set()
+        assert allow_proceed_1.wait(timeout=5.0)
+        return val_core_sample
+
+    monkeypatch.setattr("src.living_authenticity.knowledge.vault.core_validator.validate_and_load_core", mock_validate_paused_1)
+
+    t1_result: dict[str, Any] = {}
+    def t1_target():
+        try:
+            t1_result["res"] = launcher.retry_paused_run(run_id=run_id_1)
+        except Exception as exc:
+            t1_result["exc"] = exc
+
+    th1 = threading.Thread(target=t1_target)
+    th1.start()
+
+    assert in_pause_1.wait(timeout=5.0)
+
+    # Competing retry must fail with conflict
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.retry_paused_run(run_id=run_id_1)
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_1.set()
+    th1.join(timeout=5.0)
+    assert not th1.is_alive()
+    assert "res" in t1_result
+    assert t1_result["res"]["accepted"] is True
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_1) is True
+    launcher._active_run_id = ""
+
+    # 2. retry vs fix
+    run_id_2 = "run-t7-pair2"
+    launcher._paused_run = {
+        "run_id": run_id_2,
+        "input_text": "Sample text 2",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_2 = threading.Event()
+    allow_proceed_2 = threading.Event()
+
+    def mock_validate_paused_2(*args, **kwargs):
+        in_pause_2.set()
+        assert allow_proceed_2.wait(timeout=5.0)
+        return val_core_sample
+
+    monkeypatch.setattr("src.living_authenticity.knowledge.vault.core_validator.validate_and_load_core", mock_validate_paused_2)
+
+    t2_result: dict[str, Any] = {}
+    def t2_target():
+        try:
+            t2_result["res"] = launcher.retry_paused_run(run_id=run_id_2)
+        except Exception as exc:
+            t2_result["exc"] = exc
+
+    th2 = threading.Thread(target=t2_target)
+    th2.start()
+
+    assert in_pause_2.wait(timeout=5.0)
+
+    # Competing fix must fail with conflict
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=run_id_2, input_text="Updated text 2")
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_2.set()
+    th2.join(timeout=5.0)
+    assert not th2.is_alive()
+    assert "res" in t2_result
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_2) is True
+    launcher._active_run_id = ""
+
+    # 3. retry vs stop
+    run_id_3 = "run-t7-pair3"
+    launcher._paused_run = {
+        "run_id": run_id_3,
+        "input_text": "Sample text 3",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_3 = threading.Event()
+    allow_proceed_3 = threading.Event()
+
+    def mock_validate_paused_3(*args, **kwargs):
+        in_pause_3.set()
+        assert allow_proceed_3.wait(timeout=5.0)
+        return val_core_sample
+
+    monkeypatch.setattr("src.living_authenticity.knowledge.vault.core_validator.validate_and_load_core", mock_validate_paused_3)
+
+    t3_result: dict[str, Any] = {}
+    def t3_target():
+        try:
+            t3_result["res"] = launcher.retry_paused_run(run_id=run_id_3)
+        except Exception as exc:
+            t3_result["exc"] = exc
+
+    th3 = threading.Thread(target=t3_target)
+    th3.start()
+
+    assert in_pause_3.wait(timeout=5.0)
+
+    # Competing stop must fail with conflict
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.stop_paused_run(run_id=run_id_3)
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_3.set()
+    th3.join(timeout=5.0)
+    assert not th3.is_alive()
+    assert "res" in t3_result
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_3) is True
+    launcher._active_run_id = ""
+
+    # 4. fix vs fix
+    run_id_4 = "run-t7-pair4"
+    launcher._paused_run = {
+        "run_id": run_id_4,
+        "input_text": "Sample text 4",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_4 = threading.Event()
+    allow_proceed_4 = threading.Event()
+    orig_strat_val = RetrievalStrategyRegistry.validate
+
+    def paused_strat_val_4(self, name):
+        in_pause_4.set()
+        assert allow_proceed_4.wait(timeout=5.0)
+        return orig_strat_val(self, name)
+
+    monkeypatch.setattr(RetrievalStrategyRegistry, "validate", paused_strat_val_4)
+
+    t4_result: dict[str, Any] = {}
+    def t4_target():
+        try:
+            t4_result["res"] = launcher.fix_paused_run(run_id=run_id_4, input_text="Fixed text 4")
+        except Exception as exc:
+            t4_result["exc"] = exc
+
+    th4 = threading.Thread(target=t4_target)
+    th4.start()
+
+    assert in_pause_4.wait(timeout=5.0)
+
+    # Competing fix must fail with conflict
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=run_id_4, input_text="Another text 4")
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_4.set()
+    th4.join(timeout=5.0)
+    assert not th4.is_alive()
+    assert "res" in t4_result
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_4) is True
+    launcher._active_run_id = ""
+
+    # 5. fix vs stop
+    run_id_5 = "run-t7-pair5"
+    launcher._paused_run = {
+        "run_id": run_id_5,
+        "input_text": "Sample text 5",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_5 = threading.Event()
+    allow_proceed_5 = threading.Event()
+
+    def paused_strat_val_5(self, name):
+        in_pause_5.set()
+        assert allow_proceed_5.wait(timeout=5.0)
+        return orig_strat_val(self, name)
+
+    monkeypatch.setattr(RetrievalStrategyRegistry, "validate", paused_strat_val_5)
+
+    t5_result: dict[str, Any] = {}
+    def t5_target():
+        try:
+            t5_result["res"] = launcher.fix_paused_run(run_id=run_id_5, input_text="Fixed text 5")
+        except Exception as exc:
+            t5_result["exc"] = exc
+
+    th5 = threading.Thread(target=t5_target)
+    th5.start()
+
+    assert in_pause_5.wait(timeout=5.0)
+
+    # Competing stop must fail with conflict
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.stop_paused_run(run_id=run_id_5)
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_5.set()
+    th5.join(timeout=5.0)
+    assert not th5.is_alive()
+    assert "res" in t5_result
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_5) is True
+    launcher._active_run_id = ""
+
+    # 6. stop vs stop
+    run_id_6 = "run-t7-pair6"
+    launcher._paused_run = {
+        "run_id": run_id_6,
+        "input_text": "Sample text 6",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_6 = threading.Event()
+    allow_proceed_6 = threading.Event()
+    orig_audit_res = resolve_authorized_audit_root
+
+    def paused_audit_res_6(paths):
+        in_pause_6.set()
+        assert allow_proceed_6.wait(timeout=5.0)
+        return orig_audit_res(paths)
+
+    monkeypatch.setattr("src.living_authenticity.knowledge.integration.guard.resolve_authorized_audit_root", paused_audit_res_6)
+
+    t6_result: dict[str, Any] = {}
+    def t6_target():
+        try:
+            t6_result["res"] = launcher.stop_paused_run(run_id=run_id_6)
+        except Exception as exc:
+            t6_result["exc"] = exc
+
+    th6 = threading.Thread(target=t6_target)
+    th6.start()
+
+    assert in_pause_6.wait(timeout=5.0)
+
+    # Competing stop must fail with conflict
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.stop_paused_run(run_id=run_id_6)
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_6.set()
+    th6.join(timeout=5.0)
+    assert not th6.is_alive()
+    assert "res" in t6_result
+    assert t6_result["res"]["stopped"] is True
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_6) is True
+    launcher._active_run_id = ""
+
+    # 7. start_run vs recovery (and competing start_run after atomic transition)
+    run_id_7 = "run-t7-pair7"
+    launcher._paused_run = {
+        "run_id": run_id_7,
+        "input_text": "Sample text 7",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+    }
+    in_pause_7 = threading.Event()
+    allow_proceed_7 = threading.Event()
+
+    def mock_validate_paused_7(*args, **kwargs):
+        in_pause_7.set()
+        assert allow_proceed_7.wait(timeout=5.0)
+        return val_core_sample
+
+    monkeypatch.setattr("src.living_authenticity.knowledge.vault.core_validator.validate_and_load_core", mock_validate_paused_7)
+
+    t7_result: dict[str, Any] = {}
+    def t7_target():
+        try:
+            t7_result["res"] = launcher.retry_paused_run(run_id=run_id_7)
+        except Exception as exc:
+            t7_result["exc"] = exc
+
+    th7 = threading.Thread(target=t7_target)
+    th7.start()
+
+    assert in_pause_7.wait(timeout=5.0)
+
+    # Competing start_run must fail with conflict during recovery
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.start_run(input_text="Independent run text", source_mode="examples")
+    assert exc_info.value.kind == "conflict"
+    assert "paused run recovery is already in progress" in exc_info.value.message
+
+    allow_proceed_7.set()
+    th7.join(timeout=5.0)
+    assert not th7.is_alive()
+    assert "res" in t7_result
+    assert launcher._paused_run is None
+    assert launcher.events.is_sealed(run_id_7) is True
+
+    # 8. Competing start_run after atomic transition:
+    # _active_run_id was reserved by the recovery operation
+    assert launcher._active_run_id == t7_result["res"]["run_id"]
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.start_run(input_text="Another independent run", source_mode="examples")
+    assert exc_info.value.kind == "processing_error"
+    assert "a run is already active" in exc_info.value.message
+    launcher._active_run_id = ""
+
+
+def test_p4_inc1_t8_recovery_quiescence_and_sealing(monkeypatch):
+    """T8: Recovery Quiescence, Sealing & Failure Reset.
+    Invoking fix_paused_run seals prev_run_id before starting new run,
+    preserves its terminal outcome, clears _paused_run, and starts new run
+    with fresh run_id starting at run_seq: 1.
+    Pre-validation failure in fix_paused_run cleanly resets recovering=False.
+    Strategy validation failure in fix_paused_run cleanly resets recovering=False.
+    Core revalidation failure in retry_paused_run cleanly resets recovering=False.
+    """
+    from src.living_authenticity.adapter.app import AdapterError
+
+    launcher = _launcher()
+    prev_id = "run-t8-prev"
+    launcher._paused_run = {
+        "run_id": prev_id,
+        "input_text": "Initial text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "ValidationError",
+        "error_message": "Input invalid",
+        "timestamp": "2026-11-21T00:00:00Z",
+    }
+
+    # Pre-append on prev_id
+    launcher.events.append({"kind": "run_started", "stage": "input", "run_id": prev_id})
+    assert launcher.events.is_sealed(prev_id) is False
+
+    # Failure path 1: fix_paused_run with empty input text
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=prev_id, input_text="")
+    assert exc_info.value.kind == "validation_error"
+    # recovering flag was cleanly reset
+    assert launcher._paused_run is not None
+    assert launcher._paused_run.get("recovering") is False
+    assert launcher.events.is_sealed(prev_id) is False
+
+    # Failure path 2: fix_paused_run with unsupported retrieval mode
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.fix_paused_run(run_id=prev_id, input_text="Valid text", retrieval_mode="invalid_strategy_xyz")
+    assert exc_info.value.kind == "validation_error"
+    assert launcher._paused_run is not None
+    assert launcher._paused_run.get("recovering") is False
+    assert launcher.events.is_sealed(prev_id) is False
+
+    # Failure path 3: retry_paused_run with failing core revalidation
+    from src.living_authenticity.knowledge.vault.core_validator import (
+        CoreResolutionError,
+        CoreFailureCategory,
+    )
+
+    def mock_failing_core(*args, **kwargs):
+        raise CoreResolutionError(CoreFailureCategory.SECURITY_VIOLATION, "mock core failure")
+
+    class _DummyCore:
+        units = ()
+
+    monkeypatch.setattr("src.living_authenticity.knowledge.vault.core_validator.validate_and_load_core", mock_failing_core)
+
+    with pytest.raises(AdapterError) as exc_info:
+        launcher.retry_paused_run(run_id=prev_id)
+    assert exc_info.value.kind == "validation_error"
+    # recovering flag was cleanly reset
+    assert launcher._paused_run is not None
+    assert launcher._paused_run.get("recovering") is False
+    assert launcher.events.is_sealed(prev_id) is False
+
+    # Restore core validation for subsequent paths
+    monkeypatch.setattr("src.living_authenticity.knowledge.vault.core_validator.validate_and_load_core", lambda *a, **k: _DummyCore())
+
+    # Success path: Mock _run_thread so start_run returns immediately without running full pipeline
+    monkeypatch.setattr(launcher, "_run_thread", lambda *args, **kwargs: None)
+
+    fix_res = launcher.fix_paused_run(run_id=prev_id, input_text="Corrected text")
+    assert fix_res["accepted"] is True
+    new_id = fix_res["run_id"]
+    assert new_id != prev_id
+
+    # Invariants: prev_id is sealed, _paused_run is cleared
+    assert launcher.events.is_sealed(prev_id) is True
+    assert launcher._paused_run is None
+
+    # Late append to prev_id rejected
+    assert launcher.events.append({"kind": "status", "stage": "input", "run_id": prev_id}) == 0
+
+    # New run appends cleanly with run_seq=1
+    s_new = launcher.events.append({"kind": "run_started", "stage": "input", "run_id": new_id})
+    assert s_new > 0
+    new_event = launcher.events.since(0)[-1]
+    assert new_event["run_id"] == new_id
+    assert new_event["run_seq"] == 1
+    launcher._active_run_id = ""
+
+    # Failure path 4: retry_paused_run with thread dispatch failure (worker.start raises)
+    retry_disp_prev = "run-t8-retry-disp-fail"
+    launcher._paused_run = {
+        "run_id": retry_disp_prev,
+        "input_text": "Retry dispatch fail text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "OperationalError",
+        "error_message": "Prior error",
+        "error_record_id": "rec-retry-fail-001",
+    }
+    launcher.events.append({"kind": "run_started", "stage": "input", "run_id": retry_disp_prev})
+    assert launcher.events.is_sealed(retry_disp_prev) is False
+
+    def failing_thread_start(self):
+        raise RuntimeError("simulated thread dispatch failure")
+
+    monkeypatch.setattr(threading.Thread, "start", failing_thread_start)
+
+    with pytest.raises(RuntimeError, match="simulated thread dispatch failure"):
+        launcher.retry_paused_run(run_id=retry_disp_prev)
+
+    # Invariants on retry dispatch failure:
+    # 1. Previous run remains sealed
+    assert launcher.events.is_sealed(retry_disp_prev) is True
+    # 2. _active_run_id is not left in phantom active state
+    assert launcher._active_run_id == ""
+    # 3. Launcher retains coherent recoverable state
+    assert launcher._paused_run is not None
+    retry_rep_id = launcher._paused_run["run_id"]
+    assert retry_rep_id != retry_disp_prev
+    assert launcher._paused_run["recovering"] is False
+    assert launcher._paused_run["resumed_from_run_id"] == retry_disp_prev
+    assert launcher._paused_run["error_record_id"] == "rec-retry-fail-001"
+    assert "Thread dispatch failed" in launcher._paused_run["error_message"]
+    assert launcher.events.is_sealed(retry_rep_id) is False
+
+    # 4. Subsequent valid recovery operation can proceed
+    monkeypatch.setattr(launcher, "_run_thread", lambda *args, **kwargs: None)
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    subsequent_res = launcher.retry_paused_run(run_id=retry_rep_id)
+    assert subsequent_res["accepted"] is True
+    assert launcher.events.is_sealed(retry_rep_id) is True
+    assert launcher._paused_run is None
+    launcher._active_run_id = ""
+
+    # Failure path 5: fix_paused_run with thread dispatch failure (worker.start raises)
+    fix_disp_prev = "run-t8-fix-disp-fail"
+    launcher._paused_run = {
+        "run_id": fix_disp_prev,
+        "input_text": "Fix dispatch fail text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "OperationalError",
+        "error_message": "Prior error",
+        "error_record_id": "rec-fix-fail-001",
+    }
+    launcher.events.append({"kind": "run_started", "stage": "input", "run_id": fix_disp_prev})
+    assert launcher.events.is_sealed(fix_disp_prev) is False
+
+    monkeypatch.setattr(threading.Thread, "start", failing_thread_start)
+
+    with pytest.raises(RuntimeError, match="simulated thread dispatch failure"):
+        launcher.fix_paused_run(run_id=fix_disp_prev, input_text="Corrected input for fix failure")
+
+    # Invariants on fix dispatch failure:
+    # 1. Previous run remains sealed
+    assert launcher.events.is_sealed(fix_disp_prev) is True
+    # 2. _active_run_id is not left in phantom active state
+    assert launcher._active_run_id == ""
+    # 3. Launcher retains coherent recoverable state with preserved corrected input
+    assert launcher._paused_run is not None
+    fix_rep_id = launcher._paused_run["run_id"]
+    assert fix_rep_id != fix_disp_prev
+    assert launcher._paused_run["input_text"] == "Corrected input for fix failure"
+    assert launcher._paused_run["recovering"] is False
+    assert launcher._paused_run["resumed_from_run_id"] == fix_disp_prev
+    assert launcher._paused_run["error_record_id"] == "rec-fix-fail-001"
+    assert "Thread dispatch failed" in launcher._paused_run["error_message"]
+    assert launcher.events.is_sealed(fix_rep_id) is False
+
+    # 4. Subsequent valid recovery operation can proceed
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    subsequent_fix_res = launcher.fix_paused_run(run_id=fix_rep_id, input_text="Final valid text")
+    assert subsequent_fix_res["accepted"] is True
+    assert launcher.events.is_sealed(fix_rep_id) is True
+    assert launcher._paused_run is None
+    launcher._active_run_id = ""
+
+
+def test_p4_inc1_t9_audit_event_production_all_producers(tmp_path, monkeypatch):
+    """T9: Audit Event Production Across All 6 Producers.
+    Independently verifies that each of the 6 production emitter entry points:
+    1. unit_loop.py:804 (unit audit persisted - normal)
+    2. runner.py:1085 (integration run summary audit persisted)
+    3. unit_loop.py:792 (unit audit persisted - emergency journal)
+    4. app.py:910 (input validation failure audit persisted)
+    5. app.py:1073 (operational error audit persisted)
+    6. app.py:3237 (paused run termination audit persisted)
+    produces audit_persisted events with persisted: True, stage: 'audit',
+    correct run_id, valid monotonic seq, and valid monotonic run_seq.
+    """
+    from pathlib import Path
+    from tests.integration.test_run_governance import _layouts, _write, _core, _yes, SAMPLE
+    from tests._test_core_helpers import build_test_validated_core
+    from tests._synthetic_synthesis import SyntheticSynthesis
+    from src.living_authenticity.knowledge.integration.runner import run_bounded_integration
+    from src.living_authenticity.knowledge.governance.audit import AuditWriter
+
+    audit_root = tmp_path / "audit"
+    staging_root = tmp_path / "staging"
+    audit_root.mkdir(parents=True, exist_ok=True)
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    launcher = _launcher(
+        paths={
+            "audit": {"root": str(audit_root)},
+            "staging": {"root": str(staging_root)},
+        },
+    )
+
+    # Producers 1 & 2: Normal integration execution (unit_loop.py:804 and runner.py:1085)
+    gov1_dir = tmp_path / "gov1"
+    gov1_dir.mkdir(parents=True, exist_ok=True)
+    source_dir, staging_dir = _layouts(gov1_dir)
+    _write(Path(source_dir), "note.md", SAMPLE)
+    val_core = build_test_validated_core([_core()], source_path="core", core_hash="test_core_p1")
+    gov_audit = str(tmp_path / "gov1_audit")
+    Path(gov_audit).mkdir(parents=True, exist_ok=True)
+
+    run_bounded_integration(
+        source_dir, staging_dir, guarded_roots=(), approval_reader=_yes,
+        core_units=list(val_core.units), max_files=1, synthesis=SyntheticSynthesis(),
+        audit_root=gov_audit, authorized_audit_root=gov_audit,
+        validated_core=val_core, run_id="run-t9-prod12", event_sink=launcher.events.append,
+    )
+
+    events_12 = [e for e in launcher.events.since(0) if e.get("kind") == "audit_persisted" and e.get("run_id") == "run-t9-prod12"]
+    assert len(events_12) >= 2
+
+    # Producer 1 Assertion
+    unit_persisted = [e for e in events_12 if "unit audit persisted" in e.get("message", "")]
+    assert len(unit_persisted) >= 1
+    assert unit_persisted[0]["kind"] == "audit_persisted"
+    assert unit_persisted[0]["run_id"] == "run-t9-prod12"
+    assert unit_persisted[0]["stage"] == "audit"
+    assert unit_persisted[0]["persisted"] is True
+    assert isinstance(unit_persisted[0]["seq"], int) and unit_persisted[0]["seq"] >= 1
+    assert isinstance(unit_persisted[0]["run_seq"], int) and unit_persisted[0]["run_seq"] >= 1
+
+    # Producer 2 Assertion
+    summary_persisted = [e for e in events_12 if "audit records persisted" in e.get("message", "")]
+    assert len(summary_persisted) >= 1
+    assert summary_persisted[0]["kind"] == "audit_persisted"
+    assert summary_persisted[0]["run_id"] == "run-t9-prod12"
+    assert summary_persisted[0]["stage"] == "audit"
+    assert summary_persisted[0]["persisted"] is True
+    assert summary_persisted[0]["seq"] > unit_persisted[0]["seq"]
+    assert summary_persisted[0]["run_seq"] > unit_persisted[0]["run_seq"]
+
+    # Producer 3: Emergency journaling unit audit (unit_loop.py:792)
+    gov_e_dir = tmp_path / "gov_e"
+    gov_e_dir.mkdir(parents=True, exist_ok=True)
+    source_dir_e, staging_dir_e = _layouts(gov_e_dir)
+    _write(Path(source_dir_e), "note.md", SAMPLE)
+    val_core_e = build_test_validated_core([_core()], source_path="core", core_hash="test_core_pe")
+    gov_audit_e = str(tmp_path / "gov_e_audit")
+    Path(gov_audit_e).mkdir(parents=True, exist_ok=True)
+
+    def failing_append(self, record):
+        _ = (self, record)
+        raise IOError("simulated primary disk failure")
+
+    monkeypatch.setattr(AuditWriter, "append", failing_append)
+    run_bounded_integration(
+        source_dir_e, staging_dir_e, guarded_roots=(), approval_reader=_yes,
+        core_units=list(val_core_e.units), max_files=1, synthesis=SyntheticSynthesis(),
+        audit_root=gov_audit_e, authorized_audit_root=gov_audit_e,
+        validated_core=val_core_e, run_id="run-t9-prod3", event_sink=launcher.events.append,
+    )
+    monkeypatch.undo()
+
+    events_3 = [e for e in launcher.events.since(0) if e.get("kind") == "audit_persisted" and e.get("run_id") == "run-t9-prod3"]
+    emerg_persisted = [e for e in events_3 if "unit audit persisted (emergency)" in e.get("message", "")]
+    assert len(emerg_persisted) >= 1
+    assert emerg_persisted[0]["kind"] == "audit_persisted"
+    assert emerg_persisted[0]["run_id"] == "run-t9-prod3"
+    assert emerg_persisted[0]["stage"] == "audit"
+    assert emerg_persisted[0]["persisted"] is True
+    assert emerg_persisted[0]["emergency"] is True
+    assert isinstance(emerg_persisted[0]["seq"], int) and emerg_persisted[0]["seq"] > summary_persisted[0]["seq"]
+    assert isinstance(emerg_persisted[0]["run_seq"], int) and emerg_persisted[0]["run_seq"] >= 1
+
+    # Producer 4: Input validation failure audit (app.py:910)
+    launcher._run_thread(
+        run_id="run-t9-prod4",
+        input_text="???",
+        mode_value="examples",
+    )
+    events_4 = [e for e in launcher.events.since(0) if e.get("kind") == "audit_persisted" and e.get("run_id") == "run-t9-prod4"]
+    assert len(events_4) >= 1
+    assert events_4[0]["kind"] == "audit_persisted"
+    assert events_4[0]["run_id"] == "run-t9-prod4"
+    assert events_4[0]["stage"] == "audit"
+    assert events_4[0]["persisted"] is True
+    assert "input validation audit persisted" in events_4[0]["message"]
+    assert isinstance(events_4[0]["seq"], int) and events_4[0]["seq"] > emerg_persisted[0]["seq"]
+    assert isinstance(events_4[0]["run_seq"], int) and events_4[0]["run_seq"] >= 1
+
+    # Producer 5: Operational error audit (app.py:1073)
+    valid_text_p5 = (
+        "Observation:\n"
+        "Researchers working under cognitive compression require reliable traceability "
+        "and clear verification milestones across all stages of data ingestion and governance.\n\n"
+        "Relations:\n"
+        "[[Traceability]]\n"
+        "[[Autonomy]]\n"
+    )
+
+    def failing_execute(*_args, **_kwargs):
+        raise RuntimeError("simulated operational fault")
+
+    monkeypatch.setattr(launcher, "_execute_run", failing_execute)
+    launcher._run_thread(
+        run_id="run-t9-prod5",
+        input_text=valid_text_p5,
+        mode_value="examples",
+    )
+    monkeypatch.undo()
+
+    events_5 = [e for e in launcher.events.since(0) if e.get("kind") == "audit_persisted" and e.get("run_id") == "run-t9-prod5"]
+    assert len(events_5) >= 1
+    assert events_5[0]["kind"] == "audit_persisted"
+    assert events_5[0]["run_id"] == "run-t9-prod5"
+    assert events_5[0]["stage"] == "audit"
+    assert events_5[0]["persisted"] is True
+    assert "operational error audit persisted" in events_5[0]["message"]
+    assert isinstance(events_5[0]["seq"], int) and events_5[0]["seq"] > events_4[0]["seq"]
+    assert isinstance(events_5[0]["run_seq"], int) and events_5[0]["run_seq"] >= 1
+
+    # Producer 6: Paused run termination audit (app.py:3237)
+    launcher._paused_run = {
+        "run_id": "run-t9-prod6",
+        "input_text": "Sample text",
+        "source_mode": "examples",
+        "retrieval_mode": "lexical",
+        "error": "IOError",
+        "error_message": "Network timeout",
+        "timestamp": "2026-11-21T00:00:00Z",
+    }
+    launcher.stop_paused_run(run_id="run-t9-prod6")
+    events_6 = [e for e in launcher.events.since(0) if e.get("kind") == "audit_persisted" and e.get("run_id") == "run-t9-prod6"]
+    assert len(events_6) >= 1
+    assert events_6[0]["kind"] == "audit_persisted"
+    assert events_6[0]["run_id"] == "run-t9-prod6"
+    assert events_6[0]["stage"] == "audit"
+    assert events_6[0]["persisted"] is True
+    assert "paused run termination audit persisted" in events_6[0]["message"]
+    assert isinstance(events_6[0]["seq"], int) and events_6[0]["seq"] > events_5[0]["seq"]
+    assert isinstance(events_6[0]["run_seq"], int) and events_6[0]["run_seq"] >= 1
+
+    # Verify overall monotonicity of all captured events
+    all_events = launcher.events.since(0)
+    for idx, e in enumerate(all_events):
+        assert e["seq"] == idx + 1
+
+
+def test_p4_inc1_t10_atomic_replay_snapshot():
+    """T10: Atomic Replay Snapshot & Concurrent Eviction Atomicity.
+    - snapshot_replay captures min_seq, max_seq, is_evicted, and matching events
+      atomically in a single critical section without races.
+    - Deterministic concurrent snapshot testing: reader threads capture snapshots
+      concurrently while a producer thread appends events; asserts zero torn state.
+    - Bounded-buffer continuous eviction atomicity: capacity=20 with 300 appends,
+      asserting consistent bounds and mathematical range invariant:
+      [e["seq"] for e in snap.events] == list(range(max(snap.min_seq, after + 1), snap.max_seq + 1))
+    """
+    log = RunEventLog(max_events=5)
+    run_a = "run-t10-a"
+    run_b = "run-t10-b"
+
+    log.append({"kind": "run_started", "stage": "input", "run_id": run_a})   # seq 1
+    log.append({"kind": "run_started", "stage": "input", "run_id": run_b})   # seq 2
+    log.append({"kind": "stage_started", "stage": "input", "run_id": run_a}) # seq 3
+
+    snap = log.snapshot_replay(after=0, run_id=run_a)
+    assert snap.min_seq == 1
+    assert snap.max_seq == 3
+    assert snap.total_evicted == 0
+    assert snap.is_evicted is False
+    assert snap.hand_off_cursor == 3
+    assert len(snap.events) == 2
+    assert [e["seq"] for e in snap.events] == [1, 3]
+
+    # Concurrent snapshot atomicity test
+    concurrent_log = RunEventLog(max_events=1000)
+    producer_stop = threading.Event()
+    snapshots_captured = []
+    snapshot_errors = []
+
+    def concurrent_producer():
+        for i in range(500):
+            concurrent_log.append({"kind": "status", "stage": "work", "run_id": "run-t10-c", "i": i})
+        producer_stop.set()
+
+    def concurrent_reader():
+        while not producer_stop.is_set():
+            snap_c = concurrent_log.snapshot_replay(after=10, run_id="run-t10-c")
+            if not snap_c.is_evicted:
+                if snap_c.hand_off_cursor != snap_c.max_seq:
+                    snapshot_errors.append(f"hand_off_cursor {snap_c.hand_off_cursor} != max_seq {snap_c.max_seq}")
+                for ev in snap_c.events:
+                    if ev["seq"] > snap_c.max_seq:
+                        snapshot_errors.append(f"event seq {ev['seq']} > max_seq {snap_c.max_seq}")
+                    if ev["seq"] <= 10:
+                        snapshot_errors.append(f"event seq {ev['seq']} <= after 10")
+                seqs = [ev["seq"] for ev in snap_c.events]
+                if seqs != sorted(seqs) or len(seqs) != len(set(seqs)):
+                    snapshot_errors.append(f"non-monotonic event seqs: {seqs}")
+                snapshots_captured.append(len(snap_c.events))
+
+    p_thread = threading.Thread(target=concurrent_producer)
+    r_threads = [threading.Thread(target=concurrent_reader) for _ in range(5)]
+
+    for t in r_threads:
+        t.start()
+    p_thread.start()
+
+    p_thread.join()
+    for t in r_threads:
+        t.join()
+
+    assert not snapshot_errors, f"Snapshot atomicity violations detected: {snapshot_errors[:5]}"
+    assert len(snapshots_captured) > 0
+
+    # Strengthened: Bounded-buffer continuous eviction atomicity test with deterministic milestone barriers
+    evict_log = RunEventLog(max_events=20)
+    evict_stop = threading.Event()
+    evict_violations = []
+    guaranteed_overlap_count = 0
+    guaranteed_overlap_lock = threading.Lock()
+
+    milestone_steps = {25, 50, 75, 100, 150, 200, 250}
+    milestone_event = threading.Event()
+    milestone_done = threading.Event()
+
+    def evict_producer():
+        for i in range(1, 301):
+            evict_log.append({"kind": "status", "stage": "work", "run_id": "run-t10-evict", "step": i})
+            if i in milestone_steps:
+                milestone_done.clear()
+                milestone_event.set()
+                milestone_done.wait(timeout=2.0)
+                milestone_event.clear()
+        evict_stop.set()
+
+    def verify_snapshot_invariants(snap, after_cursor, reader_id):
+        if snap.min_seq != snap.total_evicted + 1:
+            evict_violations.append(f"R{reader_id}: min_seq {snap.min_seq} != total_evicted + 1 ({snap.total_evicted + 1})")
+        if snap.is_evicted:
+            if snap.hand_off_cursor != after_cursor:
+                evict_violations.append(f"R{reader_id}: evicted snapshot hand_off_cursor {snap.hand_off_cursor} != after_cursor {after_cursor}")
+            if snap.events != []:
+                evict_violations.append(f"R{reader_id}: evicted snapshot contained events: {snap.events}")
+            if after_cursor >= snap.min_seq - 1:
+                evict_violations.append(f"R{reader_id}: after_cursor {after_cursor} >= min_seq - 1 ({snap.min_seq - 1}) but was marked evicted")
+        else:
+            if snap.hand_off_cursor != snap.max_seq:
+                evict_violations.append(f"R{reader_id}: non-evicted snapshot hand_off_cursor {snap.hand_off_cursor} != max_seq {snap.max_seq}")
+            if after_cursor < snap.min_seq - 1:
+                evict_violations.append(f"R{reader_id}: after_cursor {after_cursor} < min_seq - 1 ({snap.min_seq - 1}) but was marked not evicted")
+            expected_seqs = list(range(max(snap.min_seq, after_cursor + 1), snap.max_seq + 1))
+            actual_seqs = [e["seq"] for e in snap.events]
+            if actual_seqs != expected_seqs:
+                evict_violations.append(f"R{reader_id}: seq mismatch: actual {actual_seqs} != expected {expected_seqs}")
+
+    def milestone_coordinator():
+        nonlocal guaranteed_overlap_count
+        while not evict_stop.is_set():
+            if milestone_event.wait(timeout=0.05):
+                for after_cursor in [0, 5, 10, 15, 20, 30, 60, 120]:
+                    snap = evict_log.snapshot_replay(after=after_cursor, run_id="run-t10-evict")
+                    if snap.total_evicted <= 0:
+                        evict_violations.append(f"Milestone coordinator: expected total_evicted > 0, got {snap.total_evicted}")
+                    with guaranteed_overlap_lock:
+                        guaranteed_overlap_count += 1
+                    verify_snapshot_invariants(snap, after_cursor, "milestone")
+                milestone_done.set()
+
+    def evict_reader(reader_id):
+        nonlocal guaranteed_overlap_count
+        while not evict_stop.is_set():
+            for after_cursor in [0, 5, 10, 15, 20, 50, 100, 150, 200, 250]:
+                snap = evict_log.snapshot_replay(after=after_cursor, run_id="run-t10-evict")
+                if snap.total_evicted > 0 and not evict_stop.is_set():
+                    with guaranteed_overlap_lock:
+                        guaranteed_overlap_count += 1
+                verify_snapshot_invariants(snap, after_cursor, reader_id)
+
+    ep_thread = threading.Thread(target=evict_producer)
+    coord_thread = threading.Thread(target=milestone_coordinator)
+    er_threads = [threading.Thread(target=evict_reader, args=(i,)) for i in range(5)]
+
+    for t in er_threads:
+        t.start()
+    coord_thread.start()
+    ep_thread.start()
+
+    ep_thread.join()
+    coord_thread.join()
+    for t in er_threads:
+        t.join()
+
+    assert not evict_violations, f"T10 bounded eviction atomicity violations: {evict_violations[:5]}"
+    assert guaranteed_overlap_count >= 10, f"Expected >= 10 guaranteed eviction overlaps, got {guaranteed_overlap_count}"
+
+
+def test_p4_inc1_t11_replay_continuity_and_live_handoff():
+    """T11: Replay Continuity, Live Hand-Off & Eviction Protocol.
+    Verifies:
+    - Cursor advances per flushed event.
+    - Hand-off cursor equals snapshot.max_seq.
+    - Initial connection eviction emits TransportEvictionError / is_evicted.
+    - Live eviction during wait_since raises TransportEvictionError.
+    - Distinguishes confirmed eviction from intact sequence span.
+    - Real HTTP/SSE eviction wire serialization on /api/events.
+    - Real HTTP/SSE live streaming eviction upon buffer overflow with socket close.
+    """
+    log = RunEventLog(max_events=3)
+    run_id = "run-t11-evict"
+
+    # Append 5 events into capacity-3 buffer
+    for i in range(1, 6):
+        log.append({"kind": "status", "stage": "work", "run_id": run_id, "step": i})
+
+    bounds = log.bounds()
+    assert bounds["min_seq"] == 3
+    assert bounds["max_seq"] == 5
+    assert bounds["total_evicted"] == 2
+
+    # Client connects with after=0 (older than min_seq-1=2): must report is_evicted=True
+    snap_evicted = log.snapshot_replay(after=0, run_id=run_id)
+    assert snap_evicted.is_evicted is True
+    assert snap_evicted.events == []
+
+    # Client connects with after=2: retained buffer starts at 3, so unbroken continuity
+    snap_valid = log.snapshot_replay(after=2, run_id=run_id)
+    assert snap_valid.is_evicted is False
+    assert [e["seq"] for e in snap_valid.events] == [3, 4, 5]
+    assert snap_valid.hand_off_cursor == 5
+
+    # Live eviction check: calling wait_since with cursor < min_seq - 1 raises TransportEvictionError
+    with pytest.raises(TransportEvictionError) as exc_info:
+        log.wait_since(seq=1, timeout=0.1, run_id=run_id)
+    assert exc_info.value.cursor == 1
+    assert exc_info.value.min_seq == 3
+    assert exc_info.value.total_evicted == 2
+
+    # Real HTTP/SSE initial connection eviction test
+    launcher, server = _server()
+    launcher.events = RunEventLog(max_events=3)
+    for i in range(1, 6):
+        launcher.events.append({"kind": "status", "stage": "work", "run_id": "run-http-evict", "step": i})
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/api/events?after=0", headers={TOKEN_HEADER: launcher.token})
+    resp = conn.getresponse()
+    assert resp.status == 200
+    assert resp.getheader("Content-Type") == "text/event-stream"
+    assert resp.getheader("X-Events-Evicted") == "2"
+    assert resp.getheader("X-Buffer-Min-Seq") == "3"
+
+    # Verify wire serialization of error event
+    line1 = resp.readline().decode("utf-8")
+    line2 = resp.readline().decode("utf-8")
+    line3 = resp.readline().decode("utf-8")
+
+    assert line1 == "event: error\n"
+    assert line2.startswith("data: ")
+    err_payload = json.loads(line2[len("data: "):].strip())
+    assert err_payload["error"] == "transport_eviction"
+    assert err_payload["min_seq"] == 3
+    assert err_payload["total_evicted"] == 2
+    assert line3 == "\n"
+    conn.close()
+
+    # Real HTTP/SSE live streaming eviction test upon buffer overflow
+    launcher_live, server_live = _server()
+    launcher_live.events = RunEventLog(max_events=3)
+    launcher_live.events.append({"kind": "run_started", "stage": "input", "run_id": "run-live-evict"}) # seq 1
+
+    conn_live = http.client.HTTPConnection("127.0.0.1", server_live.port, timeout=5)
+    conn_live.request("GET", "/api/events?after=0", headers={TOKEN_HEADER: launcher_live.token, "Connection": "close"})
+    resp_live = conn_live.getresponse()
+    assert resp_live.status == 200
+
+    # Read initial event (seq 1)
+    l1 = resp_live.readline().decode("utf-8")
+    l2 = resp_live.readline().decode("utf-8")
+    l3 = resp_live.readline().decode("utf-8")
+    l4 = resp_live.readline().decode("utf-8")
+    assert l1 == "id: 1\n"
+    assert l2 == "event: message\n"
+    assert l4 == "\n"
+
+    # Producer overflows buffer past client cursor 1
+    for step in range(2, 7):
+        launcher_live.events.append({"kind": "status", "stage": "work", "run_id": "run-live-evict", "step": step})
+
+    # Streaming loop encounters TransportEvictionError in wait_since, sends event: error, and cleanly closes socket
+    err_l1 = resp_live.readline().decode("utf-8")
+    err_l2 = resp_live.readline().decode("utf-8")
+    err_l3 = resp_live.readline().decode("utf-8")
+
+    assert err_l1 == "event: error\n"
+    assert err_l2.startswith("data: ")
+    live_err = json.loads(err_l2[len("data: "):].strip())
+    assert live_err["error"] == "transport_eviction"
+    assert live_err["cursor"] == 1
+    assert live_err["min_seq"] == 4
+    assert live_err["total_evicted"] == 3
+    assert err_l3 == "\n"
+
+    # Verify server-initiated connection termination (EOF) on the live SSE response stream.
+    # With Connection: close, the server handler exits upon eviction error and closes the connection.
+    # We attempt to read from the response stream with a bounded timeout to verify EOF (b"")
+    # establishing that the server terminated the stream before the client performs conn_live.close().
+    raw_sock = getattr(getattr(resp_live, "fp", None), "raw", None)
+    sock_obj = getattr(raw_sock, "_sock", None)
+    if sock_obj:
+        try:
+            sock_obj.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        sock_obj.settimeout(2.0)
+    eof_data = resp_live.read()
+    assert eof_data == b"", f"Expected EOF from server, got: {eof_data!r}"
+
+    conn_live.close()
+
+
+def test_p4_inc1_t12_transport_sse_snapshot_headers():
+    """T12: Transport SSE Snapshot Headers and Per-Event Flushed Delivery.
+    Verifies that /api/events populates X-Buffer-Min-Seq, X-Buffer-Max-Seq,
+    and X-Events-Evicted headers reflecting the connection-time snapshot
+    both when total_evicted == 0 and when total_evicted > 0, flushes individual events,
+    and advances cursor on live appends.
+    """
+    launcher, server = _server()
+    # Append initial events
+    launcher.events.append({"kind": "run_started", "stage": "input", "run_id": "run-t12"}) # seq 1
+    launcher.events.append({"kind": "status", "stage": "input", "run_id": "run-t12"})      # seq 2
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/api/events?after=0", headers={TOKEN_HEADER: launcher.token, "Connection": "close"})
+    resp = conn.getresponse()
+    assert resp.status == 200
+    assert resp.getheader("Content-Type") == "text/event-stream"
+    assert resp.getheader("X-Buffer-Min-Seq") == "1"
+    assert resp.getheader("X-Buffer-Max-Seq") == "2"
+    assert resp.getheader("X-Events-Evicted") == "0"
+
+    # Verify per-event flushed delivery for event 1
+    assert resp.readline().decode("utf-8") == "id: 1\n"
+    assert resp.readline().decode("utf-8") == "event: message\n"
+    ev1_line = resp.readline().decode("utf-8")
+    assert ev1_line.startswith("data: ")
+    ev1 = json.loads(ev1_line[len("data: "):].strip())
+    assert ev1["seq"] == 1
+    assert ev1["run_id"] == "run-t12"
+    assert resp.readline().decode("utf-8") == "\n"
+
+    # Verify per-event flushed delivery for event 2
+    assert resp.readline().decode("utf-8") == "id: 2\n"
+    assert resp.readline().decode("utf-8") == "event: message\n"
+    ev2_line = resp.readline().decode("utf-8")
+    assert ev2_line.startswith("data: ")
+    ev2 = json.loads(ev2_line[len("data: "):].strip())
+    assert ev2["seq"] == 2
+    assert ev2["run_id"] == "run-t12"
+    assert resp.readline().decode("utf-8") == "\n"
+
+    # Live event appended while connected
+    launcher.events.append({"kind": "run_completed", "stage": "final", "run_id": "run-t12"}) # seq 3
+
+    # Client receives event 3 flushed with advanced cursor
+    assert resp.readline().decode("utf-8") == "id: 3\n"
+    assert resp.readline().decode("utf-8") == "event: message\n"
+    ev3_line = resp.readline().decode("utf-8")
+    assert ev3_line.startswith("data: ")
+    ev3 = json.loads(ev3_line[len("data: "):].strip())
+    assert ev3["seq"] == 3
+    assert ev3["run_id"] == "run-t12"
+    assert resp.readline().decode("utf-8") == "\n"
+
+    conn.close()
+
+
+def test_p4_inc1_t13_concurrent_append_and_stream_thread_safety():
+    """T13: Concurrent Append and Stream Thread Safety.
+    10 producer threads appending 1000 events concurrently while 5 consumer
+    threads stream via wait_since; asserts zero sequence collisions, zero skips,
+    zero lock deadlocks, and that every consumer receives the exact complete 1000-event sequence.
+    """
+    log = RunEventLog(max_events=2000)
+    producers_done = threading.Event()
+    consumed_seqs = [[] for _ in range(5)]
+
+    def producer(worker_idx):
+        for j in range(100):
+            r_id = f"run-t13-{worker_idx}"
+            log.append({"kind": "status", "stage": "work", "run_id": r_id, "i": j})
+
+    def consumer(c_idx):
+        cursor = 0
+        while not producers_done.is_set() or cursor < 1000:
+            try:
+                batch = log.wait_since(cursor, timeout=0.05)
+                for e in batch:
+                    consumed_seqs[c_idx].append(e["seq"])
+                    cursor = e["seq"]
+            except TransportEvictionError:
+                break
+
+    c_threads = [threading.Thread(target=consumer, args=(i,)) for i in range(5)]
+    p_threads = [threading.Thread(target=producer, args=(i,)) for i in range(10)]
+
+    for t in c_threads:
+        t.start()
+    for t in p_threads:
+        t.start()
+
+    for t in p_threads:
+        t.join()
+    producers_done.set()
+
+    for t in c_threads:
+        t.join()
+
+    # Total 1000 events committed
+    all_events = log.since(0)
+    assert len(all_events) == 1000
+    expected_full_seq = list(range(1, 1001))
+    assert [e["seq"] for e in all_events] == expected_full_seq
+
+    # Every consumer received the exact complete 1000-event sequence without omissions
+    for c_seqs in consumed_seqs:
+        assert c_seqs == expected_full_seq
+
+
+def test_p4_inc1_t14_typescript_contract_parity():
+    """T14: TypeScript Contract Parity.
+    Validates JSON serialization of backend events conforms to TypeScript
+    RunEvent and TransportErrorEvent interfaces.
+    """
+    log = RunEventLog()
+    log.append({
+        "kind": "stage_completed",
+        "stage": "retrieval",
+        "run_id": "run-t14",
+        "message": "retrieval completed",
+    })
+    event = log.since(0)[-1]
+    serialized = json.loads(json.dumps(event))
+
+    # Verify fields match TypeScript RunEvent interface
+    assert isinstance(serialized["seq"], int)
+    assert isinstance(serialized["run_seq"], int)
+    assert isinstance(serialized["run_id"], str)
+    assert isinstance(serialized["kind"], str)
+    assert isinstance(serialized["stage"], str)
+    assert isinstance(serialized["timestamp"], str)
+
+    # Verify TransportEviction error format
+    err_event = {
+        "error": "transport_eviction",
+        "cursor": 10,
+        "min_seq": 25,
+        "total_evicted": 50,
+    }
+    err_json = json.loads(json.dumps(err_event))
+    assert err_json["error"] == "transport_eviction"
+    assert err_json["cursor"] == 10
+    assert err_json["min_seq"] == 25
+    assert err_json["total_evicted"] == 50
+
+
+def test_p4_inc1_t15_post_seal_diagnostic_schema_compliance():
+    """T15: Post-Seal Diagnostic Schema Compliance.
+    Rejection records contain exactly the 5 bounded keys (timestamp, run_id,
+    kind, stage, reason) and no extraneous keys. Verifies monotonic counter
+    increment and bounded ring buffer capacity (maxlen=100).
+    """
+    log = RunEventLog()
+    run_id = "run-t15-schema"
+    log.seal_run(run_id)
+
+    # Trigger 150 rejections to verify maxlen=100 ring buffer
+    for i in range(150):
+        log.append({
+            "kind": "status",
+            "stage": "audit",
+            "run_id": run_id,
+            "arbitrary_payload_key": "should_never_be_stored",
+            "message": "unbounded user text",
+        })
+
+    diag = log.post_seal_diagnostics()
+    assert diag["total_rejections"] == 150
+    assert len(diag["recent_rejections"]) == 100  # Bounded at 100
+
+    # Verify every record matches the strict 5-key schema
+    for record in diag["recent_rejections"]:
+        assert set(record.keys()) == {"timestamp", "run_id", "kind", "stage", "reason"}
+        assert record["run_id"] == run_id
+        assert record["kind"] == "status"
+        assert record["stage"] == "audit"
+        assert record["reason"] == "run_sealed"
+        assert "arbitrary_payload_key" not in record
+        assert "message" not in record

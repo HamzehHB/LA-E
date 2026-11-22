@@ -25,6 +25,7 @@ from .app import (
     VERSION,
     _utcnow,
 )
+from .events import TransportEvictionError
 
 ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 MAX_JSON_BODY = MAX_BODY_BYTES
@@ -244,26 +245,70 @@ def _make_handler(launcher: Launcher):
                 after = int(_query_value(query, "after", "0"))
             except (TypeError, ValueError):
                 after = 0
+            run_id = _query_value(query, "run_id", "").strip() or None
+
+            snapshot = launcher.events.snapshot_replay(after=after, run_id=run_id)
+
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
+            self.send_header("X-Buffer-Min-Seq", str(snapshot.min_seq))
+            self.send_header("X-Buffer-Max-Seq", str(snapshot.max_seq))
+            self.send_header("X-Events-Evicted", str(snapshot.total_evicted))
             self.end_headers()
+
             try:
+                if snapshot.is_evicted:
+                    self.wfile.write((
+                        "event: error\ndata: %s\n\n"
+                        % json.dumps({
+                            "error": "transport_eviction",
+                            "cursor": after,
+                            "min_seq": snapshot.min_seq,
+                            "total_evicted": snapshot.total_evicted,
+                        })
+                    ).encode("utf-8"))
+                    self.wfile.flush()
+                    return
+
+                for event in snapshot.events:
+                    self.wfile.write((
+                        "id: %d\nevent: message\ndata: %s\n\n"
+                        % (event["seq"],
+                           json.dumps(event, ensure_ascii=False))
+                    ).encode("utf-8"))
+                    self.wfile.flush()
+
+                live_cursor = snapshot.hand_off_cursor
                 while True:
-                    batch = launcher.events.wait_since(after, 20.0)
+                    try:
+                        batch = launcher.events.wait_since(live_cursor, 20.0, run_id=run_id)
+                    except TransportEvictionError as exc:
+                        self.wfile.write((
+                            "event: error\ndata: %s\n\n"
+                            % json.dumps({
+                                "error": "transport_eviction",
+                                "cursor": exc.cursor,
+                                "min_seq": exc.min_seq,
+                                "total_evicted": exc.total_evicted,
+                            })
+                        ).encode("utf-8"))
+                        self.wfile.flush()
+                        return
+
                     if not batch:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
                     for event in batch:
-                        after = event["seq"]
                         self.wfile.write((
                             "id: %d\nevent: message\ndata: %s\n\n"
                             % (event["seq"],
                                json.dumps(event, ensure_ascii=False))
                         ).encode("utf-8"))
-                    self.wfile.flush()
+                        self.wfile.flush()
+                        live_cursor = event["seq"]
             except (OSError, ValueError):
                 pass
 
